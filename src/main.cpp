@@ -32,6 +32,9 @@
 #include "price.h"
 #include "touch.h"
 #include "walletscreen.h"
+#include "settingsscreen.h"
+#include "wifiscreen.h"
+#include "devcfg.h"
 #include "secrets.h"
 
 static TFT_eSPI tft;
@@ -44,20 +47,26 @@ static constexpr uint32_t WALLET_INTERVAL_MS = 60000;   // 60 s
 static uint32_t s_nextPriceMs  = 0;
 static uint32_t s_nextWalletMs = 0;
 
-// Which of the two screens is currently shown.
+// Screens: creature (home), wallet (swipe-left), settings (pull-down).
 enum Screen : uint8_t {
   SCREEN_CREATURE = 0,
   SCREEN_WALLET   = 1,
+  SCREEN_SETTINGS = 2,
+  SCREEN_WIFI     = 3,   // sub-screen reached from Settings
 };
-static Screen s_screen = SCREEN_CREATURE;
+static Screen s_screen     = SCREEN_CREATURE;
+static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
 
 static void switchScreen(Screen target) {
   if (target == s_screen) return;
+  // Remember the non-settings screen we came from so swipe-up restores it.
+  if (target == SCREEN_SETTINGS) s_prevScreen = s_screen;
   s_screen = target;
-  if (target == SCREEN_CREATURE) {
-    creatureRepaint();
-  } else {
-    walletScreenDraw();
+  switch (target) {
+    case SCREEN_CREATURE: creatureRepaint();     break;
+    case SCREEN_WALLET:   walletScreenDraw();    break;
+    case SCREEN_SETTINGS: settingsScreenDraw();  break;
+    case SCREEN_WIFI:     wifiScreenEnter();     break;
   }
 }
 
@@ -146,12 +155,12 @@ void setup() {
   Serial.println();
   Serial.println("== Daemon booting ==");
 
-  pinMode(5, OUTPUT);      // LCD backlight
-  digitalWrite(5, HIGH);
-
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(0x0000);
+
+  // LCD backlight is now driven by PWM from devcfg; applied after voice
+  // init so the Audio library exists by the time we call voiceSetVolume.
 
   if (!creatureBegin(&tft)) {
     Serial.println("creature: begin failed");
@@ -160,12 +169,18 @@ void setup() {
     tft.print("creature sprite alloc failed");
   }
   walletScreenBegin(&tft);
+  settingsScreenBegin(&tft);
+  wifiScreenBegin(&tft);
   touchBegin();
   creatureSetStatus("WAKING UP");
   creatureTick();   // first frame
 
   s_voiceOk = voiceBegin();
   Serial.printf("voice: %s\n", s_voiceOk ? "OK" : "failed");
+
+  // Device-level settings (volume, brightness, BT). Applies brightness
+  // PWM and restores last-known volume from NVS.
+  devcfgBegin();
 
   // Wi-Fi + web server. These are best-effort; creature still animates
   // without them. That lets you iterate on the drawing without a network.
@@ -176,11 +191,14 @@ void setup() {
     aiBegin();
     serverBeginHttp(handleUtterance);
     String ipLine = "http://" + serverLocalIP();
-    creatureSetStatus(ipLine);
+    // Status-bar real estate now belongs to the USDC balance (updated
+    // every frame in loop()); the web UI address stays in serial + the
+    // Settings → Wi-Fi row.
+    creatureSetStatus("USDC ...");
     serverSetStatus("idle");
     Serial.print("open "); Serial.print(ipLine); Serial.println(" on your phone");
   } else {
-    creatureSetStatus("OFFLINE - TYPE IN SERIAL");
+    creatureSetStatus("OFFLINE");
   }
 
   creatureForceBlink();
@@ -224,10 +242,26 @@ void loop() {
   // client is connected, so the animation keeps running.
   if (s_wifiOk) serverLoop();
 
-  // Handle swipes. Left swipe → wallet, right swipe → creature.
-  SwipeDir sw = touchPollSwipe();
-  if (sw == SWIPE_LEFT)  switchScreen(SCREEN_WALLET);
-  if (sw == SWIPE_RIGHT) switchScreen(SCREEN_CREATURE);
+  // Handle swipes.
+  //   SWIPE_LEFT  → wallet (from creature)
+  //   SWIPE_RIGHT → creature (from wallet)
+  //   SWIPE_DOWN  → open settings (only fires if start was near top edge)
+  //   SWIPE_UP    → close settings (back to previous screen)
+  SwipeDir sw = touchPoll();
+  if (s_screen == SCREEN_SETTINGS) {
+    if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
+    if (settingsScreenConsumeClose())       switchScreen(s_prevScreen);
+    if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
+  } else if (s_screen == SCREEN_WIFI) {
+    // Wi-Fi screen decides itself whether a swipe goes back to the list
+    // or exits the panel; we just pipe the swipe through.
+    wifiScreenHandleSwipe(sw);
+    if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+  } else {
+    if (sw == SWIPE_LEFT)  switchScreen(SCREEN_WALLET);
+    if (sw == SWIPE_RIGHT) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
+  }
 
   // Talking state still drives the creature regardless of which screen is
   // visible — audio and mood transitions are shared.
@@ -242,10 +276,11 @@ void loop() {
   wasTalking = talking;
 
   // Per-screen tick.
-  if (s_screen == SCREEN_CREATURE) {
-    creatureTick();
-  } else {
-    walletScreenTick();
+  switch (s_screen) {
+    case SCREEN_CREATURE: creatureTick();       break;
+    case SCREEN_WALLET:   walletScreenTick();   break;
+    case SCREEN_SETTINGS: settingsScreenTick(); break;
+    case SCREEN_WIFI:     wifiScreenTick();     break;
   }
 
   voiceLoop();
@@ -257,6 +292,14 @@ void loop() {
   if (!voiceIsSpeaking()) {
     maybeRefreshPrice();
     maybeRefreshWallet();
+  }
+
+  // Keep the top-left status showing the wallet's current USDC balance.
+  // creatureSetStatus is a cheap setter; drawStatusIfChanged only repaints
+  // when the string actually differs, so calling it every frame is fine.
+  if (s_wifiOk) {
+    String usdc = walletUsdcDisplayString();
+    if (usdc.length() > 0) creatureSetStatus(usdc);
   }
 
   // Deadline-based pacing instead of a fixed delay(16): if this iteration

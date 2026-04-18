@@ -1,5 +1,6 @@
 #include "server.h"
 #include "secrets.h"
+#include "devcfg.h"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -175,26 +176,23 @@ static void logNearbyNetworks() {
   WiFi.scanDelete();
 }
 
-bool serverBeginWifi() {
+// Core connect: tries the given SSID/password and returns success/failure.
+// Does not touch NVS; caller decides whether to persist.
+static bool connectTo(const String &ssid, const String &password) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("daemon");
   WiFi.disconnect(true, true);
   delay(100);
 
-  logNearbyNetworks();
-
-  Serial.printf("wifi: connecting to '%s' ", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("wifi: connecting to '%s' ", ssid.c_str());
+  WiFi.begin(ssid.c_str(), password.c_str());
 
   uint32_t start = millis();
   wl_status_t last = WL_IDLE_STATUS;
   while (WiFi.status() != WL_CONNECTED && millis() - start < 25000) {
     delay(300);
     wl_status_t st = WiFi.status();
-    if (st != last) {
-      Serial.printf("[%d]", (int)st);
-      last = st;
-    }
+    if (st != last) { Serial.printf("[%d]", (int)st); last = st; }
     Serial.print('.');
   }
   Serial.println();
@@ -204,6 +202,32 @@ bool serverBeginWifi() {
   }
   Serial.print("wifi: got IP "); Serial.println(WiFi.localIP());
   return true;
+}
+
+bool serverBeginWifi() {
+  logNearbyNetworks();
+
+  // 1. Try user-provided credentials from NVS (set via the settings UI).
+  String ssid = devcfgWifiSSID();
+  String pass = devcfgWifiPassword();
+  if (ssid.length() > 0) {
+    if (connectTo(ssid, pass)) return true;
+    Serial.println("wifi: stored creds failed, trying secrets.h fallback");
+  }
+
+  // 2. Fall back to compile-time defaults in secrets.h.
+  return connectTo(WIFI_SSID, WIFI_PASSWORD);
+}
+
+bool serverWifiConnect(const String &ssid, const String &password) {
+  bool ok = connectTo(ssid, password);
+  if (ok) devcfgSetWifi(ssid, password);
+  return ok;
+}
+
+void serverWifiDisconnect() {
+  Serial.println("wifi: user-initiated disconnect");
+  WiFi.disconnect(true, true);
 }
 
 void serverBeginHttp(SayCallback onSay) {

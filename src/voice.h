@@ -23,4 +23,5 @@ void voiceLoop();
 bool voiceSpeak(const String &text);
 bool voiceIsSpeaking();
 void voiceStop();
-void voiceDiagnose();   // one-shot HTTP diag for debugging
+void voiceDiagnose();           // one-shot HTTP diag for debugging
+void voiceSetVolume(uint8_t v); // 0..21, forwarded to the Audio library

@@ -242,6 +242,11 @@ void voiceStop() {
 
 void voiceDiagnose() { /* no-op now */ }
 
+void voiceSetVolume(uint8_t v) {
+  if (v > 21) v = 21;
+  if (s_audio) s_audio->setVolume(v);
+}
+
 void audio_info(const char *info)    { Serial.print("[audio] ");    Serial.println(info); }
 void audio_id3data(const char *info) { Serial.print("[audio id3] "); Serial.println(info); }
 void audio_bitrate(const char *info) { Serial.print("[audio br] ");  Serial.println(info); }

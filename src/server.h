@@ -14,8 +14,16 @@
 
 using SayCallback = std::function<void(const String &userText)>;
 
-// Connect to Wi-Fi (blocking, with short timeout). Returns true on success.
+// Connect to Wi-Fi using NVS-stored credentials first, falling back to the
+// compile-time defaults in secrets.h (blocking, 25 s timeout).
 bool serverBeginWifi();
+
+// Attempt a connection to a specific SSID/password (blocking). On success
+// the credentials are persisted in NVS so subsequent boots pick them up.
+bool serverWifiConnect(const String &ssid, const String &password);
+
+// Drop the current Wi-Fi association without forgetting the stored creds.
+void serverWifiDisconnect();
 
 // Start the HTTP listener; must be called after serverBeginWifi(). The
 // provided callback fires on every incoming user utterance (from the phone).

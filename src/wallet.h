@@ -34,6 +34,11 @@ double walletSolBalance();
 const std::vector<TokenHolding> &walletTokens();
 uint32_t walletLastRefreshAgeMs();
 
+// Convenience: USDC balance (SPL token, mint EPjFWdd5...) and a short,
+// status-bar-friendly representation like "USDC 12.34".
+double  walletUsdcAmount();
+String  walletUsdcDisplayString();
+
 // Compact multi-line summary suitable for injection into Gemini's system
 // prompt. Example output:
 //   Your wallet: 9xHb...Qk3 (Solana mainnet).

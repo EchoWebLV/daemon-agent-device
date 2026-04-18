@@ -73,6 +73,28 @@ String walletPubkey()                  { return s_pubkey; }
 double walletSolBalance()              { return s_solBalance; }
 const std::vector<TokenHolding> &walletTokens() { return s_tokens; }
 
+// ---- USDC helpers ---------------------------------------------------------
+static const char *USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+double walletUsdcAmount() {
+  for (const TokenHolding &t : s_tokens) {
+    if (t.mint == USDC_MINT) return t.amount;
+  }
+  return 0.0;
+}
+
+String walletUsdcDisplayString() {
+  if (!s_ok) return String("");
+  double u = walletUsdcAmount();
+  char buf[24];
+  if (u >= 10000)      snprintf(buf, sizeof(buf), "USDC %.0f",  u);
+  else if (u >= 100)   snprintf(buf, sizeof(buf), "USDC %.1f",  u);
+  else if (u >= 1)     snprintf(buf, sizeof(buf), "USDC %.2f",  u);
+  else if (u > 0)      snprintf(buf, sizeof(buf), "USDC %.4f",  u);
+  else                 snprintf(buf, sizeof(buf), "USDC 0.00");
+  return String(buf);
+}
+
 uint32_t walletLastRefreshAgeMs() {
   if (s_lastRefreshMs == 0) return UINT32_MAX;
   return millis() - s_lastRefreshMs;
