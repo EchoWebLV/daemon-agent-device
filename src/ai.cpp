@@ -2,6 +2,7 @@
 #include "secrets.h"
 #include "wallet.h"
 #include "price.h"
+#include "devcfg.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -31,7 +32,10 @@ static const char *PERSONA =
 static String buildSystemPrompt() {
   String out;
   out.reserve(1024);
-  out += PERSONA;
+  // Prefer the user-configured personality from the web settings; fall
+  // back to the built-in default if nothing's been set.
+  String custom = devcfgPersonality();
+  out += (custom.length() > 0) ? custom : String(PERSONA);
   out += "\n\n---\nLIVE WALLET STATE (refresh this each answer):\n";
   out += walletContext(priceSOLUSD());
   double p = priceSOLUSD();
@@ -41,6 +45,23 @@ static String buildSystemPrompt() {
     out += buf;
   }
   return out;
+}
+
+// Map the extension-style model id ("google/gemini-3.1-pro", etc.) to the
+// bare Gemini API name. Only Google models are supported on the device
+// today; anything else falls back to the compile-time default until x402
+// payment is wired up.
+static String pickGeminiModel() {
+  String m = devcfgLlmModel();
+  if (m.startsWith("google/")) {
+    String bare = m.substring(7);   // strip "google/"
+    // Gemini API expects these names as-is (gemini-2.5-flash, etc.)
+    return bare;
+  }
+  Serial.printf("ai: non-google model '%s' selected but x402 payment not "
+                "wired up yet — falling back to %s\n",
+                m.c_str(), GEMINI_MODEL);
+  return String(GEMINI_MODEL);
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +107,9 @@ static bool postToGemini(const String &payload, String &outReply) {
   client.setInsecure();   // Google's CA chain rotates; skip pinning.
 
   HTTPClient http;
+  String modelName = pickGeminiModel();
   String url = "https://generativelanguage.googleapis.com/v1beta/models/";
-  url += GEMINI_MODEL;
+  url += modelName;
   url += ":generateContent?key=";
   url += GEMINI_API_KEY;
 

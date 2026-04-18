@@ -95,3 +95,56 @@ void devcfgClearWifi() {
   s_nvs.remove("wf_pass");
   s_nvs.end();
 }
+
+// ---- LLM model + personality + services ---------------------------------
+String devcfgLlmModel() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("llm_model", "google/gemini-3.1-pro");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetLlmModel(const String &m) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("llm_model", m);
+  s_nvs.end();
+}
+
+String devcfgPersonality() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("persona", "");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetPersonality(const String &p) {
+  s_nvs.begin("daemon", false);
+  // NVS string entries are limited to ~4000 bytes; personalities this
+  // long would be silly but we still clamp as a safety net.
+  String clamped = p;
+  if (clamped.length() > 3800) clamped.remove(3800);
+  s_nvs.putString("persona", clamped);
+  s_nvs.end();
+}
+
+String devcfgServicesEnabled() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("svc_en", "[]");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetServicesEnabled(const String &jsonArray) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("svc_en", jsonArray);
+  s_nvs.end();
+}
+
+String devcfgCustomServices() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("svc_cu", "[]");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetCustomServices(const String &jsonArray) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("svc_cu", jsonArray);
+  s_nvs.end();
+}

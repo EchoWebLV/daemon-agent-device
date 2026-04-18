@@ -29,3 +29,22 @@ String  devcfgWifiSSID();
 String  devcfgWifiPassword();
 void    devcfgSetWifi(const String &ssid, const String &password);
 void    devcfgClearWifi();
+
+// LLM model id (uses the same provider/name format as the Chrome
+// extension, e.g. "google/gemini-3.1-pro", "openai/gpt-4o-mini").
+String  devcfgLlmModel();
+void    devcfgSetLlmModel(const String &m);
+
+// Custom personality — injected into the AI system prompt in place of the
+// default "You are Daemon..." text. Empty string means "use default".
+String  devcfgPersonality();
+void    devcfgSetPersonality(const String &p);
+
+// JSON arrays stored as strings (so we can ship them straight to the web
+// UI). Contents:
+//   svc_enabled: array of service ids the user has flipped on
+//   svc_custom:  array of full X402Service JSON objects added via .md
+String  devcfgServicesEnabled();
+void    devcfgSetServicesEnabled(const String &jsonArray);
+String  devcfgCustomServices();
+void    devcfgSetCustomServices(const String &jsonArray);
