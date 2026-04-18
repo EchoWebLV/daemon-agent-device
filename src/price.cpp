@@ -41,6 +41,32 @@ void priceRefresh() {
 
 double priceSOLUSD() { return s_priceUsd; }
 
+// --- Background task --------------------------------------------------
+static TaskHandle_t      s_task    = nullptr;
+static SemaphoreHandle_t s_trigger = nullptr;
+
+static void priceTaskEntry(void *) {
+  for (;;) {
+    if (xSemaphoreTake(s_trigger, portMAX_DELAY) == pdTRUE) {
+      priceRefresh();
+    }
+  }
+}
+
+static void ensurePriceTask() {
+  if (s_task) return;
+  s_trigger = xSemaphoreCreateBinary();
+  // 8 KB — TLS handshake + HTTPClient + ArduinoJson easily use >4 KB.
+  // A smaller stack here causes the canary watchpoint to trigger.
+  xTaskCreatePinnedToCore(priceTaskEntry, "price", 8192, nullptr,
+                          1, &s_task, 1);
+}
+
+void priceRequestRefresh() {
+  ensurePriceTask();
+  if (s_trigger) xSemaphoreGive(s_trigger);
+}
+
 String priceDisplayString() {
   if (s_priceUsd <= 0) return "SOL --";
   char buf[24];

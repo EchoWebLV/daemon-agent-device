@@ -105,15 +105,15 @@ static void maybeRefreshPrice() {
   if (!s_wifiOk) return;
   if (millis() < s_nextPriceMs) return;
   s_nextPriceMs = millis() + PRICE_INTERVAL_MS;
-  priceRefresh();
-  creatureSetPrice(priceDisplayString());
+  priceRequestRefresh();                          // runs on background task
+  creatureSetPrice(priceDisplayString());         // updates next frame
 }
 
 static void maybeRefreshWallet() {
   if (!s_wifiOk) return;
   if (millis() < s_nextWalletMs) return;
   s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
-  walletRefresh();
+  walletRequestRefresh();                         // runs on background task
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +198,11 @@ void setup() {
   s_nextPriceMs  = millis() + PRICE_INTERVAL_MS;
   s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
 
+  // One-shot TTS diagnostic so we can see via serial what ElevenLabs
+  // actually returns when POSTed through HTTPClient, and compare against
+  // what the patched library sees. Helps isolate streaming bugs.
+  if (s_wifiOk) voiceDiagnose();
+
   // Boot greeting — proves Wi-Fi, Gemini and the speaker are all alive.
   if (s_wifiOk && s_voiceOk) {
     creatureSetMood(MOOD_TALK);
@@ -231,6 +236,7 @@ void loop() {
   creatureSetTalking(talking);
   if (wasTalking && !talking) {
     creatureSetMood(MOOD_IDLE);
+    creatureSetSubtitle("");      // clear the reply as soon as audio ends
     serverSetStatus("idle");
   }
   wasTalking = talking;
@@ -245,13 +251,23 @@ void loop() {
   voiceLoop();
   pumpSerialInput();
 
-  // Background tickers — only run when the mic/speaker pipeline is quiet,
-  // so a talking Daemon never stutters due to a Helius fetch.
+  // Background tickers — only run when audio is quiet so we don't stutter
+  // mid-playback. Wallet/price fetches themselves now live on background
+  // tasks (see wallet.cpp / price.cpp) so these are just cheap triggers.
   if (!voiceIsSpeaking()) {
     maybeRefreshPrice();
     maybeRefreshWallet();
   }
 
-  // Target ~30 FPS for animation.
-  delay(16);
+  // Deadline-based pacing instead of a fixed delay(16): if this iteration
+  // took longer than the 16 ms frame budget we sleep less (or not at all)
+  // on the next one, keeping animation time-correct even when a tick was
+  // heavy (e.g., a swipe that triggered a full redraw).
+  static uint32_t s_nextFrameMs = 0;
+  uint32_t now = millis();
+  if (s_nextFrameMs <= now) s_nextFrameMs = now + 16;
+  uint32_t sleep = s_nextFrameMs - now;
+  if (sleep > 32) sleep = 32;               // never sleep longer than 2 frames
+  s_nextFrameMs += 16;
+  delay(sleep < 1 ? 1 : sleep);
 }

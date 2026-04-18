@@ -105,9 +105,17 @@ bool Audio::connecttoElevenlabs(const char* voiceId, const char* apiKey,
     AUDIO_INFO("SSL to ElevenLabs in %u ms, free heap %u",
                (unsigned)(millis() - t), (unsigned)ESP.getFreeHeap());
 
-    _client->write((const uint8_t*)rqh, rqhLen);
-    _client->write((const uint8_t*)body, bodyLen);
+    size_t totalLen = (size_t)rqhLen + bodyLen;
+    char *both = (char*)malloc(totalLen);
+    if(!both) { free(body); AUDIO_INFO("oom writing"); return false; }
+    memcpy(both,           rqh,  rqhLen);
+    memcpy(both + rqhLen,  body, bodyLen);
+    size_t wrote = _client->write((const uint8_t*)both, totalLen);
     free(body);
+    free(both);
+    AUDIO_INFO("ElevenLabs POST: headers=%d body=%u wrote=%u",
+               rqhLen, (unsigned)bodyLen, (unsigned)wrote);
+    if(wrote != totalLen) AUDIO_INFO("WARN: short write on POST");
 
     strncpy(m_lastHost, host, sizeof(m_lastHost) - 1);
     m_f_running     = true;

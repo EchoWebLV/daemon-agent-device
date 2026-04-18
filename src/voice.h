@@ -23,3 +23,4 @@ void voiceLoop();
 bool voiceSpeak(const String &text);
 bool voiceIsSpeaking();
 void voiceStop();
+void voiceDiagnose();   // one-shot HTTP diag for debugging

@@ -183,6 +183,33 @@ void walletRefresh() {
                 s_solBalance, (unsigned)s_tokens.size());
 }
 
+// --- Background task --------------------------------------------------
+static TaskHandle_t     s_task    = nullptr;
+static SemaphoreHandle_t s_trigger = nullptr;
+
+static void walletTaskEntry(void *) {
+  for (;;) {
+    if (xSemaphoreTake(s_trigger, portMAX_DELAY) == pdTRUE) {
+      walletRefresh();
+    }
+  }
+}
+
+static void ensureWalletTask() {
+  if (s_task) return;
+  s_trigger = xSemaphoreCreateBinary();
+  // 10 KB — wallet refresh does TWO back-to-back TLS calls (getBalance +
+  // getTokenAccountsByOwner) plus JSON parsing of a potentially-large
+  // response, so we give it more headroom than the price task.
+  xTaskCreatePinnedToCore(walletTaskEntry, "wallet", 10240, nullptr,
+                          1, &s_task, 1);
+}
+
+void walletRequestRefresh() {
+  ensureWalletTask();
+  if (s_trigger) xSemaphoreGive(s_trigger);
+}
+
 // ---------------------------------------------------------------------------
 // Context string for the AI
 // ---------------------------------------------------------------------------

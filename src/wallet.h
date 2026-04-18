@@ -25,6 +25,10 @@ String walletPubkey();
 // of SPL token accounts. Safe to call periodically (once a minute).
 void walletRefresh();
 
+// Fire-and-forget: asks the background wallet task to perform a refresh.
+// Returns immediately, so the main loop never freezes during RPC calls.
+void walletRequestRefresh();
+
 // Most recent values from walletRefresh(). All read-only.
 double walletSolBalance();
 const std::vector<TokenHolding> &walletTokens();

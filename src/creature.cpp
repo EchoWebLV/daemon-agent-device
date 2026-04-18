@@ -63,6 +63,18 @@ static bool         s_forceBlink = false;
 static float        s_animPhase  = 0.0f;
 static float        s_mouthPhase = 0.0f;
 static float        s_mouthEnv   = 0.0f;
+
+// Idle-animation extras: gentle bob, slow side-to-side gaze drift, and
+// occasional "character moments" (double-blink, wink, micro-squint).
+static float        s_bobPhase   = 0.0f;
+static float        s_gazeX = 0.0f, s_gazeY = 0.0f;
+static float        s_gazeTargetX = 0.0f, s_gazeTargetY = 0.0f;
+static uint32_t     s_nextGazeMoveMs = 0;
+static uint32_t     s_nextQuirkMs    = 0;
+enum QuirkKind : uint8_t { QUIRK_NONE, QUIRK_DOUBLE_BLINK, QUIRK_WINK_L, QUIRK_WINK_R };
+static QuirkKind    s_quirk         = QUIRK_NONE;
+static uint32_t     s_quirkStartMs  = 0;
+static int          s_quirkStage    = 0;
 static String       s_status;
 static String       s_lastStatusDrawn = "\x01invalid\x01";
 static String       s_price;
@@ -141,9 +153,10 @@ static void drawEye(TFT_eSprite *s, int cxScreen, int cyScreen, float angle,
 // ---------------------------------------------------------------------------
 // Mouth — an unfilled #0F5DFD capsule, scales vertically when talking.
 // ---------------------------------------------------------------------------
-static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood) {
+static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood,
+                      int yOffset = 0) {
   int cx = MOUTH_CX - FACE_X;
-  int cy = MOUTH_CY - FACE_Y;
+  int cy = MOUTH_CY - FACE_Y + yOffset;
 
   if (openness < 0.0f) openness = 0.0f;
   if (openness > 1.0f) openness = 1.0f;
@@ -317,23 +330,74 @@ void creatureTick() {
   if (dt > 0.25f) dt = 0.25f;
   s_lastTickMs = now;
 
+  // Breathing pulse (eye brightness + slight scale).
   s_animPhase += dt * (s_mood == MOOD_LISTEN ? 2.4f : 1.5f);
   if (s_animPhase > 2.0f * (float)PI) s_animPhase -= 2.0f * (float)PI;
   float pulse = sinf(s_animPhase);
 
-  float blinkT = -1.0f;
-  if (s_forceBlink && now - s_blinkStartMs > 400) {
-    s_blinkStartMs = now;
-    s_forceBlink = false;
+  // Vertical bob — slow sine at 0.35 Hz, ±2 px. Makes the face feel alive.
+  s_bobPhase += dt * 2.2f;
+  int16_t bobDY = (int16_t)(sinf(s_bobPhase) * 2.0f);
+
+  // Gaze drift — pick a random target every 5-10 s, lerp toward it.
+  if (now > s_nextGazeMoveMs) {
+    s_gazeTargetX = (float)random(-6, 7);   // ±6 px
+    s_gazeTargetY = (float)random(-3, 4);   // ±3 px
+    s_nextGazeMoveMs = now + (uint32_t)random(5000, 11000);
   }
-  bool blinking = (now - s_blinkStartMs) < 200;
-  if (blinking) {
-    blinkT = (now - s_blinkStartMs) / 200.0f;
-  } else if (now - s_lastBlinkMs > (uint32_t)random(3000, 6000)) {
-    s_blinkStartMs = now;
-    s_lastBlinkMs = now;
+  s_gazeX += (s_gazeTargetX - s_gazeX) * min(1.0f, dt * 1.5f);
+  s_gazeY += (s_gazeTargetY - s_gazeY) * min(1.0f, dt * 1.5f);
+
+  // Quirk scheduling — every 12-22 s fire a small character moment.
+  if (s_quirk == QUIRK_NONE && now > s_nextQuirkMs) {
+    int roll = random(0, 3);
+    s_quirk = (roll == 0) ? QUIRK_DOUBLE_BLINK
+            : (roll == 1) ? QUIRK_WINK_L
+                          : QUIRK_WINK_R;
+    s_quirkStartMs = now;
+    s_quirkStage = 0;
+    s_nextQuirkMs = now + (uint32_t)random(12000, 22000);
   }
 
+  // Per-eye blink phase. Quirks override the normal blink timer.
+  float blinkL = -1.0f, blinkR = -1.0f;
+
+  auto standardBlink = [&]() -> float {
+    if (s_forceBlink && now - s_blinkStartMs > 400) {
+      s_blinkStartMs = now;
+      s_forceBlink = false;
+    }
+    if (now - s_blinkStartMs < 200) {
+      return (now - s_blinkStartMs) / 200.0f;
+    }
+    if (now - s_lastBlinkMs > (uint32_t)random(3000, 6000)) {
+      s_blinkStartMs = now;
+      s_lastBlinkMs  = now;
+    }
+    return -1.0f;
+  };
+
+  if (s_quirk == QUIRK_DOUBLE_BLINK) {
+    // Two blinks 250 ms apart
+    uint32_t elapsed = now - s_quirkStartMs;
+    if (elapsed < 200)      { blinkL = blinkR = elapsed / 200.0f; }
+    else if (elapsed < 450) { /* gap */ }
+    else if (elapsed < 650) { blinkL = blinkR = (elapsed - 450) / 200.0f; }
+    else                    { s_quirk = QUIRK_NONE; }
+  } else if (s_quirk == QUIRK_WINK_L || s_quirk == QUIRK_WINK_R) {
+    uint32_t elapsed = now - s_quirkStartMs;
+    if (elapsed < 400) {
+      float t = elapsed / 400.0f;                // slower wink
+      if (s_quirk == QUIRK_WINK_L) blinkL = t;
+      else                         blinkR = t;
+    } else { s_quirk = QUIRK_NONE; }
+  } else {
+    float b = standardBlink();
+    blinkL = b;
+    blinkR = b;
+  }
+
+  // Mouth drive — slight breathing motion even when idle.
   float targetOpen = 0.0f;
   if (s_talking || s_mood == MOOD_TALK) {
     s_mouthPhase += dt * 13.0f;
@@ -341,16 +405,19 @@ void creatureTick() {
     float b = 0.5f * (1.0f + sinf(s_mouthPhase * 0.37f + 1.1f));
     targetOpen = a * 0.7f + b * 0.3f;
     if (((int)(s_mouthPhase * 0.3f)) % 7 == 0) targetOpen *= 0.3f;
+  } else {
+    // tiny idle twitch
+    targetOpen = 0.05f + 0.03f * sinf(s_animPhase * 0.5f);
   }
   s_mouthEnv += (targetOpen - s_mouthEnv) * min(1.0f, dt * 18.0f);
 
-  // Black background, then eyes + mouth directly into the face buffer.
   s_faceBuf->fillSprite(C_BG);
-  drawEye(s_faceBuf, LEFT_EYE_CX,  LEFT_EYE_CY,  LEFT_EYE_ANGLE,
-          pulse, blinkT, s_mood);
-  drawEye(s_faceBuf, RIGHT_EYE_CX, RIGHT_EYE_CY, RIGHT_EYE_ANGLE,
-          pulse, blinkT, s_mood);
-  drawMouth(s_faceBuf, s_mouthEnv, s_mood);
+  int16_t leftX  = LEFT_EYE_CX  + (int16_t)s_gazeX;
+  int16_t rightX = RIGHT_EYE_CX + (int16_t)s_gazeX;
+  int16_t eyeY   = LEFT_EYE_CY  + (int16_t)s_gazeY + bobDY;
+  drawEye(s_faceBuf, leftX,  eyeY, LEFT_EYE_ANGLE,  pulse, blinkL, s_mood);
+  drawEye(s_faceBuf, rightX, eyeY, RIGHT_EYE_ANGLE, pulse, blinkR, s_mood);
+  drawMouth(s_faceBuf, s_mouthEnv, s_mood, bobDY);
   s_faceBuf->pushSprite(FACE_X, FACE_Y);
 
   drawStatusIfChanged(false);

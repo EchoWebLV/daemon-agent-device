@@ -7,6 +7,7 @@
 #include <Arduino.h>
 
 bool    priceBegin();
-void    priceRefresh();         // blocking HTTPS fetch; call every ~30 s
-double  priceSOLUSD();          // most recent known price; 0 if unknown
-String  priceDisplayString();   // e.g. "SOL $204.37", or "SOL --" if unknown
+void    priceRefresh();         // blocking HTTPS fetch
+void    priceRequestRefresh();  // fire-and-forget, runs on background task
+double  priceSOLUSD();
+String  priceDisplayString();
