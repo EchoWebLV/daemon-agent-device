@@ -1,0 +1,11 @@
+.pio
+.pioenvs
+.piolibdeps
+.vscode
+.clang_complete
+.gcc-flags.json
+.DS_Store
+.pio-venv
+
+# Never commit real Wi-Fi / API credentials
+src/secrets.h
