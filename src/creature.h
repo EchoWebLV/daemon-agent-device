@@ -36,8 +36,13 @@ void creatureSetTalking(bool on);
 // Tell the creature to blink ASAP (used when it first wakes, etc).
 void creatureForceBlink();
 
-// Draw a small status string in the top status bar (Wi-Fi IP, etc).
+// Draw a small status string on the LEFT of the top status bar
+// (Wi-Fi IP, "thinking", etc).
 void creatureSetStatus(const String &s);
+
+// Draw a small ticker on the RIGHT of the top status bar
+// (e.g. "SOL $204.37"). Pass empty string to hide.
+void creatureSetPrice(const String &s);
 
 // Subtitle area under Daemon. Pass an empty string to clear it. Word-wraps
 // across up to 3 lines; anything longer is truncated with an ellipsis.

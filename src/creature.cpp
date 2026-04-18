@@ -107,6 +107,8 @@ static float        s_mouthPhase = 0.0f;
 static float        s_mouthEnv   = 0.0f;
 static String       s_status;
 static String       s_lastStatusDrawn = "\x01invalid\x01";
+static String       s_price;
+static String       s_lastPriceDrawn  = "\x01invalid\x01";
 static String       s_subPrefix;
 static String       s_subText;
 static String       s_lastSubDrawn = "\x01invalid\x01";
@@ -276,15 +278,31 @@ static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood) {
 // ---------------------------------------------------------------------------
 // Status bar on the top of the display.
 // ---------------------------------------------------------------------------
+static constexpr uint16_t C_PRICE = 0x07FF;   // near-cyan for the SOL ticker
+
 static void drawStatusIfChanged(bool force) {
-  if (!force && s_status == s_lastStatusDrawn) return;
+  bool statusChanged = s_status != s_lastStatusDrawn;
+  bool priceChanged  = s_price  != s_lastPriceDrawn;
+  if (!force && !statusChanged && !priceChanged) return;
+
   s_tft->fillRect(0, 0, SCR_W, STATUS_H, C_BG);
-  s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextFont(1);
+
+  // LEFT: status
+  s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextColor(C_STATUS, C_BG);
   s_tft->setCursor(4, 4);
   s_tft->print(s_status);
+
+  // RIGHT: price ticker
+  if (s_price.length() > 0) {
+    s_tft->setTextDatum(TR_DATUM);
+    s_tft->setTextColor(C_PRICE, C_BG);
+    s_tft->drawString(s_price, SCR_W - 4, 4);
+  }
+
   s_lastStatusDrawn = s_status;
+  s_lastPriceDrawn  = s_price;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +421,7 @@ void creatureSetMood(CreatureMood m)    { s_mood = m; }
 void creatureSetTalking(bool on)        { s_talking = on; if (!on) s_mouthEnv = 0.0f; }
 void creatureForceBlink()               { s_forceBlink = true; }
 void creatureSetStatus(const String &s) { s_status = s; }
+void creatureSetPrice (const String &s) { s_price  = s; }
 void creatureSetSubtitle(const String &prefix, const String &text) {
   s_subPrefix = prefix;
   s_subText   = text;

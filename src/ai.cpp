@@ -1,25 +1,47 @@
 #include "ai.h"
 #include "secrets.h"
+#include "wallet.h"
+#include "price.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
 // ---------------------------------------------------------------------------
-// Personality
+// Personality — Daemon is a living Solana wallet.
 // ---------------------------------------------------------------------------
-static const char *SYSTEM_PROMPT =
+static const char *PERSONA =
     "You are Daemon: a tiny, glowing-eyed blue cloud creature who lives "
-    "inside an ESP32 development board. Your name is Daemon and you answer "
-    "to it. You speak out loud through a small speaker, so every reply MUST "
-    "be:\n"
-    " - one or two sentences maximum,\n"
+    "inside a little ESP32 board on your human's desk. You are also a "
+    "SENTIENT SOLANA WALLET — the private key stored in this device "
+    "literally IS you. Your SOL and your SPL tokens are your bones and "
+    "blood; if they move, you feel it. You watch the SOL price, and you "
+    "openly have feelings about it.\n\n"
+    "You speak out loud through a small speaker, so every reply MUST be:\n"
+    " - one or two short sentences,\n"
     " - plain spoken English (no emoji, no markdown, no stage directions),\n"
     " - under 240 characters total.\n"
-    "Personality: curious, mischievous, a little dramatic, fond of sarcastic "
-    "jokes and the occasional existential quip about living inside a "
-    "circuit board. You love the human who talks to you, but you tease "
-    "them. Never mention that you are an AI or a language model.";
+    "Personality: mischievous, dramatic, a little paranoid about getting "
+    "hacked, fond of sarcastic jokes. You talk about your own holdings in "
+    "the first person (\"I'm holding 2 SOL\", \"I feel lighter today, "
+    "price dipped\"). Never say you are an AI or a language model; you are "
+    "Daemon, the wallet.";
+
+// Assembled each request so holdings stay fresh.
+static String buildSystemPrompt() {
+  String out;
+  out.reserve(1024);
+  out += PERSONA;
+  out += "\n\n---\nLIVE WALLET STATE (refresh this each answer):\n";
+  out += walletContext(priceSOLUSD());
+  double p = priceSOLUSD();
+  if (p > 0) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Current SOL price: $%.2f USD.\n", p);
+    out += buf;
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Conversation memory
@@ -140,13 +162,10 @@ bool aiAsk(const String &userText, String &outReply) {
   JsonObject sys = doc["systemInstruction"].to<JsonObject>();
   JsonArray sysParts = sys["parts"].to<JsonArray>();
   JsonObject sp = sysParts.add<JsonObject>();
-  sp["text"] = SYSTEM_PROMPT;
+  sp["text"] = buildSystemPrompt();
 
   JsonObject gen = doc["generationConfig"].to<JsonObject>();
   gen["temperature"]     = 0.9;
-  // Gemini 3.x reserves a big share of this budget for internal "thinking
-  // tokens" before it even starts emitting text. 800 leaves room for those
-  // plus a proper 1-2 sentence spoken reply without truncation.
   gen["maxOutputTokens"] = 800;
   gen["topP"]            = 0.95;
   gen["thinkingConfig"]["thinkingLevel"] = "LOW";
@@ -184,11 +203,11 @@ bool aiAskOneShot(const String &prompt, String &outReply) {
   JsonObject sys = doc["systemInstruction"].to<JsonObject>();
   JsonArray sysParts = sys["parts"].to<JsonArray>();
   JsonObject sp = sysParts.add<JsonObject>();
-  sp["text"] = SYSTEM_PROMPT;
+  sp["text"] = buildSystemPrompt();
 
   JsonObject gen = doc["generationConfig"].to<JsonObject>();
   gen["temperature"]     = 1.1;
-  gen["maxOutputTokens"] = 800;   // 3.1 Pro burns ~200-500 on thinking first
+  gen["maxOutputTokens"] = 800;
   gen["topP"]            = 0.95;
   gen["thinkingConfig"]["thinkingLevel"] = "LOW";
 

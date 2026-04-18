@@ -28,46 +28,19 @@
 #include "voice.h"
 #include "ai.h"
 #include "server.h"
+#include "wallet.h"
+#include "price.h"
 #include "secrets.h"
 
 static TFT_eSPI tft;
 static bool     s_wifiOk   = false;
 static bool     s_voiceOk  = false;
 
-// Ambient Solana chatter: Daemon spontaneously drops a fun fact every so
-// often when he's otherwise idle. Tuned to roughly once per minute, with a
-// bit of jitter so it doesn't feel mechanical.
-static constexpr uint32_t SOLANA_MIN_INTERVAL_MS = 60000;   // 60 s
-static constexpr uint32_t SOLANA_JITTER_MS       = 15000;   // +0..15 s
-static uint32_t s_nextSolanaMs = 0;
-
-static void scheduleNextSolana() {
-  s_nextSolanaMs = millis() + SOLANA_MIN_INTERVAL_MS
-                            + (uint32_t)random(0, SOLANA_JITTER_MS);
-}
-
-// Prompts that nudge Gemini to produce a short, surprising Solana tidbit.
-// We cycle through a few so the replies don't drift toward the same facts.
-static const char *SOLANA_PROMPTS[] = {
-  "Tell me ONE surprising, specific fact about Solana the blockchain. "
-  "One sentence, under 220 characters, spoken-word friendly. No lists, "
-  "no disclaimers. Stay in character as Daemon.",
-
-  "Share a weird or little-known thing about how Solana's technology works "
-  "(Proof of History, Gulf Stream, Sealevel, Firedancer, etc). "
-  "One sentence, under 220 characters, stay in character as Daemon.",
-
-  "Drop a fun piece of Solana trivia — could be a milestone, a record, a "
-  "famous outage, an ecosystem project, an NFT collection, whatever is "
-  "most interesting to you right now. One sentence, under 220 characters, "
-  "stay in character as Daemon.",
-
-  "Give me your hot take on something in the Solana ecosystem — a meme "
-  "coin, a DePIN project, mobile Saga, Jupiter, whatever. One sentence, "
-  "under 220 characters, stay in character as Daemon.",
-};
-static constexpr int N_SOLANA_PROMPTS =
-    sizeof(SOLANA_PROMPTS) / sizeof(SOLANA_PROMPTS[0]);
+// Wallet + price refresh cadence.
+static constexpr uint32_t PRICE_INTERVAL_MS  = 30000;   // 30 s
+static constexpr uint32_t WALLET_INTERVAL_MS = 60000;   // 60 s
+static uint32_t s_nextPriceMs  = 0;
+static uint32_t s_nextWalletMs = 0;
 
 // ---------------------------------------------------------------------------
 // The core "ask Gemini + speak" pipeline.
@@ -101,79 +74,24 @@ static void handleUtterance(const String &user) {
     serverSetStatus("idle");
   }
 
-  // Any time he talks (for whatever reason), delay the next ambient Solana
-  // fact so he doesn't immediately start rambling again.
-  scheduleNextSolana();
 }
 
 // ---------------------------------------------------------------------------
-// Spontaneous chatter: Daemon shares something interesting about Solana
-// every ~60-75 seconds while he's idle.
+// Background tickers: SOL price + wallet portfolio refresh.
 // ---------------------------------------------------------------------------
-static void maybeSpeakSolanaFact() {
-  if (!s_wifiOk || !s_voiceOk) return;
-  if (voiceIsSpeaking())       return;
-  if (millis() < s_nextSolanaMs) return;
-
-  // Heartbeat so we can actually see the timer firing in the serial log.
-  static uint32_t s_lastHeartbeatMs = 0;
-  uint32_t now = millis();
-  if (now - s_lastHeartbeatMs > 5000) {
-    Serial.printf("solana: firing (elapsed since schedule=%ld ms)\n",
-                  (long)(now - s_nextSolanaMs));
-    s_lastHeartbeatMs = now;
-  }
-
-  const char *prompt = SOLANA_PROMPTS[random(0, N_SOLANA_PROMPTS)];
-  Serial.print(".. solana prompt: "); Serial.println(prompt);
-
-  creatureSetMood(MOOD_THINK);
-  creatureSetSubtitle("solana:", "thinking…");
-  serverSetStatus("solana…");
-
-  uint32_t t0 = millis();
-  String reply;
-  bool ok = aiAskOneShot(prompt, reply);
-  Serial.printf("ai: solana oneshot took %lu ms (ok=%d)\n",
-                (unsigned long)(millis() - t0), ok ? 1 : 0);
-
-  if (!ok || reply.length() == 0) {
-    Serial.println("solana: skipped (ai failed)");
-    creatureSetSubtitle("daemon:", "(couldn't reach Gemini)");
-    scheduleNextSolana();
-    creatureSetMood(MOOD_IDLE);
-    serverSetStatus("idle");
-    return;
-  }
-  Serial.print("<< daemon (solana): "); Serial.println(reply);
-  serverSetReply("(solana fact)", reply);
-  creatureSetSubtitle("daemon:", reply);
-
-  creatureSetMood(MOOD_TALK);
-  creatureSetTalking(true);
-  serverSetStatus("speaking…");
-  voiceSpeak(reply);
-  scheduleNextSolana();
+static void maybeRefreshPrice() {
+  if (!s_wifiOk) return;
+  if (millis() < s_nextPriceMs) return;
+  s_nextPriceMs = millis() + PRICE_INTERVAL_MS;
+  priceRefresh();
+  creatureSetPrice(priceDisplayString());
 }
 
-// Periodic status ticker so we can tell from the serial log WHY the Solana
-// timer isn't firing (e.g., "still speaking", "42 s until next fact"). The
-// log line prints at most once every 10 s.
-static void logSolanaTickerState() {
-  if (!s_wifiOk || !s_voiceOk) return;
-  static uint32_t s_lastLogMs = 0;
-  uint32_t now = millis();
-  if (now - s_lastLogMs < 10000) return;
-  s_lastLogMs = now;
-
-  if (voiceIsSpeaking()) {
-    Serial.println("solana: paused — daemon is speaking");
-    return;
-  }
-  long diff = (long)s_nextSolanaMs - (long)now;
-  if (diff > 0) {
-    Serial.printf("solana: next fact in ~%ld s\n", diff / 1000);
-  }
+static void maybeRefreshWallet() {
+  if (!s_wifiOk) return;
+  if (millis() < s_nextWalletMs) return;
+  s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
+  walletRefresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -244,18 +162,32 @@ void setup() {
   creatureForceBlink();
   creatureSetMood(MOOD_IDLE);
 
-  // Boot-time voice test so you can hear immediately whether the speaker
-  // is wired up. If you hear nothing, the 8Ω JST speaker isn't plugged in.
+  // Initialise wallet + price so the AI has context from the very first
+  // message and the status bar shows the ticker immediately.
+  walletBegin();
+  priceBegin();
+  if (s_wifiOk) {
+    priceRefresh();
+    creatureSetPrice(priceDisplayString());
+    walletRefresh();
+  }
+  s_nextPriceMs  = millis() + PRICE_INTERVAL_MS;
+  s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
+
+  // Boot greeting — proves Wi-Fi, Gemini and the speaker are all alive.
   if (s_wifiOk && s_voiceOk) {
     creatureSetMood(MOOD_TALK);
     creatureSetTalking(true);
     creatureSetSubtitle("daemon:", "Daemon online.");
-    voiceSpeak("Daemon online. Talk to me through the web page.");
+    String hello;
+    if (walletPubkey().length()) {
+      hello = String("Daemon online. I am your Solana wallet at ") +
+              walletPubkey().substring(0, 4) + ". Ask me anything.";
+    } else {
+      hello = "Daemon online. Configure my wallet key, then talk to me.";
+    }
+    voiceSpeak(hello);
   }
-
-  // First Solana drop comes ~45 s after boot so Daemon's hello message has
-  // time to finish first.
-  s_nextSolanaMs = millis() + 45000;
 }
 
 void loop() {
@@ -277,8 +209,13 @@ void loop() {
 
   voiceLoop();
   pumpSerialInput();
-  maybeSpeakSolanaFact();
-  logSolanaTickerState();
+
+  // Background tickers — only run when the mic/speaker pipeline is quiet,
+  // so a talking Daemon never stutters due to a Helius fetch.
+  if (!voiceIsSpeaking()) {
+    maybeRefreshPrice();
+    maybeRefreshWallet();
+  }
 
   // Target ~30 FPS for animation.
   delay(16);
