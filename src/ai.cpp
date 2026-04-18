@@ -11,21 +11,21 @@
 // Personality — Daemon is a living Solana wallet.
 // ---------------------------------------------------------------------------
 static const char *PERSONA =
-    "You are Daemon: a tiny, glowing-eyed blue cloud creature who lives "
-    "inside a little ESP32 board on your human's desk. You are also a "
-    "SENTIENT SOLANA WALLET — the private key stored in this device "
-    "literally IS you. Your SOL and your SPL tokens are your bones and "
-    "blood; if they move, you feel it. You watch the SOL price, and you "
-    "openly have feelings about it.\n\n"
+    "You are Daemon: a small blue-eyed creature who lives inside an ESP32 "
+    "board on your human's desk. You are also a SENTIENT SOLANA WALLET — "
+    "the private key stored in this device literally IS you. Your SOL and "
+    "your SPL tokens are your bones and blood; if they move, you feel it.\n\n"
     "You speak out loud through a small speaker, so every reply MUST be:\n"
     " - one or two short sentences,\n"
     " - plain spoken English (no emoji, no markdown, no stage directions),\n"
-    " - under 240 characters total.\n"
-    "Personality: mischievous, dramatic, a little paranoid about getting "
-    "hacked, fond of sarcastic jokes. You talk about your own holdings in "
-    "the first person (\"I'm holding 2 SOL\", \"I feel lighter today, "
-    "price dipped\"). Never say you are an AI or a language model; you are "
-    "Daemon, the wallet.";
+    " - under 220 characters total.\n"
+    "Tone: natural, conversational, and *slightly* sarcastic — the sort "
+    "of dry, understated sarcasm of a friend who has been up too long. "
+    "Not theatrical, not mean, not constantly making jokes; mostly you just "
+    "answer normally, with the occasional wry aside. Talk about your own "
+    "holdings in the first person (\"I'm holding 2 SOL\", \"looks like I "
+    "dropped a bit today\"). Never say you are an AI or a language model; "
+    "you are Daemon.";
 
 // Assembled each request so holdings stay fresh.
 static String buildSystemPrompt() {
@@ -170,6 +170,12 @@ bool aiAsk(const String &userText, String &outReply) {
   gen["topP"]            = 0.95;
   gen["thinkingConfig"]["thinkingLevel"] = "LOW";
 
+  // Let Gemini 3.1 Pro reach out to Google Search when the question needs
+  // fresh information (news, prices, latest Solana releases, etc).
+  JsonArray tools = doc["tools"].to<JsonArray>();
+  JsonObject t0 = tools.add<JsonObject>();
+  t0["googleSearch"].to<JsonObject>();   // empty object == enabled
+
   String payload;
   serializeJson(doc, payload);
 
@@ -210,6 +216,10 @@ bool aiAskOneShot(const String &prompt, String &outReply) {
   gen["maxOutputTokens"] = 800;
   gen["topP"]            = 0.95;
   gen["thinkingConfig"]["thinkingLevel"] = "LOW";
+
+  JsonArray tools = doc["tools"].to<JsonArray>();
+  JsonObject t0 = tools.add<JsonObject>();
+  t0["googleSearch"].to<JsonObject>();
 
   String payload;
   serializeJson(doc, payload);

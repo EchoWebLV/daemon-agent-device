@@ -30,6 +30,8 @@
 #include "server.h"
 #include "wallet.h"
 #include "price.h"
+#include "touch.h"
+#include "walletscreen.h"
 #include "secrets.h"
 
 static TFT_eSPI tft;
@@ -42,6 +44,23 @@ static constexpr uint32_t WALLET_INTERVAL_MS = 60000;   // 60 s
 static uint32_t s_nextPriceMs  = 0;
 static uint32_t s_nextWalletMs = 0;
 
+// Which of the two screens is currently shown.
+enum Screen : uint8_t {
+  SCREEN_CREATURE = 0,
+  SCREEN_WALLET   = 1,
+};
+static Screen s_screen = SCREEN_CREATURE;
+
+static void switchScreen(Screen target) {
+  if (target == s_screen) return;
+  s_screen = target;
+  if (target == SCREEN_CREATURE) {
+    creatureRepaint();
+  } else {
+    walletScreenDraw();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The core "ask Gemini + speak" pipeline.
 // ---------------------------------------------------------------------------
@@ -49,7 +68,10 @@ static void handleUtterance(const String &user) {
   Serial.print(">> you:    "); Serial.println(user);
 
   creatureSetMood(MOOD_THINK);
-  creatureSetSubtitle("you:", user);
+  // Flip the subtitle to "thinking…" immediately so the user sees activity
+  // while Gemini grinds away; it gets overwritten with the reply text as
+  // soon as the HTTPS round-trip finishes.
+  creatureSetSubtitle("thinking…");
   serverSetStatus("thinking…");
 
   uint32_t t0 = millis();
@@ -62,7 +84,7 @@ static void handleUtterance(const String &user) {
   }
   Serial.print("<< daemon: "); Serial.println(reply);
   serverSetReply(user, reply);
-  creatureSetSubtitle("daemon:", reply);
+  creatureSetSubtitle(reply);
 
   if (s_voiceOk) {
     creatureSetMood(MOOD_TALK);
@@ -137,6 +159,8 @@ void setup() {
     tft.setCursor(10, 20);
     tft.print("creature sprite alloc failed");
   }
+  walletScreenBegin(&tft);
+  touchBegin();
   creatureSetStatus("WAKING UP");
   creatureTick();   // first frame
 
@@ -178,7 +202,7 @@ void setup() {
   if (s_wifiOk && s_voiceOk) {
     creatureSetMood(MOOD_TALK);
     creatureSetTalking(true);
-    creatureSetSubtitle("daemon:", "Daemon online.");
+    creatureSetSubtitle("Daemon online.");
     String hello;
     if (walletPubkey().length()) {
       hello = String("Daemon online. I am your Solana wallet at ") +
@@ -195,8 +219,13 @@ void loop() {
   // client is connected, so the animation keeps running.
   if (s_wifiOk) serverLoop();
 
-  // Drive the creature. We track talking-edge so we can drop the mouth
-  // animation and restore the status line when the reply finishes playing.
+  // Handle swipes. Left swipe → wallet, right swipe → creature.
+  SwipeDir sw = touchPollSwipe();
+  if (sw == SWIPE_LEFT)  switchScreen(SCREEN_WALLET);
+  if (sw == SWIPE_RIGHT) switchScreen(SCREEN_CREATURE);
+
+  // Talking state still drives the creature regardless of which screen is
+  // visible — audio and mood transitions are shared.
   static bool wasTalking = false;
   bool talking = voiceIsSpeaking();
   creatureSetTalking(talking);
@@ -205,7 +234,13 @@ void loop() {
     serverSetStatus("idle");
   }
   wasTalking = talking;
-  creatureTick();
+
+  // Per-screen tick.
+  if (s_screen == SCREEN_CREATURE) {
+    creatureTick();
+  } else {
+    walletScreenTick();
+  }
 
   voiceLoop();
   pumpSerialInput();

@@ -1,10 +1,7 @@
 #include "voice.h"
 #include "secrets.h"
 
-#include <Audio.h>              // schreibfaul1/ESP32-audioI2S
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <LittleFS.h>
+#include <Audio.h>              // schreibfaul1/ESP32-audioI2S (patched)
 #include <driver/i2s.h>
 
 // ---------------------------------------------------------------------------
@@ -14,21 +11,14 @@ static constexpr int I2S_BCLK = 48;
 static constexpr int I2S_LRC  = 38;
 static constexpr int I2S_DOUT = 47;
 
-// ---------------------------------------------------------------------------
-// Where we cache the MP3 that ElevenLabs returns.  LittleFS lives inside the
-// on-chip 16 MB flash — no external storage is required.  We re-use the
-// same filename every time; the old file is overwritten before playback.
-// ---------------------------------------------------------------------------
-static constexpr const char *TTS_FS_PATH = "/tts.mp3";
-
 static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
 static volatile bool s_ready     = false;
 static volatile bool s_playing   = false;
 
 // ---------------------------------------------------------------------------
-// Low-level I2S beeper — used once at boot to prove the DAC + amp + speaker
-// chain works before we hand I2S over to the ESP32-audioI2S library.
+// Boot-time hardware probe — direct-I2S beep so the user knows the speaker
+// chain is alive before any network / TTS is attempted.
 // ---------------------------------------------------------------------------
 static constexpr int BEEP_SR = 22050;
 
@@ -88,7 +78,7 @@ static void beepTone(uint16_t freq, uint16_t durationMs, int16_t amp) {
 }
 
 // ---------------------------------------------------------------------------
-// Audio task — pumps the MP3 decoder non-stop so I2S never starves.
+// Audio task — pumps the MP3 decoder continuously.
 // ---------------------------------------------------------------------------
 static void audioTaskEntry(void *) {
   for (;;) {
@@ -99,111 +89,9 @@ static void audioTaskEntry(void *) {
 }
 
 // ---------------------------------------------------------------------------
-// ElevenLabs HTTP POST → LittleFS
-// ---------------------------------------------------------------------------
-// JSON-escape a plain string for embedding inside a JSON string literal.
-static String jsonEscape(const String &in) {
-  String out;
-  out.reserve(in.length() + 16);
-  for (size_t i = 0; i < in.length(); ++i) {
-    char c = in[i];
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
-      default:
-        if ((uint8_t)c < 0x20) {
-          char buf[8];
-          snprintf(buf, sizeof(buf), "\\u%04x", (uint8_t)c);
-          out += buf;
-        } else {
-          out += c;
-        }
-    }
-  }
-  return out;
-}
-
-static bool fetchMp3ToFs(const String &text) {
-  if (String(ELEVENLABS_API_KEY).startsWith("PASTE-") ||
-      strlen(ELEVENLABS_API_KEY) < 10) {
-    Serial.println("voice: no ElevenLabs key configured");
-    return false;
-  }
-
-  String url = "https://api.elevenlabs.io/v1/text-to-speech/";
-  url += ELEVENLABS_VOICE_ID;
-  // Higher-bitrate MP3 renders noticeably louder than 32 kbps mono because
-  // the aggressive low-bitrate codec normalizes the signal down. 128 kbps
-  // @ 44.1 kHz still streams in ~2 s for a 1-sentence reply and the MP3
-  // decoder handles it easily.
-  url += "/stream?output_format=mp3_44100_128";
-
-  // Enable `use_speaker_boost` so ElevenLabs further compresses/limits
-  // the track for small speakers. Louder, more present.
-  String body = "{\"text\":\"";
-  body += jsonEscape(text);
-  body += "\",\"model_id\":\"";
-  body += ELEVENLABS_MODEL;
-  body += "\",\"voice_settings\":{\"stability\":0.45,\"similarity_boost\":0.8,"
-         "\"style\":0.3,\"use_speaker_boost\":true}}";
-
-  Serial.printf("voice: POST to ElevenLabs (%u chars)\n",
-                (unsigned)text.length());
-
-  WiFiClientSecure client;
-  client.setInsecure();              // ElevenLabs uses DigiCert; skip pinning.
-
-  HTTPClient http;
-  http.setTimeout(25000);
-  if (!http.begin(client, url)) {
-    Serial.println("voice: http.begin failed");
-    return false;
-  }
-  http.addHeader("xi-api-key",   ELEVENLABS_API_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept",       "audio/mpeg");
-
-  uint32_t t0 = millis();
-  int code = http.POST(body);
-  if (code != 200) {
-    String err = http.getString();
-    Serial.printf("voice: HTTP %d from ElevenLabs: %s\n", code, err.c_str());
-    http.end();
-    return false;
-  }
-
-  File f = LittleFS.open(TTS_FS_PATH, FILE_WRITE);
-  if (!f) {
-    Serial.println("voice: LittleFS open failed");
-    http.end();
-    return false;
-  }
-
-  // HTTPClient::writeToStream handles all three framings correctly —
-  // chunked transfer (which ElevenLabs uses for /stream), fixed
-  // Content-Length, and connection-close delimited — so we don't have
-  // to guess when the body ends.
-  int written = http.writeToStream(&f);
-  f.close();
-  http.end();
-
-  if (written <= 0) {
-    Serial.printf("voice: writeToStream failed (%d)\n", written);
-    return false;
-  }
-  Serial.printf("voice: wrote %d bytes of MP3 in %lu ms\n",
-                written, (unsigned long)(millis() - t0));
-  return true;
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 bool voiceBegin() {
-  // 1) hardware sanity beep
   Serial.println("voice: direct-I2S hardware probe (you should hear 3 beeps)");
   if (beepInstall()) {
     beepTone(660,  90, 12000);
@@ -216,25 +104,9 @@ bool voiceBegin() {
     Serial.println("voice: direct I2S install FAILED");
   }
 
-  // 2) filesystem for cached MP3s
-  if (!LittleFS.begin(/*formatOnFail=*/true)) {
-    Serial.println("voice: LittleFS mount FAILED");
-    return false;
-  }
-  size_t total = LittleFS.totalBytes();
-  size_t used  = LittleFS.usedBytes();
-  Serial.printf("voice: LittleFS %u/%u bytes used\n",
-                (unsigned)used, (unsigned)total);
-
-  // 3) hand I2S over to the Audio library for MP3 streaming from flash
   s_audio = new Audio(/*internalDAC=*/false);
   s_audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
   s_audio->setVolume(21);
-  // 3-band EQ cranked to +6 dB on every band (the library's max). Each band
-  // adds a few dB; stacked they're roughly +6 to +10 dB of perceived
-  // loudness beyond volume step 21. Safe on the PCM5101 since the DAC has
-  // plenty of headroom; the only risk is clipping on very loud source
-  // material, which ElevenLabs output is not.
   s_audio->setTone(6, 6, 6);
 
   BaseType_t ok = xTaskCreatePinnedToCore(
@@ -244,7 +116,7 @@ bool voiceBegin() {
     return false;
   }
   s_ready = true;
-  Serial.println("voice: ESP32-audioI2S + LittleFS ready");
+  Serial.println("voice: ElevenLabs streaming path ready");
   return true;
 }
 
@@ -256,15 +128,23 @@ bool voiceSpeak(const String &text) {
   if (!s_ready || !s_audio) return false;
   if (text.length() == 0) return false;
 
-  // Stop any in-flight playback first (holds the I2S port).
   if (s_audio->isRunning()) s_audio->stopSong();
 
-  // Blocking: fetch MP3 from ElevenLabs into flash, then start playback.
-  if (!fetchMp3ToFs(text)) return false;
+  Serial.printf("voice: streaming ElevenLabs (%u chars)\n",
+                (unsigned)text.length());
 
-  bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
+  // Single-call streaming path: the patched library opens the HTTPS socket,
+  // sends the POST, and starts feeding MP3 bytes into the decoder as soon
+  // as the first chunk arrives. No LittleFS round-trip, no wait for the
+  // full body. Typical time-to-first-sample is 300-700 ms instead of
+  // 1300-1800 ms on the old "download, then play" path.
+  bool ok = s_audio->connecttoElevenlabs(
+      ELEVENLABS_VOICE_ID,
+      ELEVENLABS_API_KEY,
+      text.c_str(),
+      ELEVENLABS_MODEL);
   s_playing = ok;
-  if (!ok) Serial.println("voice: connecttoFS failed");
+  if (!ok) Serial.println("voice: connecttoElevenlabs failed");
   return ok;
 }
 
@@ -275,6 +155,7 @@ void voiceStop() {
   s_playing = false;
 }
 
+// Library callbacks
 void audio_info(const char *info)    { Serial.print("[audio] ");    Serial.println(info); }
 void audio_id3data(const char *info) { Serial.print("[audio id3] "); Serial.println(info); }
 void audio_bitrate(const char *info) { Serial.print("[audio br] ");  Serial.println(info); }

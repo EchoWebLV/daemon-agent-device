@@ -24,6 +24,11 @@ enum CreatureMood : uint8_t {
 // called after tft.init(). Returns false if sprite allocation fails.
 bool creatureBegin(TFT_eSPI *tft);
 
+// Full repaint — clears the whole screen and redraws the body, status bar,
+// and subtitle. Call after coming back from a different screen (e.g. the
+// wallet view) so Daemon reappears cleanly.
+void creatureRepaint();
+
 // Advance animation by one frame. Call as often as you like (~20 Hz is
 // plenty); internal timing handles smoothing.
 void creatureTick();
@@ -46,5 +51,5 @@ void creatureSetPrice(const String &s);
 
 // Subtitle area under Daemon. Pass an empty string to clear it. Word-wraps
 // across up to 3 lines; anything longer is truncated with an ellipsis.
-// The prefix (e.g. "daemon:" or "you:") is rendered in a distinct color.
-void creatureSetSubtitle(const String &prefix, const String &text);
+// Every line is center-aligned.
+void creatureSetSubtitle(const String &text);
