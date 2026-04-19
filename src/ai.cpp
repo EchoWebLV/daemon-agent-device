@@ -6,6 +6,7 @@
 #include "x402.h"
 #include "tools.h"
 #include "memory.h"
+#include "mood.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -47,6 +48,16 @@ static String buildSystemPrompt() {
     snprintf(buf, sizeof(buf), "Current SOL price: $%.2f USD.\n", p);
     out += buf;
   }
+
+  // Inner state + recent-self anti-repeat block. This is the single
+  // biggest lever against "Daemon always says the same thing" — the
+  // system prompt is now materially different every turn based on
+  // uptime, local hour, silence length, mood/energy/curiosity, and
+  // the last few things Daemon already said (with an explicit "don't
+  // reuse these phrases" instruction). See src/mood.cpp for the
+  // update rules.
+  out += moodPromptContext();
+
   return out;
 }
 
@@ -235,14 +246,25 @@ bool aiAsk(const String &userText, String &outReply) {
   JsonArray working = msgsDoc.to<JsonArray>();
   seedWorkingMessages(working);
 
+  // Temperature + token budget are mood-driven now: a tired / grumpy
+  // Daemon gets terser and more predictable, a curious / wired Daemon
+  // gets hotter and more associative. That variance is also a big part
+  // of why replies stop feeling samey.
+  const float temp    = moodTemperature();
+  const int   maxTok  = moodMaxTokens();
+
   String reply;
-  bool ok = runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.7f, reply);
+  bool ok = runChatLoop(working, maxTok, temp, reply);
   if (!ok) {
     s_histLen--;              // roll back the pending user turn
     outReply = reply;
     return false;
   }
   pushTurn("model", reply);
+
+  // Feed the reply back into the anti-repeat ring so the next prompt's
+  // "do NOT reuse these phrases" block actually knows what we just said.
+  moodNoteDaemonReply(reply);
 
   // Persist this exchange to on-chain memory (fire-and-forget; runs on a
   // background task so chat latency stays the same).
@@ -277,5 +299,12 @@ bool aiAskOneShot(const String &prompt, String &outReply) {
   usr["role"]    = "user";
   usr["content"] = prompt;
 
-  return runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.7f, outReply);
+  // One-shot prompts (heartbeat chatter, tweet composition) also benefit
+  // from mood-driven variance — a sleepy 3am ambient line should sound
+  // different from a wired mid-afternoon one.
+  const float temp   = moodTemperature();
+  const int   maxTok = moodMaxTokens();
+  bool ok = runChatLoop(working, maxTok, temp, outReply);
+  if (ok) moodNoteDaemonReply(outReply);
+  return ok;
 }

@@ -28,6 +28,7 @@
 #include "creature.h"
 #include "voice.h"
 #include "ai.h"
+#include "mood.h"
 #include "server.h"
 #include "wallet.h"
 #include "price.h"
@@ -351,6 +352,13 @@ static void switchScreen(Screen target) {
 static void handleUtterance(const String &user) {
   Serial.print(">> you:    "); Serial.println(user);
 
+  // NOTE: we don't touch the mood silence-counter here because
+  // handleUtterance is ALSO the path heartbeats take. Calling
+  // moodNoteUserUtterance() in here would reset silenceMs every 5
+  // minutes and defeat the whole "alone with your thoughts" signal.
+  // Real human entry points — /say, the serial fallback — call
+  // moodNoteUserUtterance() themselves just before invoking us.
+
   // All the heavy work (LLM round-trip, tool calls, TTS fetch) now runs
   // on dedicated worker tasks, so this function just updates UI state
   // and enqueues the request. Returns in microseconds — the main loop
@@ -488,6 +496,7 @@ static void pumpSerialInput() {
         if (s_serialBuf == "/ar-test") {
           arweaveSelfTest();
         } else {
+          moodNoteUserUtterance();   // real human typing over USB serial
           handleUtterance(s_serialBuf);
         }
       }
@@ -526,6 +535,14 @@ void setup() {
   }
   Serial.printf("== Daemon booting (prev reset: %s, free heap: %u) ==\n",
                 rrName, (unsigned)ESP.getFreeHeap());
+
+  // Seed Daemon's inner-state tracker (mood / energy / curiosity /
+  // silence / uptime / local hour). Every LLM prompt from now on gets
+  // a natural-language snapshot of this appended, which is what kills
+  // the "always says the same thing" feeling. Safe to call before
+  // Wi-Fi — the NTP-dependent hour field just reports "unknown" until
+  // time() syncs later in setup().
+  moodBegin();
 
   tft.init();
   tft.setRotation(0);
@@ -600,7 +617,13 @@ void setup() {
     // include a Unix timestamp that X rejects if it's off by >5 min.
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     aiBegin();
-    serverBeginHttp(handleUtterance);
+    // Wrap handleUtterance for the web path so real human utterances from
+    // the phone reset the mood "silence" counter. Heartbeats share
+    // handleUtterance but deliberately don't go through this wrapper.
+    serverBeginHttp([](const String &userText) {
+      moodNoteUserUtterance();
+      handleUtterance(userText);
+    });
     String ipLine = "http://" + serverLocalIP();
     // Status-bar real estate now belongs to the USDC balance (updated
     // every frame in loop()); the web UI address stays in serial + the
@@ -776,6 +799,11 @@ void loop() {
 
   // Drain any LLM replies the worker has finished while we were ticking.
   drainLlmReplies();
+
+  // Slow-walk the mood scalars (uptime, silence, mood/energy/curiosity
+  // decay, local hour). Internally rate-limited to 1 Hz so calling it
+  // every frame is free.
+  moodTick();
 
   // Background tickers — only run when BOTH the voice subsystem (fetch
   // or playback) AND the LLM worker are idle, so we never stack a second
