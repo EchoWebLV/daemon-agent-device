@@ -30,17 +30,19 @@ struct Row {
   int16_t     ctrlX, ctrlW;     // the slider bar / tappable zone
 };
 
-// Six rows: Wi-Fi is tallest (has IP+RSSI sub-line), sliders are medium,
-// the three toggle rows (Bluetooth / Memory / Heartbeat) are compact.
-// WI-FI now starts at y=32, below the X close button's hit region, so the
-// two never overlap. Everything else shifts down to match.
-static Row  ROWS[6] = {
+// Seven rows: Wi-Fi is tallest (IP+RSSI sub-line), sliders are medium,
+// the four toggle rows (Bluetooth / Memory / Heartbeat / X POST) are
+// compact at 34 px each. WI-FI starts at y=32, below the X close button's
+// hit region, so the two never overlap. Final row ends at y=296 — the
+// footer sits at y=306.
+static Row  ROWS[7] = {
   { "WI-FI",      32,  44, 120,  110 },
-  { "BLUETOOTH",  76,  38, 170,   60 },
-  { "VOLUME",     114, 42, 110,  120 },
-  { "BRIGHTNESS", 156, 42, 110,  120 },
-  { "MEMORY",     198, 38, 170,   60 },
-  { "HEARTBEAT",  236, 38, 170,   60 },
+  { "BLUETOOTH",  76,  34, 170,   60 },
+  { "VOLUME",     110, 42, 110,  120 },
+  { "BRIGHTNESS", 152, 42, 110,  120 },
+  { "MEMORY",     194, 34, 170,   60 },
+  { "HEARTBEAT",  228, 34, 170,   60 },
+  { "X POST",     262, 34, 170,   60 },
 };
 static constexpr int R_WIFI = 0;
 static constexpr int R_BT   = 1;
@@ -48,6 +50,7 @@ static constexpr int R_VOL  = 2;
 static constexpr int R_BRI  = 3;
 static constexpr int R_MEM  = 4;
 static constexpr int R_HB   = 5;
+static constexpr int R_XP   = 6;
 
 static TFT_eSPI *s_tft = nullptr;
 
@@ -57,6 +60,8 @@ static uint8_t  s_lastBri       = 255;
 static bool     s_lastBt        = false;
 static bool     s_lastMem       = false;
 static bool     s_lastHb        = false;
+static bool     s_lastXp        = false;
+static bool     s_lastXpCreds   = false;
 static String   s_lastSSID      = "\x01";
 static String   s_lastPrice     = "\x01";
 
@@ -203,6 +208,35 @@ static void paintHeartbeat() {
   s_lastHb = devcfgHeartbeatEnabled();
 }
 
+static void paintXPost() {
+  // Special case: if the user hasn't set API credentials yet, the toggle
+  // is visually greyed (no real "on" state) and we overwrite the label
+  // area with a "NEEDS KEYS" hint so it's obvious what's blocking it.
+  const Row &r = ROWS[R_XP];
+  bool creds = devcfgXCredentialsPresent();
+  bool on    = devcfgXPostEnabled();
+
+  if (!creds) {
+    paintRowFrame(r);
+    // Draw a greyed-out toggle pill so the row doesn't look broken.
+    int16_t h = 20;
+    int16_t x = r.ctrlX;
+    int16_t y = r.y + (r.h - h) / 2 - 2;
+    int16_t w = r.ctrlW;
+    s_tft->fillRoundRect(x, y, w, h, h / 2, C_BAR_BG);
+    s_tft->drawRoundRect(x, y, w, h, h / 2, C_DIM);
+    // "SET KEYS" hint in the middle of the pill.
+    s_tft->setTextFont(1);
+    s_tft->setTextDatum(MC_DATUM);
+    s_tft->setTextColor(C_DIM, C_BAR_BG);
+    s_tft->drawString("set keys in web", x + w / 2, y + h / 2);
+  } else {
+    paintToggleRow(r, on);
+  }
+  s_lastXp      = on;
+  s_lastXpCreds = creds;
+}
+
 static void paintSlider(const Row &r, int value, int maxValue) {
   paintRowFrame(r);
   int16_t x = r.ctrlX;
@@ -257,6 +291,7 @@ void settingsScreenDraw() {
   paintSlider(ROWS[R_BRI], devcfgBrightness(), 255);
   paintMemory();
   paintHeartbeat();
+  paintXPost();
   paintFooter();
   s_lastVol = devcfgVolume();
   s_lastBri = devcfgBrightness();
@@ -332,6 +367,16 @@ static void handleInput() {
       devcfgSetHeartbeatEnabled(!devcfgHeartbeatEnabled());
       return;
     }
+    const Row &xp = ROWS[R_XP];
+    if (inRect(tx, ty, 0, xp.y, SCR_W, xp.h)) {
+      // If credentials are missing, the toggle is a no-op — we can't
+      // turn on a poster without an OAuth key set. The visual "SET KEYS"
+      // hint painted in paintXPost() already tells the user where to go.
+      if (devcfgXCredentialsPresent()) {
+        devcfgSetXPostEnabled(!devcfgXPostEnabled());
+      }
+      return;
+    }
   }
 }
 
@@ -363,6 +408,12 @@ void settingsScreenTick() {
   if (devcfgBluetooth()     != s_lastBt)  paintBluetooth();
   if (devcfgArweaveEnabled() != s_lastMem) paintMemory();
   if (devcfgHeartbeatEnabled() != s_lastHb) paintHeartbeat();
+  // X-post row also needs repaint if the credential presence flips,
+  // because that changes the toggle from "SET KEYS" to a real pill.
+  if (devcfgXPostEnabled()        != s_lastXp      ||
+      devcfgXCredentialsPresent() != s_lastXpCreds) {
+    paintXPost();
+  }
 
   if (devcfgVolume() != s_lastVol) {
     paintSlider(ROWS[R_VOL], devcfgVolume(), 21);

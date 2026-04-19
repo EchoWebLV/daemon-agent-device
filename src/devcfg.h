@@ -85,3 +85,31 @@ String   devcfgHeartbeatPrompt();
 void     devcfgSetHeartbeatPrompt(const String &p);
 uint32_t devcfgHeartbeatIntervalMin();
 void     devcfgSetHeartbeatIntervalMin(uint32_t minutes);
+
+// ---- X (Twitter) auto-poster ---------------------------------------------
+// Same pattern as Heartbeat but the generated text is POSTed to the X API
+// v2 (POST /2/tweets) using user-supplied OAuth 1.0a credentials. The user
+// must create a project + app at developer.x.com, enable Read+Write, and
+// paste all four keys into the web portal. Each successful tweet is billed
+// by X at their current pay-per-use rate (~$0.01).
+bool     devcfgXPostEnabled();
+void     devcfgSetXPostEnabled(bool on);
+String   devcfgXPostPrompt();
+void     devcfgSetXPostPrompt(const String &p);
+uint32_t devcfgXPostIntervalMin();              // >= 15
+void     devcfgSetXPostIntervalMin(uint32_t minutes);
+
+// OAuth 1.0a credentials. Returned verbatim by getters (firmware needs
+// them to sign). `GET /config` in the web server only reports presence
+// booleans, never the values.
+String   devcfgXApiKey();
+String   devcfgXApiSecret();
+String   devcfgXAccessToken();
+String   devcfgXAccessTokenSecret();
+void     devcfgSetXApiKey(const String &v);
+void     devcfgSetXApiSecret(const String &v);
+void     devcfgSetXAccessToken(const String &v);
+void     devcfgSetXAccessTokenSecret(const String &v);
+
+// True iff all four OAuth credential fields are non-empty.
+bool     devcfgXCredentialsPresent();

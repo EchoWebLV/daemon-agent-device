@@ -38,6 +38,8 @@
 #include "wifiscreen.h"
 #include "menuscreen.h"
 #include "infoscreen.h"
+#include "xpostscreen.h"
+#include "xpost.h"
 #include "devcfg.h"
 #include "secrets.h"
 
@@ -206,9 +208,10 @@ enum Screen : uint8_t {
   SCREEN_CREATURE = 0,
   SCREEN_MENU     = 1,
   SCREEN_WALLET   = 2,
-  SCREEN_INFO     = 3,
-  SCREEN_SETTINGS = 4,
-  SCREEN_WIFI     = 5,   // sub-screen reached from Settings
+  SCREEN_XPOST    = 3,   // recent X posts, reached from Menu
+  SCREEN_INFO     = 4,
+  SCREEN_SETTINGS = 5,
+  SCREEN_WIFI     = 6,   // sub-screen reached from Settings
 };
 static Screen s_screen     = SCREEN_CREATURE;
 static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
@@ -222,6 +225,7 @@ static void switchScreen(Screen target) {
     case SCREEN_CREATURE: creatureRepaint();     break;
     case SCREEN_MENU:     menuScreenDraw();      break;
     case SCREEN_WALLET:   walletScreenDraw();    break;
+    case SCREEN_XPOST:    xpostScreenDraw();     break;
     case SCREEN_INFO:     infoScreenDraw();      break;
     case SCREEN_SETTINGS: settingsScreenDraw();  break;
     case SCREEN_WIFI:     wifiScreenEnter();     break;
@@ -388,6 +392,7 @@ void setup() {
   wifiScreenBegin(&tft);
   menuScreenBegin(&tft);
   infoScreenBegin(&tft);
+  xpostScreenBegin(&tft);
   touchBegin();
   creatureSetStatus("WAKING UP");
   creatureTick();   // first frame
@@ -413,6 +418,11 @@ void setup() {
   creatureTick();
   s_wifiOk = serverBeginWifi();
   if (s_wifiOk) {
+    // Start NTP — required for OAuth 1.0a timestamps on the X API. Any
+    // other TLS-based service tolerates the ESP32's epoch default because
+    // our WiFiClientSecure uses setInsecure(), but OAuth signatures
+    // include a Unix timestamp that X rejects if it's off by >5 min.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
     aiBegin();
     serverBeginHttp(handleUtterance);
     String ipLine = "http://" + serverLocalIP();
@@ -524,11 +534,15 @@ void loop() {
     if (sw == SWIPE_DOWN)                   switchScreen(SCREEN_CREATURE);
     if (menuScreenConsumeClose())           switchScreen(SCREEN_CREATURE);
     if (menuScreenConsumeWalletTap())       switchScreen(SCREEN_WALLET);
+    if (menuScreenConsumeXTap())            switchScreen(SCREEN_XPOST);
     if (menuScreenConsumeInfoTap())         switchScreen(SCREEN_INFO);
   } else if (s_screen == SCREEN_WALLET) {
     // Wallet is a sub-screen. Any swipe-down or close dismisses straight
     // back to Daemon for consistency with every other sub-screen.
     if (sw == SWIPE_DOWN) switchScreen(SCREEN_CREATURE);
+  } else if (s_screen == SCREEN_XPOST) {
+    if (sw == SWIPE_DOWN)           switchScreen(SCREEN_CREATURE);
+    if (xpostScreenConsumeClose())  switchScreen(SCREEN_CREATURE);
   } else if (s_screen == SCREEN_INFO) {
     if (sw == SWIPE_DOWN)           switchScreen(SCREEN_CREATURE);
     if (infoScreenConsumeClose())   switchScreen(SCREEN_CREATURE);
@@ -570,6 +584,7 @@ void loop() {
     case SCREEN_CREATURE: creatureTick();       break;
     case SCREEN_MENU:     menuScreenTick();     break;
     case SCREEN_WALLET:   walletScreenTick();   break;
+    case SCREEN_XPOST:    xpostScreenTick();    break;
     case SCREEN_INFO:     infoScreenTick();     break;
     case SCREEN_SETTINGS: settingsScreenTick(); break;
     case SCREEN_WIFI:     wifiScreenTick();     break;
@@ -590,6 +605,11 @@ void loop() {
     maybeRefreshPrice();
     maybeRefreshWallet();
     maybeFireHeartbeat();
+    // X auto-poster — composes + signs + POSTs on this task. Cheap when
+    // disabled or the interval hasn't elapsed; blocks for the LLM + HTTPS
+    // round-trip (~3-8 s) when it actually fires, which is fine because
+    // we're already under the "not currently talking" gate.
+    xpostSchedulerTick();
   }
 
   // Keep the top-left status showing the wallet's current USDC balance.

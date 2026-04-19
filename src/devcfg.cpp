@@ -233,3 +233,95 @@ void devcfgSetHeartbeatIntervalMin(uint32_t minutes) {
   s_nvs.putUInt("hb_min", minutes);
   s_nvs.end();
 }
+
+// ---- X (Twitter) auto-poster --------------------------------------------
+// NVS key budget: 15-char limit on keys under the Arduino Preferences
+// wrapper, so we use compact "xp_*" and "xo_*" namespacing.
+bool devcfgXPostEnabled() {
+  s_nvs.begin("daemon", true);
+  bool v = s_nvs.getBool("xp_on", false);
+  s_nvs.end();
+  return v;
+}
+void devcfgSetXPostEnabled(bool on) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putBool("xp_on", on);
+  s_nvs.end();
+}
+
+String devcfgXPostPrompt() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("xp_prompt", "");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetXPostPrompt(const String &p) {
+  String clamped = p;
+  if (clamped.length() > 1200) clamped.remove(1200);
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("xp_prompt", clamped);
+  s_nvs.end();
+}
+
+uint32_t devcfgXPostIntervalMin() {
+  s_nvs.begin("daemon", true);
+  uint32_t v = s_nvs.getUInt("xp_min", 60);
+  s_nvs.end();
+  // X free/pay-per-use tier caps at ~17 writes/24h, so we enforce a 15 min
+  // floor both as a courtesy to the user's daily quota and to keep posts
+  // spaced far enough that duplicate-detection on X doesn't reject them.
+  if (v < 15)   v = 15;
+  if (v > 1440) v = 1440;
+  return v;
+}
+void devcfgSetXPostIntervalMin(uint32_t minutes) {
+  if (minutes < 15)   minutes = 15;
+  if (minutes > 1440) minutes = 1440;
+  s_nvs.begin("daemon", false);
+  s_nvs.putUInt("xp_min", minutes);
+  s_nvs.end();
+}
+
+String devcfgXApiKey() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("xo_ck", "");
+  s_nvs.end();
+  return v;
+}
+String devcfgXApiSecret() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("xo_cs", "");
+  s_nvs.end();
+  return v;
+}
+String devcfgXAccessToken() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("xo_tk", "");
+  s_nvs.end();
+  return v;
+}
+String devcfgXAccessTokenSecret() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("xo_ts", "");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetXApiKey(const String &v) {
+  s_nvs.begin("daemon", false); s_nvs.putString("xo_ck", v); s_nvs.end();
+}
+void devcfgSetXApiSecret(const String &v) {
+  s_nvs.begin("daemon", false); s_nvs.putString("xo_cs", v); s_nvs.end();
+}
+void devcfgSetXAccessToken(const String &v) {
+  s_nvs.begin("daemon", false); s_nvs.putString("xo_tk", v); s_nvs.end();
+}
+void devcfgSetXAccessTokenSecret(const String &v) {
+  s_nvs.begin("daemon", false); s_nvs.putString("xo_ts", v); s_nvs.end();
+}
+
+bool devcfgXCredentialsPresent() {
+  return devcfgXApiKey().length() > 0 &&
+         devcfgXApiSecret().length() > 0 &&
+         devcfgXAccessToken().length() > 0 &&
+         devcfgXAccessTokenSecret().length() > 0;
+}

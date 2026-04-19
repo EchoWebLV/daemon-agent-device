@@ -1,7 +1,8 @@
 // ============================================================================
 //  Quick-actions menu — pull-up drawer reached by swiping UP from the
-//  creature screen. Currently shows two big tappable tiles:
+//  creature screen. Shows three big tappable tiles:
 //    - Wallet  → opens the Phantom-style wallet drawer
+//    - X       → opens the recent-tweets list (auto-poster history)
 //    - Info    → opens a device info panel (IP, firmware, uptime, …)
 //  Swipe DOWN to dismiss back to the creature.
 // ============================================================================
@@ -17,5 +18,6 @@ void menuScreenTick();   // called each frame while visible
 // taps the corresponding tile / close button. Main consumes the signal
 // and pushes the matching screen.
 bool menuScreenConsumeWalletTap();
+bool menuScreenConsumeXTap();
 bool menuScreenConsumeInfoTap();
 bool menuScreenConsumeClose();

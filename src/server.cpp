@@ -2,6 +2,7 @@
 #include "secrets.h"
 #include "devcfg.h"
 #include "memory.h"
+#include "xpost.h"
 #include "wallet.h"
 
 #include <WiFi.h>
@@ -181,6 +182,38 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
     <div class="row" style="margin-top:10px;justify-content:flex-end">
       <button class="btn" id="saveHeartbeat">save heartbeat</button>
     </div>
+  </div>
+  <div class="card">
+    <h3>X POSTING</h3>
+    <p class="hint">Auto-post to X on a schedule. Daemon composes a tweet from your topic prompt and POSTs it to the X API v2 (<code>POST /2/tweets</code>) using your OAuth 1.0a user credentials. The device signs with HMAC-SHA1 locally and stores the four keys encrypted at rest in NVS — they never leave the board. Cost is whatever X charges your dev account (<b>~$0.01 per tweet</b> on the current pay-per-use plan).</p>
+    <p class="hint">Create a project + app at <a href="https://developer.x.com/en/portal/dashboard" target="_blank" style="color:var(--accent)">developer.x.com</a>, enable <b>Read and Write</b> permissions, generate an Access Token and Secret for your account, then paste all four values below.</p>
+    <label>API KEY (Consumer Key)</label>
+    <input id="xApiKey" type="password" autocomplete="off" placeholder="xXxXxXxXxXxX…"/>
+    <label>API KEY SECRET (Consumer Secret)</label>
+    <input id="xApiSecret" type="password" autocomplete="off" placeholder="xXxXxXxXxXxX…"/>
+    <label>ACCESS TOKEN</label>
+    <input id="xAccessToken" type="password" autocomplete="off" placeholder="0123456789-xXxX…"/>
+    <label>ACCESS TOKEN SECRET</label>
+    <input id="xAccessTokenSecret" type="password" autocomplete="off" placeholder="xXxXxXxXxXxX…"/>
+    <div class="row" style="margin-top:10px;gap:6px;justify-content:flex-end">
+      <button class="btn ghost" id="xClearCreds">clear</button>
+      <button class="btn" id="xSaveCreds">save credentials</button>
+    </div>
+    <p class="hint" id="xCredStatus" style="margin:8px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
+
+    <label style="margin-top:14px">TOPIC PROMPT</label>
+    <textarea id="xpPrompt" rows="3" placeholder="e.g. A witty observation about Solana devs or crypto infrastructure"></textarea>
+    <label>INTERVAL (minutes, min 15)</label>
+    <input id="xpInterval" type="number" min="15" max="1440" placeholder="60"/>
+    <div class="row" style="align-items:center;gap:10px;margin-top:10px;margin-bottom:6px">
+      <button class="toggle" id="xpToggle" aria-label="x posting on/off"></button>
+      <span id="xpStatus" style="font-size:12px;color:var(--dim)">off</span>
+    </div>
+    <div class="row" style="margin-top:10px;gap:6px;justify-content:flex-end">
+      <button class="btn ghost" id="xpTest">post test tweet</button>
+      <button class="btn" id="saveXPost">save x post</button>
+    </div>
+    <p class="hint" id="xpResult" style="margin:8px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
   </div>
 </div>
 
@@ -527,6 +560,22 @@ function renderHeartbeat(){
   $('#hbInterval').value = cfg.heartbeatIntervalMin || 5;
 }
 
+function renderXPost(){
+  const on = !!cfg.xPostEnabled;
+  $('#xpToggle').classList.toggle('on', on);
+  $('#xpStatus').textContent = on ? 'on' : 'off';
+  $('#xpPrompt').value = cfg.xPostPrompt || '';
+  $('#xpInterval').value = cfg.xPostIntervalMin || 60;
+  // Credentials we never send back to the browser — just status strings.
+  const all = cfg.xApiKeySet && cfg.xApiSecretSet && cfg.xAccessTokenSet && cfg.xAccessTokenSecretSet;
+  const any = cfg.xApiKeySet || cfg.xApiSecretSet || cfg.xAccessTokenSet || cfg.xAccessTokenSecretSet;
+  const msg = all ? 'credentials stored ✓ (leave fields blank to keep them)'
+            : any ? 'partial credentials — fill the remaining fields to enable posting'
+                  : 'no credentials set';
+  $('#xCredStatus').textContent = msg;
+  $('#xCredStatus').style.color = all ? 'var(--green)' : any ? 'var(--red)' : 'var(--dim)';
+}
+
 async function loadCfg(){
   const r = await fetch('/config'); const j = await r.json();
   cfg = Object.assign(cfg, j);
@@ -535,6 +584,7 @@ async function loadCfg(){
   renderMemory();
   if(cfg.memoryEnabled) refreshMemoryStats();
   renderHeartbeat();
+  renderXPost();
   renderServices();
   refreshWalletCard();
 }
@@ -637,6 +687,81 @@ $('#saveHeartbeat').onclick = async () => {
     body: JSON.stringify({heartbeatPrompt: prompt, heartbeatIntervalMin: interval})});
   $('#status').textContent = 'heartbeat saved';
   setTimeout(()=>refresh(), 1500);
+};
+
+// ────────── X posting ──────────
+$('#xpToggle').onclick = async () => {
+  cfg.xPostEnabled = !cfg.xPostEnabled;
+  renderXPost();
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({xPostEnabled: cfg.xPostEnabled})});
+};
+
+$('#xSaveCreds').onclick = async () => {
+  // Only send fields the user actually typed into — leaving a field blank
+  // means "keep the stored value". The device treats an explicit empty
+  // string the same way (no change).
+  const body = {};
+  const k  = $('#xApiKey').value.trim();
+  const ks = $('#xApiSecret').value.trim();
+  const t  = $('#xAccessToken').value.trim();
+  const ts = $('#xAccessTokenSecret').value.trim();
+  if (k)  body.xApiKey = k;
+  if (ks) body.xApiSecret = ks;
+  if (t)  body.xAccessToken = t;
+  if (ts) body.xAccessTokenSecret = ts;
+  if (Object.keys(body).length === 0) {
+    $('#xCredStatus').textContent = 'nothing to save — fill a field first';
+    return;
+  }
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)});
+  $('#xApiKey').value = ''; $('#xApiSecret').value = '';
+  $('#xAccessToken').value = ''; $('#xAccessTokenSecret').value = '';
+  $('#status').textContent = 'x credentials saved';
+  await loadCfg();
+};
+
+$('#xClearCreds').onclick = async () => {
+  if (!confirm('Delete all four X API credentials from the device?')) return;
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      xApiKey: '', xApiSecret: '', xAccessToken: '', xAccessTokenSecret: '',
+      xPostEnabled: false
+    })});
+  $('#status').textContent = 'x credentials cleared';
+  await loadCfg();
+};
+
+$('#saveXPost').onclick = async () => {
+  const prompt = $('#xpPrompt').value.trim();
+  const interval = Math.max(15, Math.min(1440, parseInt($('#xpInterval').value) || 60));
+  cfg.xPostPrompt = prompt;
+  cfg.xPostIntervalMin = interval;
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({xPostPrompt: prompt, xPostIntervalMin: interval})});
+  $('#status').textContent = 'x post saved';
+  setTimeout(()=>refresh(), 1500);
+};
+
+$('#xpTest').onclick = async () => {
+  $('#xpResult').textContent = 'composing + posting…';
+  $('#xpResult').style.color = 'var(--dim)';
+  try{
+    const r = await fetch('/xpost/test', {method:'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      $('#xpResult').style.color = 'var(--green)';
+      $('#xpResult').innerHTML = 'posted ✓  <a href="https://x.com/i/web/status/'+(j.tweetId||'')+'" target="_blank" style="color:var(--accent)">view</a><br>'+
+                                (j.text || '').replace(/</g,'&lt;');
+    } else {
+      $('#xpResult').style.color = 'var(--red)';
+      $('#xpResult').textContent = 'failed: ' + (j.error || 'unknown');
+    }
+  }catch(e){
+    $('#xpResult').style.color = 'var(--red)';
+    $('#xpResult').textContent = 'network error';
+  }
 };
 
 // ────────── services ──────────
@@ -856,6 +981,22 @@ static void handleConfigGet() {
   hb.replace("\r", "\\r");
   hb.replace("\t", "\\t");
 
+  // And the X-posting prompt.
+  String xp = devcfgXPostPrompt();
+  xp.replace("\\", "\\\\");
+  xp.replace("\"", "\\\"");
+  xp.replace("\n", "\\n");
+  xp.replace("\r", "\\r");
+  xp.replace("\t", "\\t");
+
+  // X OAuth credentials are never sent back verbatim — we only report
+  // presence booleans so the web UI can show "credentials stored" without
+  // exposing the secret material to anyone who hits GET /config.
+  bool haveXK  = devcfgXApiKey().length()            > 0;
+  bool haveXKS = devcfgXApiSecret().length()         > 0;
+  bool haveXT  = devcfgXAccessToken().length()       > 0;
+  bool haveXTS = devcfgXAccessTokenSecret().length() > 0;
+
   String out = "{";
   out += "\"model\":\""         + devcfgLlmModel()         + "\",";
   out += "\"personality\":\""   + p                         + "\",";
@@ -865,7 +1006,14 @@ static void handleConfigGet() {
   out += "\"heartbeatPrompt\":\""   + hb                        + "\",";
   out += "\"heartbeatIntervalMin\":" + String(devcfgHeartbeatIntervalMin()) + ",";
   out += "\"memoryEnabled\":"       + String(devcfgMemoryEnabled() ? "true" : "false") + ",";
-  out += "\"arweaveEnabled\":"      + String(devcfgArweaveEnabled() ? "true" : "false");
+  out += "\"arweaveEnabled\":"      + String(devcfgArweaveEnabled() ? "true" : "false") + ",";
+  out += "\"xPostEnabled\":"        + String(devcfgXPostEnabled() ? "true" : "false") + ",";
+  out += "\"xPostPrompt\":\""       + xp                        + "\",";
+  out += "\"xPostIntervalMin\":"    + String(devcfgXPostIntervalMin()) + ",";
+  out += "\"xApiKeySet\":"            + String(haveXK  ? "true" : "false") + ",";
+  out += "\"xApiSecretSet\":"         + String(haveXKS ? "true" : "false") + ",";
+  out += "\"xAccessTokenSet\":"       + String(haveXT  ? "true" : "false") + ",";
+  out += "\"xAccessTokenSecretSet\":" + String(haveXTS ? "true" : "false");
   out += "}";
   s_http.send(200, "application/json", out);
 }
@@ -913,7 +1061,87 @@ static void handleConfigPost() {
     devcfgSetMemoryEnabled(doc["memoryEnabled"].as<bool>());
   if (doc["arweaveEnabled"].is<bool>())
     devcfgSetArweaveEnabled(doc["arweaveEnabled"].as<bool>());
+  // X posting — enable flag, topic prompt, interval. Credential fields
+  // accept empty string explicitly (user may want to clear them), so we
+  // check `is<const char*>()` and write the raw value including "".
+  if (doc["xPostEnabled"].is<bool>())
+    devcfgSetXPostEnabled(doc["xPostEnabled"].as<bool>());
+  if (doc["xPostPrompt"].is<const char*>())
+    devcfgSetXPostPrompt(doc["xPostPrompt"].as<String>());
+  if (doc["xPostIntervalMin"].is<int>())
+    devcfgSetXPostIntervalMin((uint32_t)doc["xPostIntervalMin"].as<int>());
+  if (doc["xApiKey"].is<const char*>())
+    devcfgSetXApiKey(doc["xApiKey"].as<String>());
+  if (doc["xApiSecret"].is<const char*>())
+    devcfgSetXApiSecret(doc["xApiSecret"].as<String>());
+  if (doc["xAccessToken"].is<const char*>())
+    devcfgSetXAccessToken(doc["xAccessToken"].as<String>());
+  if (doc["xAccessTokenSecret"].is<const char*>())
+    devcfgSetXAccessTokenSecret(doc["xAccessTokenSecret"].as<String>());
   s_http.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---------------------------------------------------------------------------
+// /xpost/test — run one compose + post cycle immediately using current
+// prompt + credentials. Blocks for the LLM + HTTPS round-trip, returns
+// { ok, tweetId?, text?, error? }.
+// ---------------------------------------------------------------------------
+static void handleXPostTest() {
+  XPostResult r = xpostRunNow();
+  String esc = r.ok ? r.tweetId : r.error;
+  esc.replace("\\", "\\\\");
+  esc.replace("\"", "\\\"");
+
+  // We don't have the tweet text back from xpostRunNow() directly, but
+  // the most-recent entry in the ring buffer matches.
+  String text;
+  XPostRecent snap[1];
+  if (r.ok && xpostGetRecent(snap, 1) > 0) text = snap[0].text;
+  text.replace("\\", "\\\\");
+  text.replace("\"", "\\\"");
+  text.replace("\n", "\\n");
+  text.replace("\r", "\\r");
+
+  String out = String("{\"ok\":") + (r.ok ? "true" : "false");
+  if (r.ok) {
+    out += ",\"tweetId\":\"" + esc + "\"";
+    out += ",\"text\":\""    + text + "\"";
+  } else {
+    out += ",\"error\":\"" + esc + "\"";
+    if (r.httpStatus) out += ",\"httpStatus\":" + String(r.httpStatus);
+  }
+  out += "}";
+  s_http.send(200, "application/json", out);
+}
+
+// ---------------------------------------------------------------------------
+// /xpost/recent — return the in-memory ring buffer so the web UI can show
+// a live history without hitting the X API (which would cost $0.01 per
+// read under current pay-per-use pricing).
+// ---------------------------------------------------------------------------
+static void handleXPostRecent() {
+  XPostRecent rec[10];
+  size_t n = xpostGetRecent(rec, sizeof(rec) / sizeof(rec[0]));
+
+  String out = "{\"count\":" + String((int)n) + ",\"posts\":[";
+  uint32_t now = millis();
+  for (size_t i = 0; i < n; ++i) {
+    String text = rec[i].text;
+    text.replace("\\", "\\\\");
+    text.replace("\"", "\\\"");
+    text.replace("\n", "\\n");
+    text.replace("\r", "\\r");
+    if (i > 0) out += ",";
+    uint32_t ageSec = (rec[i].postedMs == 0) ? 0 : (now - rec[i].postedMs) / 1000;
+    out += "{\"id\":\""      + rec[i].tweetId + "\",";
+    out += "\"text\":\""     + text           + "\",";
+    out += "\"ageSec\":"     + String(ageSec) + "}";
+  }
+  out += "],\"enabled\":"   + String(devcfgXPostEnabled() ? "true" : "false");
+  out += ",\"intervalMin\":" + String(devcfgXPostIntervalMin());
+  out += ",\"lastError\":\"" + xpostLastError() + "\"";
+  out += "}";
+  s_http.send(200, "application/json", out);
 }
 
 static void handleMemoryGet() {
@@ -1056,6 +1284,8 @@ void serverBeginHttp(SayCallback onSay) {
   s_http.on("/wallet",            HTTP_GET,  handleWalletGet);
   s_http.on("/wallet/reveal",     HTTP_GET,  handleWalletReveal);
   s_http.on("/wallet/regenerate", HTTP_POST, handleWalletRegenerate);
+  s_http.on("/xpost/test",        HTTP_POST, handleXPostTest);
+  s_http.on("/xpost/recent",      HTTP_GET,  handleXPostRecent);
   s_http.begin();
   Serial.println("http: listening on :80");
 }
