@@ -47,6 +47,31 @@ void creatureSetTalking(bool on);
 // Tell the creature to blink ASAP (used when it first wakes, etc).
 void creatureForceBlink();
 
+// Discrete one-shot overlays layered on top of the normal idle animation.
+// Each reaction runs for a fixed duration (a few hundred ms to ~1.5 s) and
+// temporarily overrides bob / gaze / blink / mouth to "sell" a punctuated
+// moment — e.g. a wallet outflow should STARTLE Daemon, a long-silent
+// human returning should make him PERK_UP, 3am-drowsy + no one around
+// should DOZE once in a while. Safe to call at any rate; the renderer
+// coalesces rapid triggers into the most recent one.
+enum CreatureReaction : uint8_t {
+  REACT_STARTLE  = 0,   // ~400 ms: quick upward bob + briefly wide eyes
+  REACT_PERK_UP  = 1,   // ~600 ms: gaze recenters + happy-mood flash
+  REACT_DROOP    = 2,   // ~800 ms: slow long blink + gaze sags down
+  REACT_GRUMBLE  = 3,   // ~500 ms: eyes narrow + angry-tint flash
+  REACT_DOZE     = 4,   // ~1400 ms: single extra-long sleepy blink
+};
+void creatureTriggerReaction(CreatureReaction r);
+
+// Smoothly interpolate the creature's render scale toward `target`.
+// 1.0  = normal / "close up".
+// 0.55 = zoomed-out ("stepped back from the screen") preset used by
+//        the long-press gesture in main.cpp.
+// Values are clamped to [0.35, 1.0]. The interpolation happens inside
+// creatureTick() at ~60 Hz with a 1st-order filter, so a single call
+// per state change is enough — no need to animate by hand.
+void creatureSetZoomTarget(float target);
+
 // Draw a small status string on the LEFT of the top status bar
 // (Wi-Fi IP, "thinking", etc).
 void creatureSetStatus(const String &s);

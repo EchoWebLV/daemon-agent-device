@@ -29,3 +29,16 @@ bool     touchActive(int16_t &x, int16_t &y);
 // True for exactly one frame right after the finger first touches down.
 // Handy for simple "tap" logic without a full gesture machine.
 bool     touchJustPressed(int16_t &x, int16_t &y);
+
+// How long the finger has been continuously on the glass, in
+// milliseconds since the initial press. Returns 0 when no finger is
+// touching. Designed for "hold to trigger" interactions — e.g. the
+// creature zoom-out kicks in after 800 ms of unbroken press.
+uint32_t touchPressDurationMs();
+
+// Tell the touch layer to NOT emit a swipe on the next finger-up. Use
+// this after consuming a long-press so the lift doesn't also fire
+// whatever swipe the accidental drag might have accumulated into.
+// The suppression clears itself after the next release is ignored,
+// so subsequent gestures behave normally.
+void     touchConsumeRelease();

@@ -1,4 +1,5 @@
 #include "creature.h"
+#include "mood.h"
 #include "statusicons.h"
 #include <math.h>
 #include <vector>
@@ -78,6 +79,27 @@ enum QuirkKind : uint8_t { QUIRK_NONE, QUIRK_DOUBLE_BLINK, QUIRK_WINK_L, QUIRK_W
 static QuirkKind    s_quirk         = QUIRK_NONE;
 static uint32_t     s_quirkStartMs  = 0;
 static int          s_quirkStage    = 0;
+
+// Reaction overlay — a one-shot punctuated moment (startle / perk-up /
+// droop / grumble / doze) layered on top of the idle animation. The
+// renderer reads these in creatureTick() and, if active, overrides the
+// corresponding idle knobs for the duration. See CreatureReaction in
+// creature.h for semantics.
+static CreatureReaction s_reaction     = REACT_STARTLE;   // value only valid when active
+static bool             s_reactionOn   = false;
+static uint32_t         s_reactionMs   = 0;
+static uint32_t         s_reactionDur  = 0;
+
+// Render-scale state. s_zoomCur is what we draw at this frame;
+// s_zoomTarget is where we're heading. creatureTick() runs a fast
+// 1st-order filter between them so long-press zoom-out and release
+// zoom-in both feel physical (ease toward, never snap). 1.0 = pixel-
+// perfect pushSprite; anything <0.999 takes the nearest-neighbor
+// scaled-push path. s_zoomLastDrawn tracks what we painted last so
+// we know when to clear the surrounding rect on the TFT.
+static float s_zoomCur        = 1.0f;
+static float s_zoomTarget     = 1.0f;
+static float s_zoomLastDrawn  = 1.0f;
 static String       s_status;
 static String       s_lastStatusDrawn = "\x01invalid\x01";
 static String       s_price;
@@ -789,6 +811,26 @@ void creatureDrawTo(TFT_eSprite *target) {
 void creatureSetMood(CreatureMood m)    { s_mood = m; }
 void creatureSetTalking(bool on)        { s_talking = on; if (!on) s_mouthEnv = 0.0f; }
 void creatureForceBlink()               { s_forceBlink = true; }
+
+void creatureTriggerReaction(CreatureReaction r) {
+  s_reaction    = r;
+  s_reactionOn  = true;
+  s_reactionMs  = millis();
+  switch (r) {
+    case REACT_STARTLE: s_reactionDur = 400;  break;
+    case REACT_PERK_UP: s_reactionDur = 600;  break;
+    case REACT_DROOP:   s_reactionDur = 800;  break;
+    case REACT_GRUMBLE: s_reactionDur = 500;  break;
+    case REACT_DOZE:    s_reactionDur = 1400; break;
+    default:            s_reactionDur = 400;  break;
+  }
+}
+
+void creatureSetZoomTarget(float target) {
+  if (target < 0.35f) target = 0.35f;
+  if (target > 1.0f)  target = 1.0f;
+  s_zoomTarget = target;
+}
 void creatureSetStatus(const String &s) { s_status = s; }
 void creatureSetPrice (const String &s) { s_price  = s; }
 void creatureSetSubtitle(const String &text) {
@@ -818,55 +860,166 @@ void creatureTick() {
   if (dt > 0.25f) dt = 0.25f;
   s_lastTickMs = now;
 
-  // Breathing pulse (eye brightness + slight scale).
-  s_animPhase += dt * (s_mood == MOOD_LISTEN ? 2.4f : 1.5f);
+  // ------------------------------------------------------------------------
+  // Snapshot Daemon's inner state ONCE per frame. moodTick() refreshes at
+  // 1 Hz so these values are stable across ~15-20 render frames anyway;
+  // pulling them lock-free here keeps the animation code dependency-free
+  // on FreeRTOS primitives and means the four mood scalars (energy,
+  // curiosity, mood, snark) directly modulate how Daemon *looks* while
+  // idle — tired = slow + sleepy blinks, curious = wider / more frequent
+  // gaze, grumpy = gaze droops, snarky = more winks. Without this the
+  // idle animation was one hardcoded baseline regardless of how he felt.
+  // ------------------------------------------------------------------------
+  const DaemonState &ms = moodState();
+  const float e  = ms.energy;       // 0..1
+  const float c  = ms.curiosity;    // 0..1
+  const float mm = ms.mood;         // -1..+1
+  const float sn = ms.snark;        // 0..1
+
+  // Smooth render-zoom filter. `creatureSetZoomTarget()` is the only
+  // external input — here we just walk the current value toward it
+  // with a 1st-order IIR so the animation reads as a physical dolly
+  // rather than a hard snap. Time constant ~100 ms (dt * 10) gives a
+  // perceptually-immediate-but-still-smooth settle over ~10 frames.
+  s_zoomCur += (s_zoomTarget - s_zoomCur) * min(1.0f, dt * 10.0f);
+  if (s_zoomCur < 0.30f) s_zoomCur = 0.30f;
+  if (s_zoomCur > 1.0f)  s_zoomCur = 1.0f;
+
+  // ------------------------------------------------------------------------
+  // Reaction overlay — a discrete punctuated moment (startle / perk-up /
+  // droop / grumble / doze) layered on top of idle. We compute a
+  // normalized progress `rxT` (0..1) and the active kind `rxKind`; the
+  // idle knobs below consult these and temporarily override their
+  // output. When the reaction finishes we clear the flag and fall back
+  // to pure mood-driven idle.
+  // ------------------------------------------------------------------------
+  float rxT = 0.0f;
+  CreatureReaction rxKind = REACT_STARTLE;
+  bool rxActive = false;
+  if (s_reactionOn) {
+    uint32_t elapsed = now - s_reactionMs;
+    if (elapsed >= s_reactionDur) {
+      s_reactionOn = false;
+    } else {
+      rxT      = (float)elapsed / (float)s_reactionDur;   // 0..1
+      rxKind   = s_reaction;
+      rxActive = true;
+    }
+  }
+
+  // Breathing pulse: base speed scales with energy (drowsy = slower) and a
+  // slight lift when mood is positive. MOOD_LISTEN still bumps it further
+  // so "the user is speaking" reads clearly regardless of inner weather.
+  float pulseRate = 1.1f + 0.8f * e + 0.3f * (mm > 0.0f ? mm : 0.0f);
+  if (s_mood == MOOD_LISTEN) pulseRate += 0.9f;
+  s_animPhase += dt * pulseRate;
   if (s_animPhase > 2.0f * (float)PI) s_animPhase -= 2.0f * (float)PI;
   float pulse = sinf(s_animPhase);
 
-  // Vertical bob — slow sine at 0.35 Hz, ±2 px. Makes the face feel alive.
-  s_bobPhase += dt * 2.2f;
-  int16_t bobDY = (int16_t)(sinf(s_bobPhase) * 2.0f);
+  // Vertical bob — speed + amplitude both scale with energy. Drowsy Daemon
+  // barely moves; wired Daemon has visible sway. Reactions can inject an
+  // extra vertical push (startle = up, droop = down).
+  s_bobPhase += dt * (1.4f + 1.4f * e);
+  float bobBase = sinf(s_bobPhase) * (1.0f + 2.5f * e);
+  int16_t bobDY = (int16_t)bobBase;
+  if (rxActive) {
+    if (rxKind == REACT_STARTLE) {
+      // Quick up-then-settle. sin(pi*t) peaks at t=0.5.
+      bobDY += (int16_t)(-6.0f * sinf(rxT * (float)PI));
+    } else if (rxKind == REACT_DROOP) {
+      bobDY += (int16_t)(+4.0f * sinf(rxT * (float)PI));
+    } else if (rxKind == REACT_PERK_UP) {
+      bobDY += (int16_t)(-3.0f * sinf(rxT * (float)PI));
+    }
+  }
 
-  // Gaze drift — pick a random target every 5-10 s, lerp toward it.
+  // Gaze drift: target-pick interval shortens with curiosity (10s→2.5s),
+  // amplitude grows with curiosity, and mood biases the Y axis (grumpy
+  // droops downward, happy lifts slightly). PERK_UP recenters the gaze
+  // so Daemon "looks at" whatever just happened.
   if (now > s_nextGazeMoveMs) {
-    s_gazeTargetX = (float)random(-6, 7);   // ±6 px
-    s_gazeTargetY = (float)random(-3, 4);   // ±3 px
-    s_nextGazeMoveMs = now + (uint32_t)random(5000, 11000);
+    int rangeX = (int)(3.0f + 7.0f * c);
+    int rangeY = (int)(2.0f + 4.0f * c);
+    int biasY  = (mm < -0.3f) ? +2 : (mm > 0.3f ? -2 : 0);
+    s_gazeTargetX = (float)random(-rangeX, rangeX + 1);
+    s_gazeTargetY = (float)random(-rangeY, rangeY + 1) + biasY;
+    uint32_t interval = (uint32_t)(10000.0f - 7500.0f * c);   // 10s → 2.5s
+    if (interval < 2500) interval = 2500;
+    s_nextGazeMoveMs = now + (uint32_t)random((long)(interval / 2),
+                                              (long)(interval + 1));
+  }
+  if (rxActive && rxKind == REACT_PERK_UP && rxT < 0.5f) {
+    // Snap toward center for the first half of the reaction.
+    s_gazeTargetX = 0.0f;
+    s_gazeTargetY = -2.0f;
   }
   s_gazeX += (s_gazeTargetX - s_gazeX) * min(1.0f, dt * 1.5f);
   s_gazeY += (s_gazeTargetY - s_gazeY) * min(1.0f, dt * 1.5f);
 
-  // Quirk scheduling — every 12-22 s fire a small character moment.
-  if (s_quirk == QUIRK_NONE && now > s_nextQuirkMs) {
-    int roll = random(0, 3);
-    s_quirk = (roll == 0) ? QUIRK_DOUBLE_BLINK
-            : (roll == 1) ? QUIRK_WINK_L
-                          : QUIRK_WINK_R;
+  // Quirk scheduling: snark shortens the gap (more winks when dry), and
+  // the kind distribution shifts — snarky = winks, curious = double
+  // blinks. Suppressed during reactions so the overlay reads cleanly.
+  if (!rxActive && s_quirk == QUIRK_NONE && now > s_nextQuirkMs) {
+    int roll = random(0, 10);
+    if (sn > 0.6f) {
+      s_quirk = (roll < 6) ? ((roll & 1) ? QUIRK_WINK_L : QUIRK_WINK_R)
+                           : QUIRK_DOUBLE_BLINK;
+    } else if (c > 0.7f) {
+      s_quirk = (roll < 6) ? QUIRK_DOUBLE_BLINK
+                           : ((roll & 1) ? QUIRK_WINK_L : QUIRK_WINK_R);
+    } else {
+      s_quirk = (roll < 4) ? QUIRK_DOUBLE_BLINK
+              : (roll < 7) ? QUIRK_WINK_L
+                           : QUIRK_WINK_R;
+    }
     s_quirkStartMs = now;
     s_quirkStage = 0;
-    s_nextQuirkMs = now + (uint32_t)random(12000, 22000);
+    uint32_t gap = (uint32_t)(22000.0f - 14000.0f * sn);   // 22s → 8s
+    if (gap < 6000) gap = 6000;
+    s_nextQuirkMs = now + (uint32_t)random((long)(gap / 2), (long)(gap + 1));
   }
 
-  // Per-eye blink phase. Quirks override the normal blink timer.
+  // Per-eye blink phase. Quirks and reactions override the normal blink
+  // timer. Blink interval + duration both scale with low-energy (sleepy
+  // Daemon blinks more often, and each blink lasts longer).
   float blinkL = -1.0f, blinkR = -1.0f;
+  const uint32_t blinkDur = (e < 0.25f) ? 380 : 200;
+  const long blinkMin = (long)(1500.0f + 3500.0f * e);        // 1.5s (tired) → 5s (wired)
+  const long blinkMax = blinkMin + 2000;
 
   auto standardBlink = [&]() -> float {
     if (s_forceBlink && now - s_blinkStartMs > 400) {
       s_blinkStartMs = now;
       s_forceBlink = false;
     }
-    if (now - s_blinkStartMs < 200) {
-      return (now - s_blinkStartMs) / 200.0f;
+    if (now - s_blinkStartMs < blinkDur) {
+      return (float)(now - s_blinkStartMs) / (float)blinkDur;
     }
-    if (now - s_lastBlinkMs > (uint32_t)random(3000, 6000)) {
+    if (now - s_lastBlinkMs > (uint32_t)random(blinkMin, blinkMax)) {
       s_blinkStartMs = now;
       s_lastBlinkMs  = now;
     }
     return -1.0f;
   };
 
-  if (s_quirk == QUIRK_DOUBLE_BLINK) {
-    // Two blinks 250 ms apart
+  if (rxActive && (rxKind == REACT_DOZE || rxKind == REACT_DROOP)) {
+    // Long slow blink: close (0→1) over the first half, hold, then
+    // re-open (1→0) over the second half. Reads as a sleepy lid-droop.
+    float t;
+    if      (rxT < 0.35f) t = rxT / 0.35f;
+    else if (rxT < 0.65f) t = 1.0f;
+    else                  t = 1.0f - (rxT - 0.65f) / 0.35f;
+    blinkL = blinkR = t;
+  } else if (rxActive && rxKind == REACT_GRUMBLE) {
+    // Eyes narrow to ~60% closed and hold for most of the duration.
+    float t = (rxT < 0.2f) ? (rxT / 0.2f) * 0.6f
+            : (rxT > 0.8f) ? (1.0f - (rxT - 0.8f) / 0.2f) * 0.6f
+                           : 0.6f;
+    blinkL = blinkR = t;
+  } else if (rxActive && rxKind == REACT_STARTLE) {
+    // Wide eyes — force blinkL/R to 0 (fully open) for the whole overlay.
+    blinkL = blinkR = 0.0f;
+  } else if (s_quirk == QUIRK_DOUBLE_BLINK) {
     uint32_t elapsed = now - s_quirkStartMs;
     if (elapsed < 200)      { blinkL = blinkR = elapsed / 200.0f; }
     else if (elapsed < 450) { /* gap */ }
@@ -885,7 +1038,16 @@ void creatureTick() {
     blinkR = b;
   }
 
-  // Mouth drive — slight breathing motion even when idle.
+  // Effective render-mood: PERK_UP briefly flashes HAPPY, GRUMBLE briefly
+  // flashes ANGRY so the per-style eye renderer gets the right tint.
+  CreatureMood renderMood = s_mood;
+  if (rxActive) {
+    if (rxKind == REACT_PERK_UP && s_mood == MOOD_IDLE) renderMood = MOOD_HAPPY;
+    if (rxKind == REACT_GRUMBLE && s_mood == MOOD_IDLE) renderMood = MOOD_ANGRY;
+  }
+
+  // Mouth drive — slight breathing motion even when idle. A positive mood
+  // adds a faint smile bias; a negative one adds a slight frown.
   float targetOpen = 0.0f;
   if (s_talking || s_mood == MOOD_TALK) {
     s_mouthPhase += dt * 13.0f;
@@ -894,8 +1056,8 @@ void creatureTick() {
     targetOpen = a * 0.7f + b * 0.3f;
     if (((int)(s_mouthPhase * 0.3f)) % 7 == 0) targetOpen *= 0.3f;
   } else {
-    // tiny idle twitch
-    targetOpen = 0.05f + 0.03f * sinf(s_animPhase * 0.5f);
+    float smile = (mm > 0.3f) ? +0.04f : (mm < -0.3f ? -0.02f : 0.0f);
+    targetOpen = 0.05f + smile + 0.03f * sinf(s_animPhase * 0.5f);
   }
   s_mouthEnv += (targetOpen - s_mouthEnv) * min(1.0f, dt * 18.0f);
 
@@ -903,30 +1065,108 @@ void creatureTick() {
   int16_t leftX  = LEFT_EYE_CX  + (int16_t)s_gazeX;
   int16_t rightX = RIGHT_EYE_CX + (int16_t)s_gazeX;
   int16_t eyeY   = LEFT_EYE_CY  + (int16_t)s_gazeY + bobDY;
+  // Pass `renderMood` instead of `s_mood` so PERK_UP / GRUMBLE can tint
+  // the eye renderer (HAPPY / ANGRY palette) for the overlay duration.
   switch (s_faceStyle) {
     case 1:   // Robot
-      drawEyeRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
-      drawEyeRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
-      drawMouthRobot(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      drawEyeRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, renderMood);
+      drawEyeRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, renderMood);
+      drawMouthRobot(s_faceBuf, s_mouthEnv, renderMood, bobDY);
       break;
     case 2:   // Toy Robot — cute blue head with red antenna + grille mouth
-      drawHeadToyRobot(s_faceBuf, bobDY, s_mood, pulse);
-      drawEyeToyRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
-      drawEyeToyRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
-      drawMouthToyRobot(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      drawHeadToyRobot(s_faceBuf, bobDY, renderMood, pulse);
+      drawEyeToyRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, renderMood);
+      drawEyeToyRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, renderMood);
+      drawMouthToyRobot(s_faceBuf, s_mouthEnv, renderMood, bobDY);
       break;
     case 3:   // Calculator — =  |  analog LCD
-      drawEyeCalculator(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
-      drawEyeCalculator(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
-      drawMouthCalculator(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      drawEyeCalculator(s_faceBuf, leftX,  eyeY, pulse, blinkL, renderMood);
+      drawEyeCalculator(s_faceBuf, rightX, eyeY, pulse, blinkR, renderMood);
+      drawMouthCalculator(s_faceBuf, s_mouthEnv, renderMood, bobDY);
       break;
     default:  // 0 = Daemon
-      drawEye(s_faceBuf, leftX,  eyeY, LEFT_EYE_ANGLE,  pulse, blinkL, s_mood);
-      drawEye(s_faceBuf, rightX, eyeY, RIGHT_EYE_ANGLE, pulse, blinkR, s_mood);
-      drawMouth(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      drawEye(s_faceBuf, leftX,  eyeY, LEFT_EYE_ANGLE,  pulse, blinkL, renderMood);
+      drawEye(s_faceBuf, rightX, eyeY, RIGHT_EYE_ANGLE, pulse, blinkR, renderMood);
+      drawMouth(s_faceBuf, s_mouthEnv, renderMood, bobDY);
       break;
   }
-  s_faceBuf->pushSprite(FACE_X, FACE_Y);
+  // ----- Push face to TFT ------------------------------------------------
+  // Fast path: when we're at (or effectively at) 1.0x, use the library's
+  // fast pushSprite — that's a near-DMA blit over SPI at ~10 ms for the
+  // full 240×200 face rect. Zoom path: nearest-neighbor scale row-by-row
+  // via pushImage into a smaller rect centered on the original face
+  // area, plus a one-shot border clear so leftover pixels from the
+  // larger previous frame don't leave a halo.
+  if (s_zoomCur > 0.999f && s_zoomLastDrawn > 0.999f) {
+    s_faceBuf->pushSprite(FACE_X, FACE_Y);
+  } else {
+    const int16_t srcW = FACE_W;
+    const int16_t srcH = FACE_H;
+    int16_t dstW = (int16_t)(srcW * s_zoomCur + 0.5f);
+    int16_t dstH = (int16_t)(srcH * s_zoomCur + 0.5f);
+    if (dstW < 8) dstW = 8;
+    if (dstH < 8) dstH = 8;
+    int16_t dstX = FACE_X + (srcW - dstW) / 2;
+    int16_t dstY = FACE_Y + (srcH - dstH) / 2;
+
+    // Clear exactly the 4 border strips between the previous-zoom rect
+    // and the new-zoom rect so scale-up frames don't leave a black
+    // halo, and scale-down frames don't leave bright leftovers. We
+    // compute the union rect (max of both zooms) and subtract the new
+    // rect from it — a clean, cheap approach compared to fillRect'ing
+    // the whole face area every frame.
+    float zoomMax = (s_zoomCur > s_zoomLastDrawn) ? s_zoomCur : s_zoomLastDrawn;
+    int16_t clrW = (int16_t)(srcW * zoomMax + 0.5f);
+    int16_t clrH = (int16_t)(srcH * zoomMax + 0.5f);
+    if (clrW > srcW) clrW = srcW;
+    if (clrH > srcH) clrH = srcH;
+    int16_t clrX = FACE_X + (srcW - clrW) / 2;
+    int16_t clrY = FACE_Y + (srcH - clrH) / 2;
+    if (clrW > dstW || clrH > dstH) {
+      // Top strip
+      if (dstY > clrY) s_tft->fillRect(clrX, clrY, clrW, dstY - clrY, C_BG);
+      // Bottom strip
+      int16_t clrYEnd = clrY + clrH;
+      int16_t dstYEnd = dstY + dstH;
+      if (clrYEnd > dstYEnd)
+        s_tft->fillRect(clrX, dstYEnd, clrW, clrYEnd - dstYEnd, C_BG);
+      // Left strip (only the band that aligns with dst vertical extent)
+      if (dstX > clrX)
+        s_tft->fillRect(clrX, dstY, dstX - clrX, dstH, C_BG);
+      // Right strip
+      int16_t clrXEnd = clrX + clrW;
+      int16_t dstXEnd = dstX + dstW;
+      if (clrXEnd > dstXEnd)
+        s_tft->fillRect(dstXEnd, dstY, clrXEnd - dstXEnd, dstH, C_BG);
+    }
+
+    // Nearest-neighbor resample. Raw source-sprite buffer is RGB565 in
+    // the native byte order; pushImage() on the TFT takes care of
+    // byte-swapping per its usual rules, so the per-row staging buffer
+    // goes out the same way a pushSprite would.
+    uint16_t *src = (uint16_t *)s_faceBuf->getPointer();
+    if (src) {
+      uint16_t rowBuf[FACE_W];   // max possible dstW = srcW = 240
+      // Precompute the integer source-x lookup once per draw — cheaper
+      // than a divide per pixel when dstW × dstH can reach ~40 KB ops.
+      int16_t sxMap[FACE_W];
+      for (int16_t x = 0; x < dstW; ++x) {
+        int16_t sx = (int16_t)((int32_t)x * srcW / dstW);
+        if (sx >= srcW) sx = srcW - 1;
+        sxMap[x] = sx;
+      }
+      for (int16_t y = 0; y < dstH; ++y) {
+        int16_t sy = (int16_t)((int32_t)y * srcH / dstH);
+        if (sy >= srcH) sy = srcH - 1;
+        uint16_t *srcRow = src + sy * srcW;
+        for (int16_t x = 0; x < dstW; ++x) {
+          rowBuf[x] = srcRow[sxMap[x]];
+        }
+        s_tft->pushImage(dstX, dstY + y, dstW, 1, rowBuf);
+      }
+    }
+  }
+  s_zoomLastDrawn = s_zoomCur;
 
   drawStatusIfChanged(false);
   tickSubtitleScroll(now);

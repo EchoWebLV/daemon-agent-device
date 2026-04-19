@@ -12,11 +12,19 @@
 #include <Arduino.h>
 #include <functional>
 
-using SayCallback = std::function<void(const String &userText)>;
+using SayCallback       = std::function<void(const String &userText)>;
+// Fires on every frame of the Wi-Fi connect wait loop (~30 Hz). Argument
+// is milliseconds since `serverBeginWifi` was called. Use this to drive
+// an on-screen progress/radar animation while the connect would
+// otherwise block — the CPU is mostly idle during the wait, so spending
+// a few ms/frame on UI is free.
+using WifiJoinFrameCb   = std::function<void(uint32_t elapsedMs)>;
 
 // Connect to Wi-Fi using NVS-stored credentials first, falling back to the
-// compile-time defaults in secrets.h (blocking, 25 s timeout).
-bool serverBeginWifi();
+// compile-time defaults in secrets.h (blocking, 25 s timeout). Pass a
+// frame callback to animate the connect wait; pass `nullptr` (or omit)
+// to keep the legacy silent behaviour.
+bool serverBeginWifi(WifiJoinFrameCb onFrame = nullptr);
 
 // Attempt a connection to a specific SSID/password (blocking). On success
 // the credentials are persisted in NVS so subsequent boots pick them up.

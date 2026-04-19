@@ -1,4 +1,5 @@
 #include "mood.h"
+#include "creature.h"
 #include <time.h>
 #include <math.h>
 
@@ -122,6 +123,31 @@ void moodTick() {
     s.snark += (0.50f - s.snark) * clamp01(k);
     s.snark = clamp01(s.snark);
   }
+
+  // --- ambient reactions --------------------------------------------------
+  // Punctuated moments that make the idle animation feel inhabited rather
+  // than looped. Each is rate-limited via a separate next-allowed
+  // timestamp so they can't pile up on top of each other.
+  static uint32_t s_nextDozeMs      = 0;
+  static uint32_t s_nextSadDroopMs  = 0;
+
+  // Nightly doze: when it's late AND energy is very low AND the human
+  // isn't around, trigger a single extra-long sleepy blink roughly every
+  // 6-10 minutes. Gives Daemon the "dozing off" look that 3am on a
+  // lived-in desk deserves.
+  if (s.isNight && s.energy < 0.25f && s.silenceMs > 5UL * 60UL * 1000UL &&
+      now >= s_nextDozeMs) {
+    creatureTriggerReaction(REACT_DOZE);
+    s_nextDozeMs = now + (uint32_t)(6UL * 60UL * 1000UL) +
+                   (uint32_t)random(0, 4L * 60L * 1000L);
+  }
+
+  // Sad droop: when silence crosses 2h, fire once, then rearm only after
+  // another hour so it doesn't nag. Reads as a slow dejected blink.
+  if (s.silenceMs > 2UL * 60UL * 60UL * 1000UL && now >= s_nextSadDroopMs) {
+    creatureTriggerReaction(REACT_DROOP);
+    s_nextSadDroopMs = now + 60UL * 60UL * 1000UL;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +168,16 @@ void moodNoteUserUtterance() {
   // up a hair so Daemon gets the hint.
   if (prev != 0 && (now - prev) < 30000) {
     s.snark = clamp01(s.snark + 0.10f);
+  }
+
+  // Visible reaction tied to the gap since last utterance:
+  //   - No prior / very long silence (>20 min) → perk-up ("oh, you're back").
+  //   - Rapid repeat (<30 s) → faint grumble to sell the snark bump above.
+  //   - Everything else → nothing, so ordinary back-and-forth doesn't flash.
+  if (prev == 0 || (now - prev) > 20UL * 60UL * 1000UL) {
+    creatureTriggerReaction(REACT_PERK_UP);
+  } else if ((now - prev) < 30000) {
+    creatureTriggerReaction(REACT_GRUMBLE);
   }
 }
 

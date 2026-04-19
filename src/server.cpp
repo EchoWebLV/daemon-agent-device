@@ -1246,8 +1246,13 @@ static void logNearbyNetworks() {
 }
 
 // Core connect: tries the given SSID/password and returns success/failure.
-// Does not touch NVS; caller decides whether to persist.
-static bool connectTo(const String &ssid, const String &password) {
+// Does not touch NVS; caller decides whether to persist. When `onFrame`
+// is non-null, it's invoked every ~33 ms (~30 FPS) with the elapsed
+// milliseconds since we started dialing — giving UI a tick point to
+// render a connect animation. Serial-log status dots are still emitted
+// every 300 ms, same cadence as before.
+static bool connectTo(const String &ssid, const String &password,
+                      WifiJoinFrameCb onFrame) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("daemon");
   WiFi.disconnect(true, true);
@@ -1256,13 +1261,18 @@ static bool connectTo(const String &ssid, const String &password) {
   Serial.printf("wifi: connecting to '%s' ", ssid.c_str());
   WiFi.begin(ssid.c_str(), password.c_str());
 
-  uint32_t start = millis();
-  wl_status_t last = WL_IDLE_STATUS;
+  const uint32_t start     = millis();
+  uint32_t       lastDotMs = start;
+  wl_status_t    last      = WL_IDLE_STATUS;
   while (WiFi.status() != WL_CONNECTED && millis() - start < 25000) {
-    delay(300);
-    wl_status_t st = WiFi.status();
-    if (st != last) { Serial.printf("[%d]", (int)st); last = st; }
-    Serial.print('.');
+    if (onFrame) onFrame(millis() - start);
+    delay(33);                                // ~30 FPS UI budget
+    if (millis() - lastDotMs >= 300) {
+      lastDotMs   = millis();
+      wl_status_t st = WiFi.status();
+      if (st != last) { Serial.printf("[%d]", (int)st); last = st; }
+      Serial.print('.');
+    }
   }
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {
@@ -1273,23 +1283,23 @@ static bool connectTo(const String &ssid, const String &password) {
   return true;
 }
 
-bool serverBeginWifi() {
+bool serverBeginWifi(WifiJoinFrameCb onFrame) {
   logNearbyNetworks();
 
   // 1. Try user-provided credentials from NVS (set via the settings UI).
   String ssid = devcfgWifiSSID();
   String pass = devcfgWifiPassword();
   if (ssid.length() > 0) {
-    if (connectTo(ssid, pass)) return true;
+    if (connectTo(ssid, pass, onFrame)) return true;
     Serial.println("wifi: stored creds failed, trying secrets.h fallback");
   }
 
   // 2. Fall back to compile-time defaults in secrets.h.
-  return connectTo(WIFI_SSID, WIFI_PASSWORD);
+  return connectTo(WIFI_SSID, WIFI_PASSWORD, onFrame);
 }
 
 bool serverWifiConnect(const String &ssid, const String &password) {
-  bool ok = connectTo(ssid, password);
+  bool ok = connectTo(ssid, password, nullptr);
   if (ok) devcfgSetWifi(ssid, password);
   return ok;
 }

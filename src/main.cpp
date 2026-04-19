@@ -29,6 +29,7 @@
 #include "voice.h"
 #include "ai.h"
 #include "mood.h"
+#include "bootanim.h"
 #include "server.h"
 #include "wallet.h"
 #include "price.h"
@@ -548,6 +549,15 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(0x0000);
 
+  // Cinematic CRT power-on animation. Blocking but only as long as the
+  // animation itself runs (~820 ms on fresh power-on; 200-350 ms on a
+  // crash reboot). This REPLACES the silent black screen that used to
+  // sit here while the rest of setup() ran — we didn't add latency,
+  // we moved empty time into interesting time. The tint + duration
+  // change based on the reset reason, so a panic reboot flashes red
+  // and a brownout flashes amber — instant at-a-glance diagnostics.
+  bootAnimPlayPowerOn(&tft, (int)rr);
+
   // LCD backlight is now driven by PWM from devcfg; applied after voice
   // init so the Audio library exists by the time we call voiceSetVolume.
 
@@ -607,9 +617,25 @@ void setup() {
 
   // Wi-Fi + web server. These are best-effort; creature still animates
   // without them. That lets you iterate on the drawing without a network.
+  //
+  // The connect call can sit for up to 25 s blocking in loop(), so we
+  // spin the radar-pulse animation in a frame callback driven from
+  // inside server.cpp's wait loop. wifiJoinAnimBegin paints the initial
+  // frame, the lambda below ticks it at ~30 Hz from each delay(33)
+  // iteration inside connectTo(), and wifiJoinAnimEnd plays the
+  // success/fail outro + releases the PSRAM sprite that the boot
+  // animation allocated.
   creatureSetStatus("JOINING WIFI");
+  wifiJoinAnimBegin(&tft, devcfgWifiSSID());
+  s_wifiOk = serverBeginWifi([](uint32_t elapsedMs) {
+    wifiJoinAnimTick(elapsedMs);
+  });
+  wifiJoinAnimEnd(s_wifiOk);
+  // Repaint the creature sprite+status so the rest of setup() (NTP,
+  // memory recall, voice diagnose, boot greeting) has Daemon on-screen
+  // instead of a black panel.
+  creatureRepaint();
   creatureTick();
-  s_wifiOk = serverBeginWifi();
   if (s_wifiOk) {
     // Start NTP — required for OAuth 1.0a timestamps on the X API. Any
     // other TLS-based service tolerates the ESP32's epoch default because
@@ -671,6 +697,10 @@ void setup() {
 
   // Boot greeting — proves Wi-Fi, Gemini and the speaker are all alive.
   if (s_wifiOk && s_voiceOk) {
+    // Visible "waking up" blip on first frame after boot: the creature
+    // gaze recenters and flashes HAPPY briefly so the boot moment reads
+    // as *arriving*, not just "here's a talking head". Cheap and cute.
+    creatureTriggerReaction(REACT_PERK_UP);
     creatureSetMood(MOOD_TALK);
     creatureSetTalking(true);
     creatureSetSubtitle("Daemon online.");
@@ -750,6 +780,26 @@ void loop() {
     //   SWIPE_LEFT / SWIPE_RIGHT → cycle face style (skin picker)
     //   SWIPE_UP                 → open the menu drawer
     //   SWIPE_DOWN (top edge)    → open settings
+    //   HOLD (>800 ms)           → smoothly zoom Daemon out; release →
+    //                              smoothly zoom back in.
+    // The hold detection lives here (not in creature.cpp) because only
+    // the creature screen should react to a long press — menu / wallet
+    // / settings already have their own tap semantics, and we don't
+    // want a stationary finger on a slider to start zooming the face.
+    {
+      static bool s_zoomEngaged = false;
+      uint32_t hold = touchPressDurationMs();
+      if (hold >= 800 && !s_zoomEngaged) {
+        creatureSetZoomTarget(0.55f);      // noticeable but still readable
+        touchConsumeRelease();             // no accidental swipe on lift
+        s_zoomEngaged = true;
+        Serial.println("creature: long-press → zoom-out");
+      } else if (hold == 0 && s_zoomEngaged) {
+        creatureSetZoomTarget(1.0f);
+        s_zoomEngaged = false;
+        Serial.println("creature: release → zoom-in");
+      }
+    }
     if (sw == SWIPE_LEFT || sw == SWIPE_RIGHT) {
       int dir = (sw == SWIPE_RIGHT) ? 1 : -1;
       uint8_t next = (uint8_t)((creatureFaceStyle() + DEVCFG_FACE_COUNT + dir)

@@ -28,6 +28,12 @@ static bool       s_justPressed = false;
 static int16_t    s_startX = 0, s_startY = 0;
 static int16_t    s_lastX  = 0, s_lastY  = 0;
 static uint32_t   s_startMs = 0;
+// When an external consumer (e.g. the long-press zoom logic) has
+// already acted on a press, it calls touchConsumeRelease() so the
+// upcoming finger-up doesn't also fire whatever swipe the drag-path
+// accumulated into. One-shot flag — cleared as soon as the next
+// release is processed.
+static bool       s_suppressNextRelease = false;
 
 bool touchBegin() {
   Wire.begin(PIN_SDA, PIN_SCL, I2C_HZ);
@@ -59,6 +65,14 @@ SwipeDir touchPoll() {
   // Finger lifted — evaluate the accumulated motion.
   if (s_tracking) {
     s_tracking = false;
+    // If something already consumed this press (e.g. a long-press
+    // triggered zoom-out), don't also emit a swipe on the release.
+    // Drags that accumulated during the hold shouldn't retroactively
+    // fire SWIPE_UP/DOWN.
+    if (s_suppressNextRelease) {
+      s_suppressNextRelease = false;
+      return SWIPE_NONE;
+    }
     int16_t dx = s_lastX - s_startX;
     int16_t dy = s_lastY - s_startY;
     uint32_t dt = millis() - s_startMs;
@@ -77,6 +91,14 @@ SwipeDir touchPoll() {
   }
   return SWIPE_NONE;
 }
+
+uint32_t touchPressDurationMs() {
+  if (!s_tracking) return 0;
+  uint32_t now = millis();
+  return (now >= s_startMs) ? (now - s_startMs) : 0;
+}
+
+void touchConsumeRelease() { s_suppressNextRelease = true; }
 
 bool touchActive(int16_t &x, int16_t &y) {
   if (!s_tracking) return false;
