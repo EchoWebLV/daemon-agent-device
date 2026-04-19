@@ -22,7 +22,15 @@ static constexpr int I2S_DOUT = 47;
 // Audio library's proven connecttoFS path. This is a known-working flow;
 // the streaming-direct-to-decoder patch had a premature EOF bug in the
 // library's chunked reader that cut audio off after ~6 KB.
-static constexpr const char *TTS_FS_PATH = "/tts.mp3";
+//
+// We maintain two alternating slot files instead of a single /tts.mp3 so a
+// new utterance can be downloaded into one slot while the previous slot
+// is still being read by the decoder. That eliminates the ~530 ms
+// "stop + wait for LittleFS handle close" stall that used to precede
+// every fetch, and lets the TLS handshake + body download overlap with
+// the tail of the currently-playing reply.
+static constexpr const char *TTS_FS_A = "/tts_a.mp3";
+static constexpr const char *TTS_FS_B = "/tts_b.mp3";
 
 static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
@@ -34,6 +42,22 @@ static volatile bool s_playing   = false;
 // writing to LittleFS. Flipped on at dequeue, off after connecttoFS
 // completes (whether or not the fetch succeeded).
 static volatile bool s_fetching  = false;
+
+// The slot the decoder is currently holding a handle on (or last held).
+// New fetches always write to the *other* slot. Swapped only after a
+// successful connecttoFS, so a failed fetch doesn't ever hand the
+// decoder a truncated file.
+static const char *s_playbackSlot = TTS_FS_A;
+static const char *s_fetchSlot    = TTS_FS_B;
+
+// Reused HTTPS client + HTTPClient. mbedTLS contexts are ~40 KB each and
+// the handshake to api.elevenlabs.io is ~500–800 ms on the ESP32-S3, so
+// keeping a single connection alive across utterances saves both heap
+// churn and a big chunk of wall-clock latency. setReuse(true) + HTTP/1.1
+// keep-alive means the second utterance onward skips the handshake
+// entirely.
+static WiFiClientSecure *s_httpsClient = nullptr;
+static HTTPClient        s_http;
 
 // Queue job — carries the full utterance text so the fetch runs off the
 // main loop. We allocate the text inline (C string) so the FreeRTOS queue
@@ -114,9 +138,10 @@ static void audioTaskEntry(void *) {
 // ---------------------------------------------------------------------------
 // Fetch task — runs the blocking ElevenLabs HTTPS POST + LittleFS write
 // off the main Arduino loop so the UI keeps ticking while Daemon fetches
-// his reply audio. When the MP3 lands in /tts.mp3 we kick off playback.
+// his reply audio. Writes the MP3 into whichever of the two slot files
+// is *not* currently held by the decoder, then swaps the decoder over.
 // ---------------------------------------------------------------------------
-static bool fetchMp3ToFs(const String &text);   // defined further down
+static bool fetchMp3ToFs(const String &text, const char *outPath);
 
 static void fetchTaskEntry(void *) {
   for (;;) {
@@ -132,27 +157,31 @@ static void fetchTaskEntry(void *) {
     // contexts easily OOM on the ESP32-S3.
     s_fetching = true;
 
-    // Stop any currently playing utterance AND wait for the Audio library
-    // to actually release the LittleFS handle on /tts.mp3 before we
-    // reopen it for writing. Without this wait, LittleFS asserts with
-    // `lfs_mlist_isopen` on the next lfs_file_write because the old read
-    // handle is still on its open-files list.
-    if (s_audio->isRunning()) {
-      s_audio->stopSong();
-      uint32_t deadline = millis() + 500;
-      while (s_audio->isRunning() && millis() < deadline) {
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-      }
-      // Tiny extra grace so the audio task's current loop() iteration
-      // definitely finishes its File::close() path.
-      vTaskDelay(30 / portTICK_PERIOD_MS);
+    // Fetch into the *idle* slot — the decoder may still be playing out
+    // of s_playbackSlot. Writing to a different file avoids the LittleFS
+    // `lfs_mlist_isopen` assert entirely and means the HTTPS round-trip
+    // overlaps with the tail of the previous utterance.
+    const char *target = s_fetchSlot;
+    uint32_t t0 = millis();
+    if (!fetchMp3ToFs(text, target)) { s_fetching = false; continue; }
+    uint32_t tFetched = millis();
+
+    // Fetch succeeded — hand the new file to the decoder. connecttoFS
+    // internally stops the current song and closes its file handle, so
+    // we don't need the old stopSong-then-wait dance anymore.
+    bool ok = s_audio->connecttoFS(LittleFS, target);
+    if (ok) {
+      // Swap: the file we just handed to the decoder becomes the new
+      // playback slot, and the other one becomes the next fetch target.
+      s_playbackSlot = target;
+      s_fetchSlot    = (target == TTS_FS_A) ? TTS_FS_B : TTS_FS_A;
     }
-
-    if (!fetchMp3ToFs(text)) { s_fetching = false; continue; }
-
-    bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
     s_playing  = ok;
     s_fetching = false;
+    Serial.printf("voice: fetch=%lums swap=%lums ok=%d slot=%s\n",
+                  (unsigned long)(tFetched - t0),
+                  (unsigned long)(millis() - tFetched),
+                  ok ? 1 : 0, target);
     if (!ok) Serial.println("voice: connecttoFS failed");
   }
 }
@@ -178,9 +207,9 @@ static String jsonEscape(const String &in) {
 }
 
 // ---------------------------------------------------------------------------
-// Blocking fetch: POST → ElevenLabs → MP3 → LittleFS
+// Blocking fetch: POST → ElevenLabs → MP3 → LittleFS slot
 // ---------------------------------------------------------------------------
-static bool fetchMp3ToFs(const String &text) {
+static bool fetchMp3ToFs(const String &text, const char *outPath) {
   if (String(ELEVENLABS_API_KEY).startsWith("PASTE-") ||
       strlen(ELEVENLABS_API_KEY) < 10) {
     Serial.println("voice: no ElevenLabs key configured");
@@ -191,16 +220,26 @@ static bool fetchMp3ToFs(const String &text) {
     return false;
   }
 
+  // ElevenLabs query string, tuned for minimum first-audio latency on
+  // ESP32:
+  //   mp3_22050_32              ~1/4 the bytes of mp3_44100_128, saves
+  //                             500–1500 ms of TLS download per utterance
+  //                             with imperceptible quality loss on a
+  //                             tiny speaker.
+  //   optimize_streaming_latency=4   Max-aggression server-side latency
+  //                             mode. Levels 0–4; 4 trades a hair of
+  //                             quality for the fastest TTFB ElevenLabs
+  //                             offers on the REST endpoint.
   String url = "https://api.elevenlabs.io/v1/text-to-speech/";
   url += ELEVENLABS_VOICE_ID;
-  url += "/stream?output_format=mp3_44100_128";
+  url += "/stream?output_format=mp3_22050_32&optimize_streaming_latency=4";
 
   String body = "{\"text\":\"";
   body += jsonEscape(text);
   body += "\",\"model_id\":\"";
   body += ELEVENLABS_MODEL;
   body += "\",\"voice_settings\":{\"stability\":0.45,\"similarity_boost\":0.8,"
-          "\"style\":0.3,\"use_speaker_boost\":true}}";
+          "\"style\":0.0,\"use_speaker_boost\":true}}";
 
   // Voice is Critical priority — user is waiting to hear the reply, so
   // we're willing to wait up to the default 10 s for a slot and heap.
@@ -210,42 +249,62 @@ static bool fetchMp3ToFs(const String &text) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(25000);
-  if (!http.begin(client, url)) {
+  // Lazily create the reused TLS client on first use. Keeping it alive
+  // across calls lets HTTPClient reuse the TCP+TLS session (see
+  // setReuse(true) below) so subsequent utterances skip the ~800 ms
+  // handshake entirely.
+  if (!s_httpsClient) {
+    s_httpsClient = new WiFiClientSecure();
+    s_httpsClient->setInsecure();
+    // Disable Nagle so small POST bodies (~1 KB JSON) go out immediately
+    // instead of waiting up to 40 ms for a coalesce window.
+    s_httpsClient->setNoDelay(true);
+  }
+
+  s_http.setReuse(true);
+  s_http.setTimeout(10000);
+  if (!s_http.begin(*s_httpsClient, url)) {
     Serial.println("voice: http.begin failed");
     return false;
   }
-  http.addHeader("xi-api-key",   ELEVENLABS_API_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept",       "audio/mpeg");
+  s_http.addHeader("xi-api-key",   ELEVENLABS_API_KEY);
+  s_http.addHeader("Content-Type", "application/json");
+  s_http.addHeader("Accept",       "audio/mpeg");
+  s_http.addHeader("Connection",   "keep-alive");
 
   uint32_t t0 = millis();
-  int code = http.POST(body);
+  int code = s_http.POST(body);
+  uint32_t tHdr = millis();
   if (code != 200) {
-    String err = http.getString();
+    String err = s_http.getString();
     Serial.printf("voice: HTTP %d from ElevenLabs: %s\n", code, err.c_str());
-    http.end();
+    s_http.end();
+    // A non-200 may have left the connection in a weird state. Force a
+    // full reconnect on the next call so we don't thrash.
+    s_httpsClient->stop();
     return false;
   }
 
-  File f = LittleFS.open(TTS_FS_PATH, FILE_WRITE);
+  File f = LittleFS.open(outPath, FILE_WRITE);
   if (!f) {
     Serial.println("voice: LittleFS open failed");
-    http.end();
+    s_http.end();
     return false;
   }
-  int written = http.writeToStream(&f);
+  int written = s_http.writeToStream(&f);
   f.close();
-  http.end();
+  s_http.end();
   if (written <= 0) {
     Serial.printf("voice: writeToStream failed (%d)\n", written);
+    // Dead socket — drop it so keep-alive doesn't try to reuse it.
+    s_httpsClient->stop();
     return false;
   }
-  Serial.printf("voice: %d bytes MP3 in %lu ms\n",
-                written, (unsigned long)(millis() - t0));
+  Serial.printf("voice: %d bytes MP3 in %lu ms (hdr %lu ms) -> %s\n",
+                written,
+                (unsigned long)(millis() - t0),
+                (unsigned long)(tHdr - t0),
+                outPath);
   return true;
 }
 
