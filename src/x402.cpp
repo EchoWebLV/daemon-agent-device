@@ -19,32 +19,79 @@ static constexpr uint8_t USDC_DECIMALS = 6;
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-static String pickRpcUrl() {
+
+// When the user has set a Helius key we go straight to it — reliable,
+// generous free tier. Without a key we rotate through several public
+// Solana RPCs because `api.mainnet-beta.solana.com` alone rate-limits
+// aggressively (~40 req/10s shared across IPs), and during a chat burst
+// the device easily exceeds that. Each call picks the next provider in
+// the list, so even if one is throttled the next attempt hits a fresh
+// endpoint.
+// Public Solana RPCs that accept unauthenticated POSTs. Verified on-device:
+//   - api.mainnet-beta.solana.com: Solana Labs (aggressive rate limit)
+//   - solana-rpc.publicnode.com:   Allnodes (generous, reliable)
+// Previously tried drpc.org (400s without API key) and ankr.com/solana
+// (403s without key) — dropped. Add more here when you confirm they work.
+static const char *PUBLIC_RPCS[] = {
+  "https://api.mainnet-beta.solana.com",
+  "https://solana-rpc.publicnode.com",
+};
+static constexpr int N_PUBLIC_RPCS = sizeof(PUBLIC_RPCS) / sizeof(PUBLIC_RPCS[0]);
+
+static String pickRpcUrlRotating() {
   String k = String(HELIUS_API_KEY);
   if (!k.startsWith("PASTE-") && k.length() >= 10) {
     return "https://mainnet.helius-rpc.com/?api-key=" + k;
   }
-  return "https://api.mainnet-beta.solana.com";
+  static uint32_t s_idx = 0;
+  const char *ep = PUBLIC_RPCS[s_idx % N_PUBLIC_RPCS];
+  s_idx++;
+  return String(ep);
 }
 
+// rpcCall with retry + backoff. Retries on network error and on 429 /
+// 5xx (common rate-limit + transient signals). Each retry picks the next
+// endpoint via pickRpcUrlRotating() so a throttled provider doesn't
+// pin us down.
 static bool rpcCall(const String &payload, String &outBody) {
   if (WiFi.status() != WL_CONNECTED) return false;
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  if (!http.begin(client, pickRpcUrl())) return false;
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(15000);
-  int code = http.POST(payload);
-  if (code != 200) {
-    Serial.printf("x402: rpc %d\n", code);
+
+  constexpr int MAX_TRIES     = 3;
+  constexpr uint32_t BACKOFF  = 350;   // ms between tries (linear)
+
+  for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    String url = pickRpcUrlRotating();
+    if (!http.begin(client, url)) continue;
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(15000);
+
+    int code = http.POST(payload);
+    if (code == 200) {
+      outBody = http.getString();
+      http.end();
+      return true;
+    }
+
+    // Read and discard body on failure to keep the server state clean
+    // and to get a glimpse of the error in logs when it's small.
+    String body = http.getString();
     http.end();
-    return false;
+
+    bool retryable = (code == 429) || (code >= 500) || (code < 0);
+    Serial.printf("x402: rpc %d on try %d (ep=%.40s) retryable=%d\n",
+                  code, attempt + 1, url.c_str(), retryable ? 1 : 0);
+    if (!retryable) return false;
+
+    // Linear backoff — keeps things simple; rotating endpoint already
+    // gives us most of the benefit of exponential backoff.
+    vTaskDelay((BACKOFF * (attempt + 1)) / portTICK_PERIOD_MS);
   }
-  outBody = http.getString();
-  http.end();
-  return true;
+  return false;
 }
+
 
 // Recent blockhash: returns 32 bytes (base58-decoded) or false.
 static bool fetchRecentBlockhash(uint8_t out[32]) {
@@ -309,6 +356,38 @@ static void doOneRequest(const char *method,
   // `client` destructor here frees its mbedTLS context before we return.
 }
 
+// Wrap doOneRequest with transient-failure retries. HTTPClient returns
+// small negative codes when the TCP connect / TLS handshake fails
+// (classically -1 = connection refused, -11 = read timeout). These hit
+// in bursts on shared Wi-Fi / hotspot networks and on the free x402
+// gateway. One quick retry with a brief pause fixes the vast majority.
+static void doOneRequestWithRetry(const char *method,
+                                  const String &url,
+                                  const String &jsonBody,
+                                  const String &authBearer,
+                                  const String &paymentSigHeader,
+                                  int    &outStatus,
+                                  String &outBody,
+                                  String &outPayReq) {
+  constexpr int MAX_TRIES = 3;
+  for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+    doOneRequest(method, url, jsonBody, authBearer, paymentSigHeader,
+                 outStatus, outBody, outPayReq);
+
+    // Success, clear semantic (402 is the x402 payment handshake), or
+    // any 4xx other than rate-limit 429 — don't retry.
+    if (outStatus == 200 || outStatus == 402) return;
+    bool transient = (outStatus < 0) || (outStatus == 429) ||
+                     (outStatus >= 500);
+    if (!transient) return;
+    if (attempt < MAX_TRIES - 1) {
+      Serial.printf("x402: transient %d on try %d, retrying…\n",
+                    outStatus, attempt + 1);
+      vTaskDelay(400 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
 static X402Result x402Request(const char  *method,
                               const String &url,
                               const String &jsonBody,
@@ -325,8 +404,8 @@ static X402Result x402Request(const char  *method,
   int    code    = -1;
   String body;
   String payReq;
-  doOneRequest(method, url, jsonBody, authBearer, String(),
-               code, body, payReq);
+  doOneRequestWithRetry(method, url, jsonBody, authBearer, String(),
+                        code, body, payReq);
 
   if (code != 402) {
     r.status = code;
@@ -358,12 +437,13 @@ static X402Result x402Request(const char  *method,
   }
 
   // ── Pass 3: retry with the PAYMENT-SIGNATURE header. Fresh TLS client,
-  //     previous payment-build clients already gone. ──
+  //     previous payment-build clients already gone. Same retry wrap so
+  //     transient gateway failures don't waste an x402 payment. ──
   int    code2 = -1;
   String body2;
   String payReq2;
-  doOneRequest(method, url, jsonBody, authBearer, paymentHeader,
-               code2, body2, payReq2);
+  doOneRequestWithRetry(method, url, jsonBody, authBearer, paymentHeader,
+                        code2, body2, payReq2);
 
   r.status = code2;
   r.body   = body2;

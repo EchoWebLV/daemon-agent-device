@@ -214,38 +214,57 @@ uint32_t walletLastRefreshAgeMs() {
 // ---------------------------------------------------------------------------
 // JSON-RPC helper
 // ---------------------------------------------------------------------------
-// Pick an RPC endpoint: Helius when a key is provided, otherwise Solana's
-// free public RPC so Daemon can still read his balance out of the box.
-static String rpcEndpoint() {
+// Pick an RPC endpoint: Helius when a key is provided, otherwise rotate
+// through several public Solana RPCs so we don't pin all traffic to the
+// single aggressively-throttled `api.mainnet-beta.solana.com`.
+static const char *WALLET_PUBLIC_RPCS[] = {
+  "https://api.mainnet-beta.solana.com",
+  "https://solana-rpc.publicnode.com",
+};
+static constexpr int WALLET_N_PUBLIC_RPCS =
+    sizeof(WALLET_PUBLIC_RPCS) / sizeof(WALLET_PUBLIC_RPCS[0]);
+
+static String rpcEndpointRotating() {
   String key = String(HELIUS_API_KEY);
   if (!key.startsWith("PASTE-") && key.length() >= 10) {
     return "https://mainnet.helius-rpc.com/?api-key=" + key;
   }
-  return "https://api.mainnet-beta.solana.com";
+  static uint32_t s_idx = 0;
+  const char *ep = WALLET_PUBLIC_RPCS[s_idx % WALLET_N_PUBLIC_RPCS];
+  s_idx++;
+  return String(ep);
 }
 
 static bool rpcCall(const String &payload, String &outBody) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  String url = rpcEndpoint();
-  http.setTimeout(15000);
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Content-Type", "application/json");
+  constexpr int MAX_TRIES    = 3;
+  constexpr uint32_t BACKOFF = 350;
 
-  int code = http.POST(payload);
-  if (code != 200) {
-    Serial.printf("wallet: rpc HTTP %d (endpoint=%s)\n",
-                  code,
-                  url.startsWith("https://mainnet.helius") ? "helius" : "public");
+  for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    String url = rpcEndpointRotating();
+    http.setTimeout(15000);
+    if (!http.begin(client, url)) continue;
+    http.addHeader("Content-Type", "application/json");
+
+    int code = http.POST(payload);
+    if (code == 200) {
+      outBody = http.getString();
+      http.end();
+      return true;
+    }
     http.end();
-    return false;
+
+    bool retryable = (code == 429) || (code >= 500) || (code < 0);
+    Serial.printf("wallet: rpc HTTP %d try %d (ep=%.40s) retry=%d\n",
+                  code, attempt + 1, url.c_str(), retryable ? 1 : 0);
+    if (!retryable) return false;
+    vTaskDelay((BACKOFF * (attempt + 1)) / portTICK_PERIOD_MS);
   }
-  outBody = http.getString();
-  http.end();
-  return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------

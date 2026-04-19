@@ -163,7 +163,20 @@ static void drainLlmReplies() {
   LlmReply out;
   while (s_llmOut && xQueueReceive(s_llmOut, &out, 0) == pdTRUE) {
     String user  = String(out.user);
-    String reply = out.ok ? String(out.reply) : String("I got nothing. Ask me again?");
+    // On failure `aiAsk` already sets a specific error string in `reply`
+    // (e.g. "Couldn't complete USDC payment for this reply.", "HTTP -1",
+    // "Too many tool rounds — bailing."). Surface that real message
+    // instead of the generic fallback so the user / serial log show
+    // WHY it failed. Only fall back to a generic string when aiAsk left
+    // the buffer empty, which shouldn't normally happen.
+    String reply;
+    if (out.ok) {
+      reply = String(out.reply);
+    } else if (out.reply[0] != '\0') {
+      reply = String(out.reply);
+    } else {
+      reply = "I got nothing. Ask me again?";
+    }
     Serial.printf("<< daemon: %s\n", reply.c_str());
 
     // Web chat log gets the full formatted reply.
