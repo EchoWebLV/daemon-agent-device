@@ -36,6 +36,8 @@
 #include "walletscreen.h"
 #include "settingsscreen.h"
 #include "wifiscreen.h"
+#include "menuscreen.h"
+#include "infoscreen.h"
 #include "devcfg.h"
 #include "secrets.h"
 
@@ -184,12 +186,16 @@ static void drainLlmReplies() {
   }
 }
 
-// Screens: creature (home), wallet (swipe-left), settings (pull-down).
+// Screens: creature (home), menu (swipe-up drawer), wallet / info
+// (sub-screens reachable from the menu), settings (pull-down from top),
+// wifi (sub-screen of settings).
 enum Screen : uint8_t {
   SCREEN_CREATURE = 0,
-  SCREEN_WALLET   = 1,
-  SCREEN_SETTINGS = 2,
-  SCREEN_WIFI     = 3,   // sub-screen reached from Settings
+  SCREEN_MENU     = 1,
+  SCREEN_WALLET   = 2,
+  SCREEN_INFO     = 3,
+  SCREEN_SETTINGS = 4,
+  SCREEN_WIFI     = 5,   // sub-screen reached from Settings
 };
 static Screen s_screen     = SCREEN_CREATURE;
 static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
@@ -201,7 +207,9 @@ static void switchScreen(Screen target) {
   s_screen = target;
   switch (target) {
     case SCREEN_CREATURE: creatureRepaint();     break;
+    case SCREEN_MENU:     menuScreenDraw();      break;
     case SCREEN_WALLET:   walletScreenDraw();    break;
+    case SCREEN_INFO:     infoScreenDraw();      break;
     case SCREEN_SETTINGS: settingsScreenDraw();  break;
     case SCREEN_WIFI:     wifiScreenEnter();     break;
   }
@@ -365,6 +373,8 @@ void setup() {
   walletScreenBegin(&tft);
   settingsScreenBegin(&tft);
   wifiScreenBegin(&tft);
+  menuScreenBegin(&tft);
+  infoScreenBegin(&tft);
   touchBegin();
   creatureSetStatus("WAKING UP");
   creatureTick();   // first frame
@@ -459,10 +469,17 @@ void loop() {
   if (s_wifiOk) serverLoop();
 
   // Handle swipes.
-  //   SWIPE_LEFT  → wallet (from creature)
-  //   SWIPE_RIGHT → creature (from wallet)
-  //   SWIPE_DOWN  → open settings (only fires if start was near top edge)
-  //   SWIPE_UP    → close settings (back to previous screen)
+  //   From creature:
+  //     SWIPE_LEFT/RIGHT  → cycle face style
+  //     SWIPE_UP          → open the quick-actions menu drawer
+  //     SWIPE_DOWN (top)  → pull down settings
+  //   From menu:
+  //     SWIPE_DOWN        → close back to creature
+  //     tap Wallet / Info → push the matching sub-screen
+  //   From wallet / info:
+  //     SWIPE_DOWN        → return to the menu
+  //   From settings:
+  //     SWIPE_UP          → close settings back to previous screen
   SwipeDir sw = touchPoll();
   if (s_screen == SCREEN_SETTINGS) {
     if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
@@ -473,16 +490,23 @@ void loop() {
     // or exits the panel; we just pipe the swipe through.
     wifiScreenHandleSwipe(sw);
     if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_MENU) {
+    // Quick-actions drawer: swipe down dismisses; taps push a sub-screen.
+    if (sw == SWIPE_DOWN)                   switchScreen(SCREEN_CREATURE);
+    if (menuScreenConsumeClose())           switchScreen(SCREEN_CREATURE);
+    if (menuScreenConsumeWalletTap())       switchScreen(SCREEN_WALLET);
+    if (menuScreenConsumeInfoTap())         switchScreen(SCREEN_INFO);
   } else if (s_screen == SCREEN_WALLET) {
-    // Wallet is now a "pull-up" drawer: swipe down to dismiss it back to
-    // the creature. We deliberately don't let settings open from here so
-    // the close gesture is unambiguous — users return to the creature
-    // screen first, then pull settings down from the top edge.
-    if (sw == SWIPE_DOWN) switchScreen(SCREEN_CREATURE);
+    // Wallet is a sub-screen of the menu drawer. Swipe down returns to
+    // the menu; users can then swipe down again to get back to Daemon.
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_MENU);
+  } else if (s_screen == SCREEN_INFO) {
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_MENU);
+    if (infoScreenConsumeClose()) switchScreen(SCREEN_MENU);
   } else {
     // Creature screen:
     //   SWIPE_LEFT / SWIPE_RIGHT → cycle face style (skin picker)
-    //   SWIPE_UP                 → open the wallet drawer
+    //   SWIPE_UP                 → open the menu drawer
     //   SWIPE_DOWN (top edge)    → open settings
     if (sw == SWIPE_LEFT || sw == SWIPE_RIGHT) {
       int dir = (sw == SWIPE_RIGHT) ? 1 : -1;
@@ -496,7 +520,7 @@ void loop() {
       devcfgSetFaceStyle(next);
       creatureRepaint();
     }
-    if (sw == SWIPE_UP)   switchScreen(SCREEN_WALLET);
+    if (sw == SWIPE_UP)   switchScreen(SCREEN_MENU);
     if (sw == SWIPE_DOWN) switchScreen(SCREEN_SETTINGS);
   }
 
@@ -515,7 +539,9 @@ void loop() {
   // Per-screen tick.
   switch (s_screen) {
     case SCREEN_CREATURE: creatureTick();       break;
+    case SCREEN_MENU:     menuScreenTick();     break;
     case SCREEN_WALLET:   walletScreenTick();   break;
+    case SCREEN_INFO:     infoScreenTick();     break;
     case SCREEN_SETTINGS: settingsScreenTick(); break;
     case SCREEN_WIFI:     wifiScreenTick();     break;
   }
