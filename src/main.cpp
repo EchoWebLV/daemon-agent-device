@@ -81,9 +81,18 @@ static void llmWorkerTask(void *) {
     if (xQueueReceive(s_llmIn, &req, portMAX_DELAY) != pdTRUE) continue;
     s_llmBusy = true;
 
+    Serial.printf("llm: worker start  dram=%u stack=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+
     String user = String(req.text);
     String reply;
     bool ok = aiAsk(user, reply);
+
+    Serial.printf("llm: worker done   dram=%u stack=%u reply=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+                  (unsigned)reply.length());
 
     LlmReply out;
     memset(&out, 0, sizeof(out));
@@ -593,9 +602,14 @@ void loop() {
       uint8_t next = (uint8_t)((creatureFaceStyle() + DEVCFG_FACE_COUNT + dir)
                                % DEVCFG_FACE_COUNT);
       static const char *kFaceNames[] = { "Daemon", "Robot", "ToyRobot", "Calc" };
-      Serial.printf("face: swipe %s -> %u (%s)\n",
+      sampleHeap();
+      Serial.printf("face: swipe %s -> %u (%s)  dram=%u/%u llm=%d voice=%d\n",
                     (sw == SWIPE_RIGHT) ? "right" : "left",
-                    (unsigned)next, kFaceNames[next]);
+                    (unsigned)next, kFaceNames[next],
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)s_internalLowWatermark,
+                    s_llmBusy ? 1 : 0,
+                    voiceIsSpeaking() ? 1 : 0);
       creatureSetFaceStyle(next);
       devcfgSetFaceStyle(next);
       creatureRepaint();
