@@ -312,8 +312,14 @@ static void memoryWriteTask(void *) {
     // the board on long replies.
     // ------------------------------------------------------------------
     if (devcfgArweaveEnabled()) {
-      uint32_t dl = millis() + 20000;
-      while (voiceIsSpeaking() && millis() < dl) {
+      // Wait for the voice subsystem to finish BOTH its ElevenLabs fetch
+      // and its playback before we open our own TLS session. Voice fetch
+      // alone holds a ~30 KB mbedTLS context; if we open a second one in
+      // parallel the ESP32-S3 OOMs (SSL error -32512, "Memory allocation
+      // failed"). Plus a heap-floor check in case something else is
+      // fragmenting the pool — defer rather than crash.
+      uint32_t dl = millis() + 25000;
+      while ((voiceIsBusy() || ESP.getFreeHeap() < 70000) && millis() < dl) {
         vTaskDelay(200 / portTICK_PERIOD_MS);
       }
       ArweaveTag tags[] = {

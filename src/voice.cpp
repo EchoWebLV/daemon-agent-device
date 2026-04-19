@@ -29,6 +29,10 @@ static TaskHandle_t s_fetchTask  = nullptr;
 static QueueHandle_t s_speakQueue = nullptr;
 static volatile bool s_ready     = false;
 static volatile bool s_playing   = false;
+// True while the fetch task holds a TLS session to ElevenLabs and/or is
+// writing to LittleFS. Flipped on at dequeue, off after connecttoFS
+// completes (whether or not the fetch succeeded).
+static volatile bool s_fetching  = false;
 
 // Queue job — carries the full utterance text so the fetch runs off the
 // main loop. We allocate the text inline (C string) so the FreeRTOS queue
@@ -122,6 +126,11 @@ static void fetchTaskEntry(void *) {
     String text = String(job.text);
     if (text.length() == 0) continue;
 
+    // Guard flag so other HTTPS-using tasks (Arweave, memory) don't open
+    // a second TLS session on top of ours — two concurrent mbedTLS
+    // contexts easily OOM on the ESP32-S3.
+    s_fetching = true;
+
     // Stop any currently playing utterance AND wait for the Audio library
     // to actually release the LittleFS handle on /tts.mp3 before we
     // reopen it for writing. Without this wait, LittleFS asserts with
@@ -138,10 +147,11 @@ static void fetchTaskEntry(void *) {
       vTaskDelay(30 / portTICK_PERIOD_MS);
     }
 
-    if (!fetchMp3ToFs(text)) continue;
+    if (!fetchMp3ToFs(text)) { s_fetching = false; continue; }
 
     bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
-    s_playing = ok;
+    s_playing  = ok;
+    s_fetching = false;
     if (!ok) Serial.println("voice: connecttoFS failed");
   }
 }
@@ -304,10 +314,17 @@ bool voiceSpeak(const String &text) {
     SpeakJob drop;
     xQueueReceive(s_speakQueue, &drop, 0);
   }
-  return xQueueSend(s_speakQueue, &job, 0) == pdTRUE;
+  // Flip busy BEFORE the send so any background task checking
+  // voiceIsBusy() right after this call sees the pending work and
+  // doesn't race us into mbedTLS OOM.
+  s_fetching = true;
+  bool queued = (xQueueSend(s_speakQueue, &job, 0) == pdTRUE);
+  if (!queued) s_fetching = false;
+  return queued;
 }
 
 bool voiceIsSpeaking() { return s_playing; }
+bool voiceIsBusy()     { return s_fetching || s_playing; }
 
 void voiceStop() {
   if (s_audio && s_audio->isRunning()) s_audio->stopSong();
