@@ -122,8 +122,21 @@ static void fetchTaskEntry(void *) {
     String text = String(job.text);
     if (text.length() == 0) continue;
 
-    // Stop any currently playing utterance so this one takes over.
-    if (s_audio->isRunning()) s_audio->stopSong();
+    // Stop any currently playing utterance AND wait for the Audio library
+    // to actually release the LittleFS handle on /tts.mp3 before we
+    // reopen it for writing. Without this wait, LittleFS asserts with
+    // `lfs_mlist_isopen` on the next lfs_file_write because the old read
+    // handle is still on its open-files list.
+    if (s_audio->isRunning()) {
+      s_audio->stopSong();
+      uint32_t deadline = millis() + 500;
+      while (s_audio->isRunning() && millis() < deadline) {
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+      // Tiny extra grace so the audio task's current loop() iteration
+      // definitely finishes its File::close() path.
+      vTaskDelay(30 / portTICK_PERIOD_MS);
+    }
 
     if (!fetchMp3ToFs(text)) continue;
 

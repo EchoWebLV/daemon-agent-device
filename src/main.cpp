@@ -95,19 +95,88 @@ static void llmWorkerTask(void *) {
   }
 }
 
+// Strip markdown fences/emphasis, code-block content, and multi-byte
+// emoji — the LLM occasionally returns long technical replies with big
+// ```fenced``` code sections that have no business being read aloud, and
+// those sections also blow up the ElevenLabs POST body + LittleFS write
+// (which once assert-crashed the board). We keep the original reply for
+// the web chat log and only sanitize what feeds the TTS + subtitle.
+static String sanitizeForSpeech(const String &in) {
+  // Step 1: drop fenced code blocks entirely. Looks for ``` ... ``` and
+  // removes the whole region, non-greedy.
+  String s = in;
+  while (true) {
+    int a = s.indexOf("```");
+    if (a < 0) break;
+    int b = s.indexOf("```", a + 3);
+    if (b < 0) { s = s.substring(0, a); break; }     // unterminated: chop
+    s = s.substring(0, a) + s.substring(b + 3);
+  }
+
+  // Step 2: strip inline backticks but keep the wrapped text.
+  s.replace("`", "");
+
+  // Step 3: collapse common markdown emphasis markers.
+  s.replace("**", "");
+  s.replace("__", "");
+  // Solo * and _ are ambiguous (could be bullet points or words). Leave
+  // them — ElevenLabs handles them fine.
+
+  // Step 4: keep only characters that are safe for TTS. Drops non-BMP
+  // emoji (UTF-8 4-byte sequences start with 0xF0..0xF4) and control
+  // characters except \n and \t.
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ) {
+    uint8_t c = (uint8_t)s[i];
+    if (c >= 0xF0) { i += 4; continue; }    // skip 4-byte emoji
+    if (c >= 0xE0) { out += s[i]; out += s[i+1]; out += s[i+2]; i += 3; continue; }
+    if (c >= 0xC0) { out += s[i]; out += s[i+1]; i += 2; continue; }
+    if (c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7F)) out += (char)c;
+    i += 1;
+  }
+
+  // Step 5: collapse runs of whitespace (the markdown strip can leave
+  // blank lines behind) and hard-cap at 600 chars for latency + safety.
+  String collapsed;
+  collapsed.reserve(out.length());
+  bool lastWasSpace = false;
+  for (size_t i = 0; i < out.length(); ++i) {
+    char c = out[i];
+    bool isWs = (c == ' ' || c == '\n' || c == '\t' || c == '\r');
+    if (isWs) {
+      if (!lastWasSpace) collapsed += ' ';
+      lastWasSpace = true;
+    } else {
+      collapsed += c;
+      lastWasSpace = false;
+    }
+  }
+  collapsed.trim();
+  if (collapsed.length() > 600) collapsed = collapsed.substring(0, 597) + "…";
+  return collapsed;
+}
+
 static void drainLlmReplies() {
   LlmReply out;
   while (s_llmOut && xQueueReceive(s_llmOut, &out, 0) == pdTRUE) {
     String user  = String(out.user);
     String reply = out.ok ? String(out.reply) : String("I got nothing. Ask me again?");
     Serial.printf("<< daemon: %s\n", reply.c_str());
+
+    // Web chat log gets the full formatted reply.
     serverSetReply(user, reply);
-    creatureSetSubtitle(reply);
-    if (s_voiceOk) {
+
+    // Subtitle + TTS get a cleaned version — no code fences, no emoji,
+    // length-capped — so long technical answers don't crash the board or
+    // make Daemon read "triple backtick bash" out loud.
+    String spoken = sanitizeForSpeech(reply);
+    creatureSetSubtitle(spoken.length() > 0 ? spoken : reply);
+    if (s_voiceOk && spoken.length() > 0) {
       creatureSetMood(MOOD_TALK);
       creatureSetTalking(true);
       serverSetStatus("speaking…");
-      voiceSpeak(reply);     // async itself — returns immediately
+      voiceSpeak(spoken);    // async itself — returns immediately
     } else {
       creatureSetMood(MOOD_IDLE);
       serverSetStatus("idle");
@@ -358,8 +427,8 @@ void setup() {
   if (s_wifiOk && (devcfgMemoryEnabled() || devcfgArweaveEnabled()) &&
       memoryKeyReady()) {
     creatureSetSubtitle("restoring memory…");
-    MemoryTurn loaded[10];
-    int n = memoryRecallTurns(loaded, 10);
+    MemoryTurn loaded[20];
+    int n = memoryRecallTurns(loaded, 20);
     if (n > 0) aiLoadHistory(loaded, n);
   }
 

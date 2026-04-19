@@ -4,6 +4,7 @@
 #include "base58.h"
 #include "solana_tx.h"
 #include "arweave.h"
+#include "voice.h"
 #include "secrets.h"
 
 #include <WiFi.h>
@@ -304,8 +305,17 @@ static void memoryWriteTask(void *) {
     // Irys. Runs after the memo write so a slow/failed Irys upload never
     // blocks the primary on-chain memo path. Under 100 KiB is free on
     // Irys, so this costs nothing for typical chat memos.
+    //
+    // Wait for the voice TTS fetch / playback to finish first — running
+    // a second TLS session while the voice task is also doing HTTPS +
+    // LittleFS writes peaks heap near ~20 KB free, which was crashing
+    // the board on long replies.
     // ------------------------------------------------------------------
     if (devcfgArweaveEnabled()) {
+      uint32_t dl = millis() + 20000;
+      while (voiceIsSpeaking() && millis() < dl) {
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+      }
       ArweaveTag tags[] = {
         { "Content-Type", "application/octet-stream" },
         { "App-Name",     "daemon" },
