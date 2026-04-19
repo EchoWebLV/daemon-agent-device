@@ -71,11 +71,16 @@ static bool inRect(int16_t x, int16_t y,
 }
 
 // Close "X" button lives at the very top-right of every Wi-Fi sub-mode.
-// Size is generous so tapping it is easy on the small screen.
-static constexpr int16_t CLOSE_W = 36;
-static constexpr int16_t CLOSE_H = 24;
+// Hit region (CLOSE_W × CLOSE_H) is intentionally bigger than the drawn
+// pill (CLOSE_DRAW_*) so fat-finger taps near the corner reliably
+// dismiss even though the visual stays compact.
+static constexpr int16_t CLOSE_W = 48;
+static constexpr int16_t CLOSE_H = 32;
 static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W;
 static constexpr int16_t CLOSE_Y = 0;
+static constexpr int16_t CLOSE_DRAW_W = 36;
+static constexpr int16_t CLOSE_DRAW_H = 24;
+static constexpr int16_t CLOSE_DRAW_X = SCR_W - CLOSE_DRAW_W;
 
 // Press / release tap tracking — same pattern as settingsscreen, to keep
 // "start of a swipe" from being interpreted as a button tap.
@@ -114,12 +119,16 @@ static void drawStatusBar(const char *title) {
   s_tft->setCursor(4, 4);
   s_tft->print(title);
 
-  // X close button — outlined pill with an "x" label.
-  s_tft->drawRoundRect(CLOSE_X + 2, CLOSE_Y + 2, CLOSE_W - 4, CLOSE_H - 4, 3, C_ACCENT);
+  // X close button — outlined pill with an "x" label. Drawn at the
+  // compact visual size; the tap rectangle around it is larger.
+  s_tft->drawRoundRect(CLOSE_DRAW_X + 2, CLOSE_Y + 2,
+                       CLOSE_DRAW_W - 4, CLOSE_DRAW_H - 4, 3, C_ACCENT);
   s_tft->setTextFont(2);
   s_tft->setTextDatum(MC_DATUM);
   s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->drawString("x", CLOSE_X + CLOSE_W / 2, CLOSE_Y + CLOSE_H / 2);
+  s_tft->drawString("x",
+                    CLOSE_DRAW_X + CLOSE_DRAW_W / 2,
+                    CLOSE_Y + CLOSE_DRAW_H / 2);
 }
 
 // True if the tap hit the X button at the top-right.
@@ -572,6 +581,24 @@ void wifiScreenEnter() {
   s_password = "";
   s_selectedSSID = "";
   s_listScroll = 0;
+
+  // Reset tap state so a press that began on the previous screen can't
+  // register as a ghost tap (rescan / close) the instant we flip here.
+  // This was half of the "stuck in a loop between Settings and scanning"
+  // bug.
+  s_pressed    = false;
+  s_pressMoved = false;
+  s_pressX     = 0;
+  s_pressY     = 0;
+
+  // Cancel any stale async scan left over from a prior session. kickScan
+  // does a WiFi.scanDelete first, but pending in-flight radio state may
+  // otherwise dribble results into the new session.
+  if (s_scanInFlight) {
+    WiFi.scanDelete();
+    s_scanInFlight = false;
+  }
+  Serial.println("wifi: enter (MODE_SCANNING, fresh state)");
 }
 
 bool wifiScreenConsumeExit() {
@@ -602,11 +629,15 @@ void wifiScreenTick() {
       // Allow cancelling while scan runs: a tap on the X button or any
       // swipe back exits the Wi-Fi panel straight away.
       int16_t tx, ty;
-      if (consumeTap(tx, ty) && closeButtonTapped(tx, ty)) {
-        WiFi.scanDelete();
-        s_scanInFlight = false;
-        s_wantExit = true;
-        break;
+      if (consumeTap(tx, ty)) {
+        Serial.printf("wifi(scanning): tap @ (%d,%d) close=%d\n",
+                      (int)tx, (int)ty, closeButtonTapped(tx, ty) ? 1 : 0);
+        if (closeButtonTapped(tx, ty)) {
+          WiFi.scanDelete();
+          s_scanInFlight = false;
+          s_wantExit = true;
+          break;
+        }
       }
 
       int res = WiFi.scanComplete();

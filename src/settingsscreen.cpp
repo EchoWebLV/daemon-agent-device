@@ -32,15 +32,15 @@ struct Row {
 
 // Six rows: Wi-Fi is tallest (has IP+RSSI sub-line), sliders are medium,
 // the three toggle rows (Bluetooth / Memory / Heartbeat) are compact.
-// All heights include the divider below — total stack ends at y=284 with
-// footer text sitting at y=306, so everything fits on the 320-px screen.
+// WI-FI now starts at y=32, below the X close button's hit region, so the
+// two never overlap. Everything else shifts down to match.
 static Row  ROWS[6] = {
-  { "WI-FI",      22,  50, 120,  110 },
-  { "BLUETOOTH",  72,  38, 170,   60 },
-  { "VOLUME",     110, 42, 110,  120 },
-  { "BRIGHTNESS", 152, 42, 110,  120 },
-  { "MEMORY",     194, 38, 170,   60 },
-  { "HEARTBEAT",  232, 38, 170,   60 },
+  { "WI-FI",      32,  44, 120,  110 },
+  { "BLUETOOTH",  76,  38, 170,   60 },
+  { "VOLUME",     114, 42, 110,  120 },
+  { "BRIGHTNESS", 156, 42, 110,  120 },
+  { "MEMORY",     198, 38, 170,   60 },
+  { "HEARTBEAT",  236, 38, 170,   60 },
 };
 static constexpr int R_WIFI = 0;
 static constexpr int R_BT   = 1;
@@ -66,11 +66,18 @@ static bool     s_wantWifiPanel = false;
 static bool     s_wantClose     = false;
 
 // Close "X" button — top-right of status bar on every sub-screen.
-// Made it a bit larger than the previous 26×20 so it's easier to land on.
-static constexpr int16_t CLOSE_W = 36;
-static constexpr int16_t CLOSE_H = 24;
+// Hit region is deliberately bigger than the drawn pill so fat-finger
+// taps near the corner reliably dismiss instead of wandering into the
+// row below.
+static constexpr int16_t CLOSE_W = 48;          // drawn pill stays 36-wide
+static constexpr int16_t CLOSE_H = 30;          // extend below the visual
 static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W;
 static constexpr int16_t CLOSE_Y = 0;
+// Visual pill — narrower than the hit region. The wider hit region is
+// only used for tap detection.
+static constexpr int16_t CLOSE_DRAW_W = 36;
+static constexpr int16_t CLOSE_DRAW_H = 24;
+static constexpr int16_t CLOSE_DRAW_X = SCR_W - CLOSE_DRAW_W;
 
 // --- Press / release tap detection ----------------------------------------
 // We DO NOT fire row actions on finger-down, because a swipe-up gesture
@@ -94,7 +101,9 @@ bool settingsScreenBegin(TFT_eSPI *tft) {
 // Primitive painters
 // ---------------------------------------------------------------------------
 static void paintStatusBar() {
-  s_tft->fillRect(0, 0, SCR_W, CLOSE_H, C_BG);
+  // Clear just the visible status-bar row (matches the drawn pill, not
+  // the larger tap region).
+  s_tft->fillRect(0, 0, SCR_W, CLOSE_DRAW_H, C_BG);
   s_tft->setTextFont(1);
   s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextColor(C_ACCENT, C_BG);
@@ -106,7 +115,7 @@ static void paintStatusBar() {
   if (price.length() > 0) {
     s_tft->setTextDatum(TR_DATUM);
     s_tft->setTextColor(C_ACCENT_HI, C_BG);
-    s_tft->drawString(price, CLOSE_X - 4, 4);
+    s_tft->drawString(price, CLOSE_DRAW_X - 4, 4);
   }
   s_lastPrice = price;
 
@@ -115,12 +124,16 @@ static void paintStatusBar() {
   // keeps the SETTINGS label uncluttered.
   statusIconsDraw(s_tft, STATUS_H + 80, STATUS_H / 2, C_ACCENT_HI, C_BG);
 
-  // Close button: [ x ]
-  s_tft->drawRoundRect(CLOSE_X + 2, CLOSE_Y + 2, CLOSE_W - 4, CLOSE_H - 4, 3, C_ACCENT);
+  // Close button visual — drawn at its natural size; tap region below
+  // is larger so fat-finger taps still catch it.
+  s_tft->drawRoundRect(CLOSE_DRAW_X + 2, CLOSE_Y + 2,
+                       CLOSE_DRAW_W - 4, CLOSE_DRAW_H - 4, 3, C_ACCENT);
   s_tft->setTextFont(2);
   s_tft->setTextDatum(MC_DATUM);
   s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->drawString("x", CLOSE_X + CLOSE_W / 2, CLOSE_Y + CLOSE_H / 2);
+  s_tft->drawString("x",
+                    CLOSE_DRAW_X + CLOSE_DRAW_W / 2,
+                    CLOSE_Y + CLOSE_DRAW_H / 2);
 }
 
 // Draws the common label + divider for a row.
@@ -222,6 +235,19 @@ static void paintFooter() {
 // ---------------------------------------------------------------------------
 void settingsScreenDraw() {
   if (!s_tft) return;
+
+  // Reset tap-tracking + one-shot flags every time the screen is freshly
+  // drawn so stale state from the previous visit (e.g. an in-progress
+  // press that got interrupted by a screen transition) can't trigger a
+  // ghost tap on the wifi row or any other control. This was the cause
+  // of users getting bounced between Settings and Wi-Fi scanning.
+  s_pressed        = false;
+  s_pressMoved     = false;
+  s_pressX         = 0;
+  s_pressY         = 0;
+  s_wantWifiPanel  = false;
+  s_wantClose      = false;
+
   s_tft->fillScreen(C_BG);
   statusIconsResetCache();
   paintStatusBar();
@@ -234,6 +260,7 @@ void settingsScreenDraw() {
   paintFooter();
   s_lastVol = devcfgVolume();
   s_lastBri = devcfgBrightness();
+  Serial.println("settings: shown");
 }
 
 static bool inRect(int16_t x, int16_t y,

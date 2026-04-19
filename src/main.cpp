@@ -495,14 +495,30 @@ void loop() {
   //     SWIPE_UP          → close settings back to previous screen
   SwipeDir sw = touchPoll();
   if (s_screen == SCREEN_SETTINGS) {
-    if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
-    if (settingsScreenConsumeClose())       switchScreen(s_prevScreen);
-    if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
+    if (sw == SWIPE_UP) {
+      Serial.println("settings: swipe-up -> creature");
+      switchScreen(SCREEN_CREATURE);
+    }
+    // X button always pops straight to Daemon — no intermediate hops,
+    // no chance of looping back into another sub-screen.
+    if (settingsScreenConsumeClose()) {
+      Serial.println("settings: X tapped -> creature");
+      switchScreen(SCREEN_CREATURE);
+    }
+    if (settingsScreenConsumeWifiTap()) {
+      Serial.println("settings: WI-FI row tapped -> WIFI");
+      switchScreen(SCREEN_WIFI);
+    }
   } else if (s_screen == SCREEN_WIFI) {
     // Wi-Fi screen decides itself whether a swipe goes back to the list
-    // or exits the panel; we just pipe the swipe through.
+    // or exits the panel; we just pipe the swipe through. On exit we go
+    // straight to the creature screen (not back to settings) so the
+    // user can never loop between scanning and settings.
     wifiScreenHandleSwipe(sw);
-    if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+    if (wifiScreenConsumeExit()) {
+      Serial.println("wifi: exit -> creature");
+      switchScreen(SCREEN_CREATURE);
+    }
   } else if (s_screen == SCREEN_MENU) {
     // Quick-actions drawer: swipe down dismisses; taps push a sub-screen.
     if (sw == SWIPE_DOWN)                   switchScreen(SCREEN_CREATURE);
@@ -510,12 +526,12 @@ void loop() {
     if (menuScreenConsumeWalletTap())       switchScreen(SCREEN_WALLET);
     if (menuScreenConsumeInfoTap())         switchScreen(SCREEN_INFO);
   } else if (s_screen == SCREEN_WALLET) {
-    // Wallet is a sub-screen of the menu drawer. Swipe down returns to
-    // the menu; users can then swipe down again to get back to Daemon.
-    if (sw == SWIPE_DOWN) switchScreen(SCREEN_MENU);
+    // Wallet is a sub-screen. Any swipe-down or close dismisses straight
+    // back to Daemon for consistency with every other sub-screen.
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_CREATURE);
   } else if (s_screen == SCREEN_INFO) {
-    if (sw == SWIPE_DOWN) switchScreen(SCREEN_MENU);
-    if (infoScreenConsumeClose()) switchScreen(SCREEN_MENU);
+    if (sw == SWIPE_DOWN)           switchScreen(SCREEN_CREATURE);
+    if (infoScreenConsumeClose())   switchScreen(SCREEN_CREATURE);
   } else {
     // Creature screen:
     //   SWIPE_LEFT / SWIPE_RIGHT → cycle face style (skin picker)
