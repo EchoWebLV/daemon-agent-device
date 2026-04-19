@@ -61,11 +61,39 @@ static bool fetchRecentBlockhash(uint8_t out[32]) {
   return true;
 }
 
+// Small in-memory cache of destination-owner → USDC ATA lookups. Every
+// payment to the same recipient would otherwise open a fresh TLS client
+// against the Solana RPC mid-x402-flow — three concurrent TLS contexts
+// (LLM client + service client + RPC client) has been observed to
+// exhaust heap and mystery-reboot the device on busy chats.
+struct AtaCacheEntry { String owner; String ata; uint32_t ageMs; };
+static constexpr int ATA_CACHE_N = 8;
+static AtaCacheEntry s_ataCache[ATA_CACHE_N];
+
+static String lookupAtaCache(const String &ownerB58) {
+  for (auto &e : s_ataCache) if (e.owner == ownerB58) return e.ata;
+  return String();
+}
+static void storeAtaCache(const String &ownerB58, const String &ata) {
+  int oldestIdx = 0;
+  uint32_t oldestAge = 0;
+  uint32_t now = millis();
+  for (int i = 0; i < ATA_CACHE_N; ++i) {
+    if (s_ataCache[i].owner.length() == 0) { oldestIdx = i; break; }
+    uint32_t age = now - s_ataCache[i].ageMs;
+    if (age > oldestAge) { oldestAge = age; oldestIdx = i; }
+  }
+  s_ataCache[oldestIdx] = { ownerB58, ata, now };
+}
+
 // Find the destination's USDC associated token account via RPC.
 // getTokenAccountsByOwner with mint filter returns the ATA if one exists.
 // Returns empty String if the recipient has no USDC account set up —
 // which means an x402 service is mis-configured, the payment will fail.
 static String fetchUsdcAta(const String &ownerB58) {
+  String cached = lookupAtaCache(ownerB58);
+  if (cached.length() > 0) return cached;
+
   String payload = String(
       "{\"jsonrpc\":\"2.0\",\"id\":1,"
       "\"method\":\"getTokenAccountsByOwner\",\"params\":[\"") +
@@ -78,7 +106,9 @@ static String fetchUsdcAta(const String &ownerB58) {
   JsonArray arr = doc["result"]["value"].as<JsonArray>();
   if (arr.isNull() || arr.size() == 0) return String();
   const char *pk = arr[0]["pubkey"] | (const char*)nullptr;
-  return pk ? String(pk) : String();
+  String ata = pk ? String(pk) : String();
+  if (ata.length() > 0) storeAtaCache(ownerB58, ata);
+  return ata;
 }
 
 // Base64-encode a UTF-8 string without newlines.
@@ -201,11 +231,12 @@ static String buildPaymentPayload(const JsonDocument &paymentRequired,
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API (shared GET/POST handler)
 // ---------------------------------------------------------------------------
-X402Result x402Post(const String &url,
-                    const String &jsonBody,
-                    const String &authBearer) {
+static X402Result x402Request(const char  *method,
+                              const String &url,
+                              const String &jsonBody,
+                              const String &authBearer) {
   X402Result r;
   if (WiFi.status() != WL_CONNECTED) {
     r.error = "no wifi";
@@ -220,7 +251,9 @@ X402Result x402Post(const String &url,
     r.error = "http.begin failed";
     return r;
   }
-  http.addHeader("Content-Type", "application/json");
+  if (strcmp(method, "POST") == 0) {
+    http.addHeader("Content-Type", "application/json");
+  }
   if (authBearer.length() > 0) {
     http.addHeader("Authorization", "Bearer " + authBearer);
   }
@@ -237,9 +270,11 @@ X402Result x402Post(const String &url,
   http.collectHeaders(kPaymentHeaders, 3);
 
   uint32_t t0 = millis();
-  int code = http.POST(jsonBody);
-  Serial.printf("x402: POST %s -> %d in %lu ms\n",
-                url.c_str(), code, (unsigned long)(millis() - t0));
+  int code = (strcmp(method, "POST") == 0)
+             ? http.POST(jsonBody)
+             : http.GET();
+  Serial.printf("x402: %s %s -> %d in %lu ms\n",
+                method, url.c_str(), code, (unsigned long)(millis() - t0));
 
   if (code == 402) {
     // Try every known place the facilitator might have put the payment
@@ -305,14 +340,18 @@ X402Result x402Post(const String &url,
       r.error = "retry http.begin failed";
       return r;
     }
-    http2.addHeader("Content-Type", "application/json");
+    if (strcmp(method, "POST") == 0) {
+      http2.addHeader("Content-Type", "application/json");
+    }
     http2.addHeader("PAYMENT-SIGNATURE", paymentHeader);
     if (authBearer.length() > 0) {
       http2.addHeader("Authorization", "Bearer " + authBearer);
     }
 
     uint32_t t1 = millis();
-    int code2 = http2.POST(jsonBody);
+    int code2 = (strcmp(method, "POST") == 0)
+                ? http2.POST(jsonBody)
+                : http2.GET();
     r.status = code2;
     r.body   = http2.getString();
     http2.end();
@@ -332,4 +371,14 @@ X402Result x402Post(const String &url,
   http.end();
   if (code != 200) r.error = "status " + String(code);
   return r;
+}
+
+X402Result x402Post(const String &url,
+                    const String &jsonBody,
+                    const String &authBearer) {
+  return x402Request("POST", url, jsonBody, authBearer);
+}
+
+X402Result x402Get(const String &url, const String &authBearer) {
+  return x402Request("GET", url, String(), authBearer);
 }

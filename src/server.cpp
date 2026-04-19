@@ -214,6 +214,48 @@ const BUILTIN = [
 ];
 
 // ────────── skill (.md) parser — ported from the extension ──────────
+// Known API parameters we can infer from the description even when the
+// skill file doesn't declare a Params: block. Grouped by trigger keywords:
+// if any of the keywords appear in the description, ALL fields in that
+// group are added as optional hints — snake_case AND camelCase — so the
+// LLM sees both conventions and picks whichever the docs imply.
+const PARAM_GROUPS = [
+  {
+    triggers: ['username', 'user id', 'user_id', 'handle', 'screen name', 'twitter', 'x.com'],
+    fields:   [['username','string'],['userName','string'],
+               ['user_id','string'],['userId','string'],
+               ['handle','string'],['screen_name','string']],
+  },
+  {
+    triggers: ['address', 'wallet', 'pubkey', 'vasp'],
+    fields:   [['address','string'],['wallet','string'],['chain','string']],
+  },
+  {
+    triggers: ['token', 'mint', 'symbol', 'coin'],
+    fields:   [['token','string'],['mint','string'],['symbol','string']],
+  },
+  {
+    triggers: ['search', 'query', 'lookup', 'find'],
+    fields:   [['q','string'],['query','string']],
+  },
+  {
+    triggers: ['prompt', 'generate', 'generation', 'image', 'video'],
+    fields:   [['prompt','string'],['model','string'],['aspect_ratio','string']],
+  },
+  {
+    triggers: ['paginat', 'cursor', 'next page', 'limit'],
+    fields:   [['cursor','string'],['limit','number']],
+  },
+  {
+    triggers: ['replies', 'reply', 'include'],
+    fields:   [['include_replies','string'],['includeReplies','string']],
+  },
+  {
+    triggers: ['url', 'link', 'website'],
+    fields:   [['url','string']],
+  },
+];
+
 function parseSkill(text){
   const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
   const p = {}; const desc = []; const params = []; let inParams = false;
@@ -278,6 +320,28 @@ function parseSkill(text){
     }catch{return 'Custom Service';}
   };
   const name = p.name || deriveName();
+
+  // If the skill didn't declare any params, scan the description for
+  // trigger keywords and add the associated field hints as optional
+  // params. We include both snake_case and camelCase spellings of every
+  // inferred field so the LLM can pick whichever the endpoint expects.
+  if(params.length === 0){
+    const lower = `${name} ${description} ${path}`.toLowerCase();
+    const seen = new Set();
+    for(const group of PARAM_GROUPS){
+      const hit = group.triggers.some(t => lower.includes(t));
+      if(!hit) continue;
+      for(const [fname, ftype] of group.fields){
+        if(seen.has(fname)) continue;
+        seen.add(fname);
+        params.push({
+          name: fname, type: ftype, required: false,
+          description: `${fname} (inferred)`,
+        });
+      }
+    }
+  }
+
   const id = `custom_${baseUrl.replace(/[^a-z0-9]/gi,'_')}_${path.replace(/[^a-z0-9]/gi,'_')}`.toLowerCase();
   const endpointId = path.split('/').filter(Boolean).pop() || 'call';
   return {id, name, category, baseUrl, priceRange: p.price||'varies', status:'live', isCustom:true,
@@ -452,13 +516,10 @@ $('#addSvc').onclick = () => {
       <h3 style="margin:0">ADD X402 SERVICE</h3>
       <button class="btn ghost" id="close">close</button>
     </div>
-    <p class="hint">Paste a skill definition or drop a .md file. Format:
-    <code>Endpoint: POST https://…/api/call</code>,
-    <code>Price: $0.01</code>, plus a description.</p>
+    <p class="hint">Paste a skill definition or drop a .md file. Must have at least an <code>Endpoint:</code> line. Description is used to infer sensible parameter names for the LLM.</p>
     <textarea id="skillText" placeholder="Endpoint: POST https://example.com/api/call&#10;Price: $0.01&#10;&#10;Description of what this service does…"></textarea>
-    <div class="row" style="margin-top:10px;gap:6px">
-      <button class="btn ghost" id="parseBtn">parse</button>
-      <button class="btn" id="commit" disabled>add &amp; enable</button>
+    <div class="row" style="margin-top:10px;gap:6px;justify-content:flex-end">
+      <button class="btn" id="commit">add &amp; enable</button>
     </div>
     <div id="err"></div>
     <div id="prev"></div>
@@ -467,38 +528,60 @@ $('#addSvc').onclick = () => {
   const close = ()=>mask.remove();
   mask.querySelector('#close').onclick = close;
   mask.addEventListener('click', e=>{if(e.target===mask) close();});
+
   const ta = mask.querySelector('#skillText');
+  const errEl = mask.querySelector('#err');
+  const prevEl = mask.querySelector('#prev');
+  let preview = null;
+
+  const reparse = () => {
+    errEl.innerHTML = '';
+    const text = ta.value.trim();
+    if(!text){ preview = null; prevEl.innerHTML = ''; return; }
+    try{
+      preview = parseSkill(text);
+      prevEl.innerHTML = `<label style="margin-top:12px">SERVICE NAME</label>
+        <input id="nm" value="${preview.name.replace(/"/g,'&quot;')}"/>
+        <div class="preview" style="margin-top:10px">${JSON.stringify(preview,null,2)}</div>`;
+    }catch(ex){
+      preview = null;
+      prevEl.innerHTML = '';
+      errEl.innerHTML = `<div class="error">${ex.message}</div>`;
+    }
+  };
+
+  // Live parse as the user types or pastes; also on drag-drop of an .md file.
+  ta.addEventListener('input', reparse);
   ta.addEventListener('dragover', e=>e.preventDefault());
   ta.addEventListener('drop', async e => {
     e.preventDefault();
     const f = e.dataTransfer.files[0]; if(!f) return;
     ta.value = await f.text();
+    reparse();
   });
-  let preview = null;
-  mask.querySelector('#parseBtn').onclick = () => {
-    mask.querySelector('#err').innerHTML = '';
-    mask.querySelector('#prev').innerHTML = '';
-    try{
-      preview = parseSkill(ta.value);
-      const p = mask.querySelector('#prev');
-      p.innerHTML = `<label>SERVICE NAME</label>
-        <input id="nm" value="${preview.name.replace(/"/g,'&quot;')}"/>
-        <div class="preview" style="margin-top:10px">${JSON.stringify(preview, null, 2)}</div>`;
-      mask.querySelector('#commit').disabled = false;
-    }catch(ex){
-      mask.querySelector('#err').innerHTML = `<div class="error">${ex.message}</div>`;
-    }
-  };
+
   mask.querySelector('#commit').onclick = async () => {
-    if(!preview) return;
-    const nm = mask.querySelector('#nm').value.trim();
-    if(nm) { preview.name = nm; preview.endpoints.forEach(e=>e.name=nm); }
-    cfg.customServices = [...(cfg.customServices||[]).filter(s=>s.id!==preview.id), preview];
-    if(!cfg.servicesEnabled.includes(preview.id)) cfg.servicesEnabled.push(preview.id);
-    await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({customServices:cfg.customServices, servicesEnabled:cfg.servicesEnabled})});
-    close();
-    renderServices();
+    reparse();                                          // make sure preview is fresh
+    if(!preview){
+      errEl.innerHTML = '<div class="error">nothing to save — paste a skill first</div>';
+      return;
+    }
+    try{
+      const nmEl = mask.querySelector('#nm');
+      const nm = (nmEl && nmEl.value ? nmEl.value : preview.name).trim();
+      if(nm){ preview.name = nm; preview.endpoints.forEach(e=>e.name=nm); }
+      cfg.customServices = [...(cfg.customServices||[]).filter(s=>s.id!==preview.id), preview];
+      if(!cfg.servicesEnabled.includes(preview.id)) cfg.servicesEnabled.push(preview.id);
+      const body = JSON.stringify({customServices:cfg.customServices, servicesEnabled:cfg.servicesEnabled});
+      const r = await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'}, body});
+      if(!r.ok) throw new Error('server returned '+r.status);
+      const j = await r.json().catch(()=>({}));
+      if(j.ok === false) throw new Error('server rejected the save');
+      close();
+      renderServices();
+    }catch(ex){
+      errEl.innerHTML = `<div class="error">save failed: ${ex.message||ex}</div>`;
+    }
   };
 };
 
@@ -570,11 +653,25 @@ static void handleConfigGet() {
 }
 
 static void handleConfigPost() {
-  if (!s_http.hasArg("plain")) { s_http.send(400, "text/plain", "no body"); return; }
+  if (!s_http.hasArg("plain")) {
+    s_http.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"no body\"}");
+    return;
+  }
   String body = s_http.arg("plain");
+  Serial.printf("http: /config POST (%u bytes)\n", (unsigned)body.length());
+
+  // Custom services include a bazaar-like schema that can nest a few levels
+  // deeper than the ArduinoJson default; bump the limit so deserialization
+  // doesn't silently fail on reasonable skill files.
   JsonDocument doc;
-  if (deserializeJson(doc, body) != DeserializationError::Ok) {
-    s_http.send(400, "text/plain", "invalid JSON");
+  DeserializationError err = deserializeJson(
+      doc, body, DeserializationOption::NestingLimit(24));
+  if (err) {
+    Serial.printf("http: /config bad json (%s)\n", err.c_str());
+    String msg = String("{\"ok\":false,\"error\":\"invalid JSON: ") +
+                 err.c_str() + "\"}";
+    s_http.send(400, "application/json", msg);
     return;
   }
   if (doc["model"].is<const char*>())       devcfgSetLlmModel(doc["model"].as<String>());
@@ -586,6 +683,7 @@ static void handleConfigPost() {
   if (doc["customServices"].is<JsonArray>()) {
     String ser; serializeJson(doc["customServices"], ser);
     devcfgSetCustomServices(ser);
+    Serial.printf("http: stored customServices (%u bytes)\n", (unsigned)ser.length());
   }
   s_http.send(200, "application/json", "{\"ok\":true}");
 }

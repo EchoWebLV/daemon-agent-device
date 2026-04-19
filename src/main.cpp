@@ -153,7 +153,26 @@ void setup() {
   Serial.begin(115200);
   delay(80);
   Serial.println();
-  Serial.println("== Daemon booting ==");
+
+  // Dump the previous reset reason on every boot so when the board
+  // mystery-restarts we can see why as soon as it comes back up.
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char *rrName = "unknown";
+  switch (rr) {
+    case ESP_RST_POWERON:  rrName = "power-on";            break;
+    case ESP_RST_EXT:      rrName = "external reset";      break;
+    case ESP_RST_SW:       rrName = "software reset";      break;
+    case ESP_RST_PANIC:    rrName = "panic (Guru Meditation / stack / abort)"; break;
+    case ESP_RST_INT_WDT:  rrName = "interrupt watchdog";  break;
+    case ESP_RST_TASK_WDT: rrName = "task watchdog";       break;
+    case ESP_RST_WDT:      rrName = "other watchdog";      break;
+    case ESP_RST_DEEPSLEEP:rrName = "wake from deep sleep";break;
+    case ESP_RST_BROWNOUT: rrName = "brownout (voltage sag)"; break;
+    case ESP_RST_SDIO:     rrName = "sdio";                break;
+    default: break;
+  }
+  Serial.printf("== Daemon booting (prev reset: %s, free heap: %u) ==\n",
+                rrName, (unsigned)ESP.getFreeHeap());
 
   tft.init();
   tft.setRotation(0);

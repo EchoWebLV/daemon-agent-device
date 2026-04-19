@@ -23,9 +23,14 @@ struct X402Result {
 };
 
 // POST `jsonBody` to `url`. If the first response is 402, pay and retry
-// automatically. The response body goes into `out.body`.
+// automatically.
 //
 // `apiKey`, if non-empty, is sent as Authorization: Bearer.
 X402Result x402Post(const String &url,
                     const String &jsonBody,
                     const String &authBearer = String());
+
+// GET variant for services that expose their endpoints as GET with query
+// parameters (most of the built-in x402 services work this way).
+X402Result x402Get(const String &url,
+                   const String &authBearer = String());

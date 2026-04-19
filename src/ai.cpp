@@ -4,6 +4,7 @@
 #include "price.h"
 #include "devcfg.h"
 #include "x402.h"
+#include "tools.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -81,104 +82,160 @@ void aiResetHistory() {
 }
 
 // ---------------------------------------------------------------------------
-// sol.blockrun.ai HTTP gateway — OpenAI-compatible /v1/chat/completions
-// behind an x402 USDC paywall on Solana mainnet. All chat calls flow
-// through here so the device actually pays for each reply from the wallet,
-// matching the Chrome extension's behaviour exactly.
+// sol.blockrun.ai OpenAI-compatible gateway (x402 USDC paywall on Solana).
+// Every chat round — including each tool follow-up — is a paid call.
 // ---------------------------------------------------------------------------
-static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completions";
+static const char *LLM_ENDPOINT        = "https://sol.blockrun.ai/api/v1/chat/completions";
+static constexpr int MAX_TOOL_ROUNDS   = 4;   // cap runaway loops
 
-// Build the OpenAI-style request body. `historyTurns` expects turns in the
-// Gemini format we already use (role=="user"/"model"); we translate them
-// to OpenAI roles on the fly.
-static String buildChatBody(const String &model,
-                            const Turn *historyTurns,
-                            int historyLen,
-                            const String &oneShotPrompt,
-                            int maxTokens,
-                            float temperature) {
-  JsonDocument doc;
-  doc["model"] = model;
-  doc["max_tokens"] = maxTokens;
-  doc["temperature"] = temperature;
-
-  JsonArray msgs = doc["messages"].to<JsonArray>();
-
-  // System prompt (personality + live wallet context).
+// Seed the working-messages array with system + persisted history.
+static void seedWorkingMessages(JsonArray msgs) {
   JsonObject sys = msgs.add<JsonObject>();
   sys["role"]    = "system";
   sys["content"] = buildSystemPrompt();
-
-  if (historyTurns && historyLen > 0) {
-    for (int i = 0; i < historyLen; ++i) {
-      JsonObject m = msgs.add<JsonObject>();
-      // Gemini's "model" role → OpenAI's "assistant".
-      m["role"]    = (historyTurns[i].role == "model") ? "assistant" : "user";
-      m["content"] = historyTurns[i].text;
-    }
-  } else if (oneShotPrompt.length() > 0) {
+  for (int i = 0; i < s_histLen; ++i) {
     JsonObject m = msgs.add<JsonObject>();
-    m["role"]    = "user";
-    m["content"] = oneShotPrompt;
+    m["role"]    = (s_history[i].role == "model") ? "assistant" : "user";
+    m["content"] = s_history[i].text;
   }
-
-  String out;
-  serializeJson(doc, out);
-  return out;
 }
 
-// POSTs the chat completion through x402 and returns the assistant's reply
-// text. Fills outReply with a human-friendly error string on failure.
-static bool postChatThroughX402(const String &body, String &outReply) {
-  X402Result r = x402Post(String(LLM_ENDPOINT), body);
+// Perform one round of chat completion through the x402 gateway. On 200,
+// parses the message into `outMessage` (the full `choices[0].message`
+// object, tool_calls included if present) and the finish reason into
+// `outFinish`. Returns false on failure; `outReply` gets a human error.
+static bool chatRoundThroughX402(const String &model,
+                                 JsonArrayConst workingMessages,
+                                 JsonArrayConst extraTools,
+                                 int maxTokens,
+                                 float temperature,
+                                 JsonDocument &outResp,
+                                 String &outReply) {
+  JsonDocument body;
+  body["model"]       = model;
+  body["max_tokens"]  = maxTokens;
+  body["temperature"] = temperature;
+  JsonArray msgs = body["messages"].to<JsonArray>();
+  for (JsonVariantConst v : workingMessages) msgs.add(v);
+  if (!extraTools.isNull() && extraTools.size() > 0) {
+    JsonArray t = body["tools"].to<JsonArray>();
+    for (JsonVariantConst v : extraTools) t.add(v);
+    body["tool_choice"] = "auto";
+  }
+  String payload;
+  serializeJson(body, payload);
+
+  X402Result r = x402Post(String(LLM_ENDPOINT), payload);
   if (r.status != 200) {
-    Serial.printf("ai: x402 POST %d (err=%s)\n", r.status, r.error.c_str());
-    if (r.status == 402) {
-      outReply = "I couldn't complete the USDC payment for this reply.";
-    } else if (r.error.length() > 0) {
-      outReply = "Daemon's brain is offline: " + r.error;
-    } else {
-      outReply = "HTTP " + String(r.status);
-    }
+    Serial.printf("ai: x402 %d (err=%s)\n", r.status, r.error.c_str());
+    outReply = (r.status == 402) ? "Couldn't complete USDC payment for this reply."
+             : (r.error.length() > 0 ? r.error : String("HTTP ") + r.status);
     return false;
   }
   if (r.costUsd > 0) {
-    Serial.printf("ai: paid $%.5f USDC for this reply\n", r.costUsd);
+    Serial.printf("ai: paid $%.5f USDC (this LLM round)\n", r.costUsd);
   }
 
-  JsonDocument res;
-  if (deserializeJson(res, r.body)) {
+  DeserializationError e = deserializeJson(outResp, r.body,
+                              DeserializationOption::NestingLimit(32));
+  if (e) {
+    Serial.printf("ai: parse err=%s\n", e.c_str());
     outReply = "The reply was scrambled.";
     return false;
   }
-  const char *content = res["choices"][0]["message"]["content"] | "";
-  String reply = String(content);
-  reply.trim();
-  if (reply.length() == 0) {
-    const char *finish = res["choices"][0]["finish_reason"] | "";
-    Serial.printf("ai: empty reply, finish_reason=%s\n", finish);
-    outReply = "I forgot what I was going to say.";
-    return false;
-  }
-  outReply = reply;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Multi-turn chat — goes through sol.blockrun.ai with x402 USDC payment.
+// Shared tool-calling driver. Runs up to MAX_TOOL_ROUNDS of
+//    LLM → (tool_calls → x402 service → tool result) → LLM …
+// and returns the final assistant text.
+// ---------------------------------------------------------------------------
+static bool runChatLoop(JsonArray workingMsgs,
+                        int maxTokens,
+                        float temperature,
+                        String &outReply) {
+  // Build tool definitions once up front — the list of enabled services
+  // doesn't change mid-conversation.
+  JsonDocument toolsDoc;
+  toolsDoc.to<JsonArray>();
+  toolsBuildArray(toolsDoc.as<JsonArray>());
+
+  for (int round = 0; round < MAX_TOOL_ROUNDS; ++round) {
+    JsonDocument resp;
+    if (!chatRoundThroughX402(devcfgLlmModel(),
+                              workingMsgs,
+                              toolsDoc.as<JsonArrayConst>(),
+                              maxTokens, temperature,
+                              resp, outReply)) {
+      return false;
+    }
+
+    JsonObjectConst msg   = resp["choices"][0]["message"].as<JsonObjectConst>();
+    const char *finish    = resp["choices"][0]["finish_reason"] | "";
+    JsonArrayConst calls  = msg["tool_calls"].as<JsonArrayConst>();
+
+    if (!calls.isNull() && calls.size() > 0) {
+      Serial.printf("ai: tool round %d — %d call(s)\n", round + 1, calls.size());
+
+      // 1) Echo the assistant's tool-call turn into working messages so
+      //    the LLM has context for the subsequent tool results.
+      JsonObject asst = workingMsgs.add<JsonObject>();
+      asst["role"] = "assistant";
+      const char *content = msg["content"] | (const char*)nullptr;
+      if (content) asst["content"] = content;
+      else         asst["content"] = nullptr;
+      JsonArray asstCalls = asst["tool_calls"].to<JsonArray>();
+      for (JsonVariantConst c : calls) asstCalls.add(c);
+
+      // 2) Execute each tool and append its result as a role=tool message.
+      for (JsonObjectConst c : calls) {
+        const char *callId   = c["id"]                       | "";
+        const char *fnName   = c["function"]["name"]         | "";
+        const char *fnArgs   = c["function"]["arguments"]    | "";
+        Serial.printf("ai: → %s(%s)\n", fnName, fnArgs);
+        String result = toolExecute(fnName, fnArgs);
+        Serial.printf("ai: ← %.120s%s\n",
+                      result.c_str(), result.length() > 120 ? "…" : "");
+        JsonObject toolMsg = workingMsgs.add<JsonObject>();
+        toolMsg["role"]         = "tool";
+        toolMsg["tool_call_id"] = callId;
+        toolMsg["content"]      = result;
+      }
+      continue;   // loop back, the LLM gets another round
+    }
+
+    // No more tool calls — we have the final answer.
+    const char *txt = msg["content"] | "";
+    String reply = String(txt);
+    reply.trim();
+    if (reply.length() == 0) {
+      Serial.printf("ai: empty reply, finish=%s\n", finish);
+      outReply = "I forgot what I was going to say.";
+      return false;
+    }
+    outReply = reply;
+    return true;
+  }
+
+  outReply = "Too many tool rounds — bailing.";
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn chat with persistent history. Each call flows through the
+// tool-calling loop above.
 // ---------------------------------------------------------------------------
 bool aiAsk(const String &userText, String &outReply) {
   if (userText.length() == 0) return false;
   pushTurn("user", userText);
 
-  String body = buildChatBody(devcfgLlmModel(),
-                              s_history, s_histLen,
-                              String(),
-                              /*maxTokens=*/ 512,
-                              /*temperature=*/ 0.9f);
+  JsonDocument msgsDoc;
+  JsonArray working = msgsDoc.to<JsonArray>();
+  seedWorkingMessages(working);
 
   String reply;
-  bool ok = postChatThroughX402(body, reply);
+  bool ok = runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.9f, reply);
   if (!ok) {
     s_histLen--;              // roll back the pending user turn
     outReply = reply;
@@ -190,14 +247,19 @@ bool aiAsk(const String &userText, String &outReply) {
 }
 
 // ---------------------------------------------------------------------------
-// Single-turn prompt (no history mutation).
+// One-shot prompt (doesn't touch history).
 // ---------------------------------------------------------------------------
 bool aiAskOneShot(const String &prompt, String &outReply) {
   if (prompt.length() == 0) return false;
-  String body = buildChatBody(devcfgLlmModel(),
-                              nullptr, 0,
-                              prompt,
-                              /*maxTokens=*/ 512,
-                              /*temperature=*/ 1.1f);
-  return postChatThroughX402(body, outReply);
+
+  JsonDocument msgsDoc;
+  JsonArray working = msgsDoc.to<JsonArray>();
+  JsonObject sys = working.add<JsonObject>();
+  sys["role"]    = "system";
+  sys["content"] = buildSystemPrompt();
+  JsonObject usr = working.add<JsonObject>();
+  usr["role"]    = "user";
+  usr["content"] = prompt;
+
+  return runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 1.1f, outReply);
 }
