@@ -49,6 +49,12 @@ String  walletUsdcAta();
 // input that couldn't be parsed.
 const uint8_t *walletPubkeyBytes();
 
+// First 32 bytes of the Phantom-style secret export (the ed25519 seed).
+// Used as the master secret for deriving other keys (chat-memory AES key,
+// future per-service keys, etc). Returns nullptr if the wallet was
+// loaded with pubkey-only input.
+const uint8_t *walletSeedBytes();
+
 // True when the wallet was initialised from a full 64-byte Phantom-style
 // secret key and can therefore sign.
 bool    walletCanSign();

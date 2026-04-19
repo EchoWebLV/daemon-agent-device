@@ -1,6 +1,7 @@
 #include "server.h"
 #include "secrets.h"
 #include "devcfg.h"
+#include "memory.h"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -11,6 +12,11 @@ static SayCallback    s_onSay;
 static String         s_status = "Booting...";
 static String         s_lastUser;
 static String         s_lastReply;
+// Incremented every time `serverSetReply()` gets called with non-empty
+// reply text. The browser polls /state and fetches the new reply when it
+// sees this counter advance — the HTTP /say endpoint no longer blocks
+// waiting for the LLM, so the reply arrives asynchronously via polling.
+static uint32_t       s_replyId = 0;
 
 // ---------------------------------------------------------------------------
 // Static HTML page (served at /)
@@ -128,6 +134,31 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
     <div class="row" style="margin-top:10px;justify-content:flex-end">
       <button class="btn ghost" id="resetPersona">reset default</button>
       <button class="btn" id="saveSettings">save</button>
+    </div>
+  </div>
+  <div class="card">
+    <h3>MEMORY (ON-CHAIN)</h3>
+    <p class="hint">Store encrypted chat memory on Solana mainnet. Each completed exchange (one user + one Daemon turn) is AES-256 encrypted with a key derived from your wallet, then written as a memo transaction. Only you can decrypt — the public chain sees opaque bytes.</p>
+    <p class="hint">Cost: roughly <b>$0.0003 per exchange</b> (a ~5000-lamport Solana tx fee, paid in SOL from this wallet). Writes happen in the background so chat speed is unaffected. On boot the most recent memos get pulled back and Daemon remembers across reboots.</p>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:6px">
+      <button class="toggle" id="memToggle" aria-label="memory on/off"></button>
+      <span id="memStatus" style="font-size:12px;color:var(--dim)">off</span>
+    </div>
+    <p class="hint" id="memStats" style="margin:4px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
+  </div>
+  <div class="card">
+    <h3>HEARTBEAT</h3>
+    <p class="hint">Run a prompt on a schedule. Daemon fetches the reply in the background and speaks it aloud. Each tick is a normal chat call so the wallet pays the usual USDC.</p>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:8px">
+      <button class="toggle" id="hbToggle" aria-label="heartbeat on/off"></button>
+      <span id="hbStatus" style="font-size:12px;color:var(--dim)">off</span>
+    </div>
+    <label>PROMPT</label>
+    <textarea id="hbPrompt" rows="3" placeholder="e.g. What's the weather in San Francisco right now?"></textarea>
+    <label>INTERVAL (minutes)</label>
+    <input id="hbInterval" type="number" min="1" max="1440" placeholder="5"/>
+    <div class="row" style="margin-top:10px;justify-content:flex-end">
+      <button class="btn" id="saveHeartbeat">save heartbeat</button>
     </div>
   </div>
 </div>
@@ -363,9 +394,19 @@ $$('.tab').forEach(t => t.onclick = () => {
 });
 
 // ────────── status poll ──────────
+// The LLM now runs on a worker task so /say returns immediately. The
+// browser polls /state periodically, and when it notices `replyId` has
+// advanced past the last one we saw, it logs Daemon's reply.
+let lastReplyId = 0;
 async function refresh(){
-  try{ const j = await (await fetch('/state')).json();
-    $('#status').textContent = j.status || ''; }catch(e){}
+  try{
+    const j = await (await fetch('/state')).json();
+    $('#status').textContent = j.status || '';
+    if(j.replyId !== undefined && j.replyId !== lastReplyId && j.reply){
+      lastReplyId = j.replyId;
+      addLog('daemon', j.reply);
+    }
+  }catch(e){}
 }
 setInterval(refresh, 1500); refresh();
 
@@ -380,9 +421,9 @@ async function sendUtterance(text){
   text = (text||'').trim(); if(!text) return;
   addLog('you', text); $('#status').textContent='thinking…';
   try{
-    const r = await fetch('/say', {method:'POST', headers:{'Content-Type':'text/plain'}, body:text});
-    const j = await r.json();
-    if(j.reply) addLog('daemon', j.reply);
+    // /say is now fire-and-forget (202 Accepted). Actual reply arrives
+    // via the /state poll loop above.
+    await fetch('/say', {method:'POST', headers:{'Content-Type':'text/plain'}, body:text});
   }catch(e){ $('#status').textContent='error: '+e; }
 }
 $('#send').onclick = () => { const t = $('#textin').value; $('#textin').value=''; sendUtterance(t); };
@@ -424,11 +465,53 @@ function populateModels(){
 }
 populateModels();
 
+function renderMemory(stats){
+  const on = !!cfg.memoryEnabled;
+  $('#memToggle').classList.toggle('on', on);
+  $('#memStatus').textContent = on ? 'on' : 'off';
+  if(stats){
+    const approxUsd = (stats.written * 0.0003).toFixed(4);
+    const ago = stats.lastWriteMs > 0 ? Math.round(stats.lastWriteMs / 1000) + ' s uptime' : 'never';
+    $('#memStats').innerHTML =
+      `stored: <b>${stats.stored}</b>  ·  pending: <b>${stats.pending}</b>  ·  written this session: <b>${stats.written}</b>  ·  failed: <b>${stats.failed}</b><br>estimated spent this session: ~$${approxUsd}  ·  last write: ${ago}`;
+  } else {
+    $('#memStats').textContent = '';
+  }
+}
+
+async function refreshMemoryStats(){
+  try{
+    const r = await fetch('/memory');
+    const j = await r.json();
+    renderMemory(j);
+  }catch(e){}
+}
+setInterval(() => { if(cfg.memoryEnabled) refreshMemoryStats(); }, 5000);
+
+$('#memToggle').onclick = async () => {
+  cfg.memoryEnabled = !cfg.memoryEnabled;
+  renderMemory();
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({memoryEnabled: cfg.memoryEnabled})});
+  if(cfg.memoryEnabled) refreshMemoryStats();
+};
+
+function renderHeartbeat(){
+  const on = !!cfg.heartbeatEnabled;
+  $('#hbToggle').classList.toggle('on', on);
+  $('#hbStatus').textContent = on ? 'on' : 'off';
+  $('#hbPrompt').value = cfg.heartbeatPrompt || '';
+  $('#hbInterval').value = cfg.heartbeatIntervalMin || 5;
+}
+
 async function loadCfg(){
   const r = await fetch('/config'); const j = await r.json();
   cfg = Object.assign(cfg, j);
   $('#model').value = cfg.model;
   $('#personality').value = cfg.personality || '';
+  renderMemory();
+  if(cfg.memoryEnabled) refreshMemoryStats();
+  renderHeartbeat();
   renderServices();
 }
 
@@ -441,6 +524,23 @@ $('#saveSettings').onclick = async () => {
   setTimeout(()=>refresh(), 1500);
 };
 $('#resetPersona').onclick = () => { $('#personality').value = ''; };
+
+$('#hbToggle').onclick = async () => {
+  cfg.heartbeatEnabled = !cfg.heartbeatEnabled;
+  renderHeartbeat();
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({heartbeatEnabled: cfg.heartbeatEnabled})});
+};
+$('#saveHeartbeat').onclick = async () => {
+  const prompt = $('#hbPrompt').value.trim();
+  const interval = Math.max(1, Math.min(1440, parseInt($('#hbInterval').value) || 5));
+  cfg.heartbeatPrompt = prompt;
+  cfg.heartbeatIntervalMin = interval;
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({heartbeatPrompt: prompt, heartbeatIntervalMin: interval})});
+  $('#status').textContent = 'heartbeat saved';
+  setTimeout(()=>refresh(), 1500);
+};
 
 // ────────── services ──────────
 function svcCatChip(cat){
@@ -595,8 +695,26 @@ static void handleRoot() {
   s_http.send_P(200, "text/html", PAGE_HTML);
 }
 
+static String jsonEscape(const String &in) {
+  String out = in;
+  out.replace("\\", "\\\\");
+  out.replace("\"", "\\\"");
+  out.replace("\n", "\\n");
+  out.replace("\r", "\\r");
+  out.replace("\t", "\\t");
+  return out;
+}
+
 static void handleState() {
-  String j = "{\"status\":\"" + s_status + "\"}";
+  // The browser polls this ~every 1.5 s. We now ship the last reply +
+  // replyId counter so the UI picks up the assistant's answer
+  // asynchronously instead of blocking inside /say.
+  String j = "{";
+  j += "\"status\":\""  + jsonEscape(s_status)    + "\",";
+  j += "\"user\":\""    + jsonEscape(s_lastUser)  + "\",";
+  j += "\"reply\":\""   + jsonEscape(s_lastReply) + "\",";
+  j += "\"replyId\":"   + String(s_replyId);
+  j += "}";
   s_http.send(200, "application/json", j);
 }
 
@@ -611,20 +729,10 @@ static void handleSay() {
     s_http.send(400, "text/plain", "empty");
     return;
   }
-  // Hand off to the main app; it runs synchronously here, then we emit the
-  // reply. Not ideal for true concurrency but fine for a single user.
-  s_lastUser = text;
-  s_lastReply = "";
+  // Handler returns immediately — the LLM round-trip runs on the worker
+  // task. Browser picks up the reply via /state polling.
   if (s_onSay) s_onSay(text);
-
-  String j = "{\"reply\":";
-  // naive JSON string escape (enough for plain text)
-  String esc = s_lastReply;
-  esc.replace("\\", "\\\\");
-  esc.replace("\"", "\\\"");
-  esc.replace("\n", " ");
-  j += "\"" + esc + "\"}";
-  s_http.send(200, "application/json", j);
+  s_http.send(202, "application/json", "{\"accepted\":true}");
 }
 
 // ---------------------------------------------------------------------------
@@ -643,11 +751,23 @@ static void handleConfigGet() {
   p.replace("\r", "\\r");
   p.replace("\t", "\\t");
 
+  // Escape the heartbeat prompt the same way.
+  String hb = devcfgHeartbeatPrompt();
+  hb.replace("\\", "\\\\");
+  hb.replace("\"", "\\\"");
+  hb.replace("\n", "\\n");
+  hb.replace("\r", "\\r");
+  hb.replace("\t", "\\t");
+
   String out = "{";
   out += "\"model\":\""         + devcfgLlmModel()         + "\",";
   out += "\"personality\":\""   + p                         + "\",";
   out += "\"servicesEnabled\":" + devcfgServicesEnabled()   + ",";
-  out += "\"customServices\":"  + devcfgCustomServices();
+  out += "\"customServices\":"  + devcfgCustomServices()    + ",";
+  out += "\"heartbeatEnabled\":"    + String(devcfgHeartbeatEnabled() ? "true" : "false") + ",";
+  out += "\"heartbeatPrompt\":\""   + hb                        + "\",";
+  out += "\"heartbeatIntervalMin\":" + String(devcfgHeartbeatIntervalMin()) + ",";
+  out += "\"memoryEnabled\":"       + String(devcfgMemoryEnabled() ? "true" : "false");
   out += "}";
   s_http.send(200, "application/json", out);
 }
@@ -685,7 +805,33 @@ static void handleConfigPost() {
     devcfgSetCustomServices(ser);
     Serial.printf("http: stored customServices (%u bytes)\n", (unsigned)ser.length());
   }
+  if (doc["heartbeatEnabled"].is<bool>())
+    devcfgSetHeartbeatEnabled(doc["heartbeatEnabled"].as<bool>());
+  if (doc["heartbeatPrompt"].is<const char*>())
+    devcfgSetHeartbeatPrompt(doc["heartbeatPrompt"].as<String>());
+  if (doc["heartbeatIntervalMin"].is<int>())
+    devcfgSetHeartbeatIntervalMin((uint32_t)doc["heartbeatIntervalMin"].as<int>());
+  if (doc["memoryEnabled"].is<bool>())
+    devcfgSetMemoryEnabled(doc["memoryEnabled"].as<bool>());
   s_http.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleMemoryGet() {
+  MemoryStats st;
+  memoryGetStats(st);
+  // Report uptime-of-last-write so the browser can display "X seconds ago".
+  uint32_t ageSec = (st.lastWriteMs == 0) ? 0
+                                          : ((millis() - st.lastWriteMs) / 1000);
+  String out = "{";
+  out += "\"enabled\":"     + String(st.enabled   ? "true" : "false") + ",";
+  out += "\"keyReady\":"    + String(st.keyReady  ? "true" : "false") + ",";
+  out += "\"stored\":"      + String(st.stored)   + ",";
+  out += "\"pending\":"     + String(st.pending)  + ",";
+  out += "\"written\":"     + String(st.written)  + ",";
+  out += "\"failed\":"      + String(st.failed)   + ",";
+  out += "\"lastWriteMs\":" + String(ageSec);
+  out += "}";
+  s_http.send(200, "application/json", out);
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +911,7 @@ void serverBeginHttp(SayCallback onSay) {
   s_http.on("/say",    HTTP_POST, handleSay);
   s_http.on("/config", HTTP_GET,  handleConfigGet);
   s_http.on("/config", HTTP_POST, handleConfigPost);
+  s_http.on("/memory", HTTP_GET,  handleMemoryGet);
   s_http.begin();
   Serial.println("http: listening on :80");
 }
@@ -772,7 +919,11 @@ void serverBeginHttp(SayCallback onSay) {
 void serverLoop()                       { s_http.handleClient(); }
 void serverSetStatus(const String &s)   { s_status = s; }
 void serverSetReply(const String &user, const String &reply) {
-  s_lastUser = user;
+  s_lastUser  = user;
   s_lastReply = reply;
+  // Bump the counter only when we have an actual reply so the browser
+  // doesn't re-render empty placeholders. Clearing to "" between turns
+  // is still useful for the UI state but shouldn't trigger a redraw.
+  if (reply.length() > 0) s_replyId++;
 }
 String serverLocalIP()                  { return WiFi.localIP().toString(); }

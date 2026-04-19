@@ -5,6 +5,7 @@
 #include "devcfg.h"
 #include "x402.h"
 #include "tools.h"
+#include "memory.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -242,8 +243,23 @@ bool aiAsk(const String &userText, String &outReply) {
     return false;
   }
   pushTurn("model", reply);
+
+  // Persist this exchange to on-chain memory (fire-and-forget; runs on a
+  // background task so chat latency stays the same).
+  memoryRecordExchange(userText, reply);
+
   outReply = reply;
   return true;
+}
+
+void aiLoadHistory(const MemoryTurn *turns, int count) {
+  if (!turns || count <= 0) return;
+  aiResetHistory();
+  // Push in order; `pushTurn` handles the FIFO trimming if we overflow.
+  for (int i = 0; i < count; ++i) {
+    pushTurn(turns[i].role, turns[i].text);
+  }
+  Serial.printf("ai: loaded %d turn(s) into history from memory\n", s_histLen);
 }
 
 // ---------------------------------------------------------------------------

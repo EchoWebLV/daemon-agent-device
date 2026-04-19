@@ -133,7 +133,78 @@ static std::vector<uint8_t> buildMessage(const SolanaTxInput &in,
 }
 
 // ---------------------------------------------------------------------------
-// Public entry
+// Base64-encode a byte blob via mbedTLS (shared helper).
+// ---------------------------------------------------------------------------
+static String base64EncodeBlob(const uint8_t *data, size_t len) {
+  size_t olen = 0;
+  mbedtls_base64_encode(nullptr, 0, &olen, data, len);
+  std::vector<uint8_t> out(olen + 1, 0);
+  size_t written = 0;
+  if (mbedtls_base64_encode(out.data(), out.size(), &written, data, len) != 0) {
+    return String();
+  }
+  return String((const char *)out.data());
+}
+
+// ---------------------------------------------------------------------------
+// Memo transaction — legacy (no version byte), single signer + fee payer.
+// Account layout:
+//   [0] wallet         writable signer (us; fee payer)
+//   [1] memo_program   readonly, not signer, not writable
+// One instruction: program=memo, accounts=[], data=<memoBytes>.
+// ---------------------------------------------------------------------------
+String solanaBuildMemoTxBase64(
+    const uint8_t walletPub[32],
+    const uint8_t blockhash[32],
+    const uint8_t *memoBytes, size_t memoLen) {
+  if (!walletCanSign())                return String();
+  if (!walletPub || !blockhash)        return String();
+  if (!memoBytes || memoLen == 0)      return String();
+  if (memoLen > 800)                   return String();  // tx-size guard
+
+  const char *MEMO_PROGRAM_B58 = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+  uint8_t memoProgram[32];
+  if (!decodeB58Pubkey(MEMO_PROGRAM_B58, memoProgram)) return String();
+
+  std::vector<uint8_t> m;
+  m.reserve(160 + memoLen);
+
+  // Header: 1 required sig, 0 readonly signed, 1 readonly unsigned
+  appendU8(m, 1);
+  appendU8(m, 0);
+  appendU8(m, 1);
+
+  // Account keys: wallet, memo_program
+  appendShortVec(m, 2);
+  appendBytes(m, walletPub, 32);
+  appendBytes(m, memoProgram, 32);
+
+  // Recent blockhash
+  appendBytes(m, blockhash, 32);
+
+  // Instructions: one, referencing the memo program
+  appendShortVec(m, 1);
+  appendU8(m, 1);                     // program id index = memo_program
+  appendShortVec(m, 0);               // no accounts
+  appendShortVec(m, (uint16_t)memoLen);
+  appendBytes(m, memoBytes, memoLen);
+
+  // Sign the whole message with the wallet's ed25519 key.
+  uint8_t sig[64];
+  if (!walletSign(m.data(), m.size(), sig)) return String();
+
+  // Assemble tx: [sig_count=1][sig][message]
+  std::vector<uint8_t> tx;
+  tx.reserve(m.size() + 70);
+  appendShortVec(tx, 1);
+  appendBytes(tx, sig, 64);
+  appendBytes(tx, m.data(), m.size());
+
+  return base64EncodeBlob(tx.data(), tx.size());
+}
+
+// ---------------------------------------------------------------------------
+// Public entry (x402 path)
 // ---------------------------------------------------------------------------
 String solanaBuildSignedTxBase64(const SolanaTxInput &in) {
   if (!walletCanSign()) {

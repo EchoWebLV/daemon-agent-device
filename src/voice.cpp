@@ -6,6 +6,9 @@
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <driver/i2s.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 // ---------------------------------------------------------------------------
 // I2S pins (PCM5101 on the Waveshare 2.8")
@@ -22,8 +25,17 @@ static constexpr const char *TTS_FS_PATH = "/tts.mp3";
 
 static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
+static TaskHandle_t s_fetchTask  = nullptr;
+static QueueHandle_t s_speakQueue = nullptr;
 static volatile bool s_ready     = false;
 static volatile bool s_playing   = false;
+
+// Queue job — carries the full utterance text so the fetch runs off the
+// main loop. We allocate the text inline (C string) so the FreeRTOS queue
+// can memcpy it without chasing heap pointers.
+struct SpeakJob {
+  char text[1400];        // ElevenLabs text cap; longer is truncated
+};
 
 // ---------------------------------------------------------------------------
 // Boot-time direct-I2S beep (hardware probe)
@@ -91,6 +103,33 @@ static void audioTaskEntry(void *) {
     if (s_audio) s_audio->loop();
     if (s_playing && s_audio && !s_audio->isRunning()) s_playing = false;
     vTaskDelay(1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch task — runs the blocking ElevenLabs HTTPS POST + LittleFS write
+// off the main Arduino loop so the UI keeps ticking while Daemon fetches
+// his reply audio. When the MP3 lands in /tts.mp3 we kick off playback.
+// ---------------------------------------------------------------------------
+static bool fetchMp3ToFs(const String &text);   // defined further down
+
+static void fetchTaskEntry(void *) {
+  for (;;) {
+    SpeakJob job;
+    if (xQueueReceive(s_speakQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+    if (!s_ready || !s_audio) continue;
+
+    String text = String(job.text);
+    if (text.length() == 0) continue;
+
+    // Stop any currently playing utterance so this one takes over.
+    if (s_audio->isRunning()) s_audio->stopSong();
+
+    if (!fetchMp3ToFs(text)) continue;
+
+    bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
+    s_playing = ok;
+    if (!ok) Serial.println("voice: connecttoFS failed");
   }
 }
 
@@ -210,8 +249,23 @@ bool voiceBegin() {
     Serial.println("voice: audio task create FAILED");
     return false;
   }
+
+  // A small queue + dedicated task so voiceSpeak() can be non-blocking.
+  // Keeping the main loop responsive during the ~2-4 s HTTPS fetch is
+  // the single biggest UX improvement for long replies.
+  s_speakQueue = xQueueCreate(2, sizeof(SpeakJob));
+  if (!s_speakQueue) {
+    Serial.println("voice: speak queue alloc FAILED");
+    return false;
+  }
+  if (xTaskCreatePinnedToCore(fetchTaskEntry, "voice-fetch", 10240,
+                              nullptr, 3, &s_fetchTask, 1) != pdPASS) {
+    Serial.println("voice: fetch task create FAILED");
+    return false;
+  }
+
   s_ready = true;
-  Serial.println("voice: LittleFS+MP3 path ready");
+  Serial.println("voice: LittleFS+MP3 path ready (async fetch on)");
   return true;
 }
 
@@ -220,17 +274,24 @@ void voiceLoop() {
 }
 
 bool voiceSpeak(const String &text) {
-  if (!s_ready || !s_audio) return false;
+  if (!s_ready || !s_audio || !s_speakQueue) return false;
   if (text.length() == 0) return false;
 
-  if (s_audio->isRunning()) s_audio->stopSong();
+  SpeakJob job;
+  memset(&job, 0, sizeof(job));
+  size_t n = text.length();
+  if (n >= sizeof(job.text)) n = sizeof(job.text) - 1;
+  memcpy(job.text, text.c_str(), n);
+  job.text[n] = '\0';
 
-  if (!fetchMp3ToFs(text)) return false;
-
-  bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
-  s_playing = ok;
-  if (!ok) Serial.println("voice: connecttoFS failed");
-  return ok;
+  // If the fetch queue already has a job in flight (or queued), drop the
+  // oldest so the newest utterance wins — matches the old "stopSong +
+  // start new" behaviour without blocking the caller.
+  if (uxQueueSpacesAvailable(s_speakQueue) == 0) {
+    SpeakJob drop;
+    xQueueReceive(s_speakQueue, &drop, 0);
+  }
+  return xQueueSend(s_speakQueue, &job, 0) == pdTRUE;
 }
 
 bool voiceIsSpeaking() { return s_playing; }

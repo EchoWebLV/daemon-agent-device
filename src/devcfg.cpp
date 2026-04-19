@@ -148,3 +148,57 @@ void devcfgSetCustomServices(const String &jsonArray) {
   s_nvs.putString("svc_cu", jsonArray);
   s_nvs.end();
 }
+
+// ---- On-chain memory -----------------------------------------------------
+bool devcfgMemoryEnabled() {
+  s_nvs.begin("daemon", true);
+  bool v = s_nvs.getBool("mem_on", false);
+  s_nvs.end();
+  return v;
+}
+void devcfgSetMemoryEnabled(bool on) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putBool("mem_on", on);
+  s_nvs.end();
+}
+
+// ---- Heartbeat ------------------------------------------------------------
+bool devcfgHeartbeatEnabled() {
+  s_nvs.begin("daemon", true);
+  bool v = s_nvs.getBool("hb_on", false);
+  s_nvs.end();
+  return v;
+}
+void devcfgSetHeartbeatEnabled(bool on) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putBool("hb_on", on);
+  s_nvs.end();
+}
+String devcfgHeartbeatPrompt() {
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("hb_prompt", "");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetHeartbeatPrompt(const String &p) {
+  String clamped = p;
+  if (clamped.length() > 1200) clamped.remove(1200);
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("hb_prompt", clamped);
+  s_nvs.end();
+}
+uint32_t devcfgHeartbeatIntervalMin() {
+  s_nvs.begin("daemon", true);
+  uint32_t v = s_nvs.getUInt("hb_min", 5);   // default 5 min
+  s_nvs.end();
+  if (v < 1)    v = 1;
+  if (v > 1440) v = 1440;                    // cap at 24h
+  return v;
+}
+void devcfgSetHeartbeatIntervalMin(uint32_t minutes) {
+  if (minutes < 1)    minutes = 1;
+  if (minutes > 1440) minutes = 1440;
+  s_nvs.begin("daemon", false);
+  s_nvs.putUInt("hb_min", minutes);
+  s_nvs.end();
+}

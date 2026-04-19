@@ -86,6 +86,10 @@ const uint8_t *walletPubkeyBytes() {
   return s_ok ? s_pubkeyBytes : nullptr;
 }
 
+const uint8_t *walletSeedBytes() {
+  return (s_ok && s_secretBytes.size() == 64) ? s_secretBytes.data() : nullptr;
+}
+
 // Ed25519 signing — rweather's library takes the 32-byte seed separately
 // from the 32-byte public key. Phantom/Solana secret keys pack them as
 // seed || pubkey in the 64-byte blob.

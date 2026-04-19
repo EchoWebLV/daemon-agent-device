@@ -30,6 +30,7 @@
 #include "server.h"
 #include "wallet.h"
 #include "price.h"
+#include "memory.h"
 #include "touch.h"
 #include "walletscreen.h"
 #include "settingsscreen.h"
@@ -46,6 +47,72 @@ static constexpr uint32_t PRICE_INTERVAL_MS  = 30000;   // 30 s
 static constexpr uint32_t WALLET_INTERVAL_MS = 60000;   // 60 s
 static uint32_t s_nextPriceMs  = 0;
 static uint32_t s_nextWalletMs = 0;
+
+// Heartbeat state. Tracks when the last scheduled prompt fired so we can
+// space repeat runs by `devcfgHeartbeatIntervalMin()` regardless of what
+// the user reconfigures in the middle of a cycle.
+static uint32_t s_lastHeartbeatMs = 0;
+static bool     s_heartbeatWasOn  = false;
+
+// ---------------------------------------------------------------------------
+// LLM worker task. Processes chat requests off the Arduino loop so the
+// creature animation, touch, and HTTP polling stay live during the 10-30 s
+// round-trip (LLM + tool x402 payments + follow-up LLM rounds).
+// ---------------------------------------------------------------------------
+struct LlmReq { char text[1024]; };
+struct LlmReply {
+  char user[1024];
+  char reply[1600];
+  bool ok;
+};
+static QueueHandle_t s_llmIn  = nullptr;
+static QueueHandle_t s_llmOut = nullptr;
+static volatile bool s_llmBusy = false;
+
+static void llmWorkerTask(void *) {
+  for (;;) {
+    LlmReq req;
+    if (xQueueReceive(s_llmIn, &req, portMAX_DELAY) != pdTRUE) continue;
+    s_llmBusy = true;
+
+    String user = String(req.text);
+    String reply;
+    bool ok = aiAsk(user, reply);
+
+    LlmReply out;
+    memset(&out, 0, sizeof(out));
+    size_t un = user.length();
+    if (un >= sizeof(out.user)) un = sizeof(out.user) - 1;
+    memcpy(out.user, user.c_str(), un);
+    size_t rn = reply.length();
+    if (rn >= sizeof(out.reply)) rn = sizeof(out.reply) - 1;
+    memcpy(out.reply, reply.c_str(), rn);
+    out.ok = ok;
+
+    xQueueSend(s_llmOut, &out, portMAX_DELAY);
+    s_llmBusy = false;
+  }
+}
+
+static void drainLlmReplies() {
+  LlmReply out;
+  while (s_llmOut && xQueueReceive(s_llmOut, &out, 0) == pdTRUE) {
+    String user  = String(out.user);
+    String reply = out.ok ? String(out.reply) : String("I got nothing. Ask me again?");
+    Serial.printf("<< daemon: %s\n", reply.c_str());
+    serverSetReply(user, reply);
+    creatureSetSubtitle(reply);
+    if (s_voiceOk) {
+      creatureSetMood(MOOD_TALK);
+      creatureSetTalking(true);
+      serverSetStatus("speaking…");
+      voiceSpeak(reply);     // async itself — returns immediately
+    } else {
+      creatureSetMood(MOOD_IDLE);
+      serverSetStatus("idle");
+    }
+  }
+}
 
 // Screens: creature (home), wallet (swipe-left), settings (pull-down).
 enum Screen : uint8_t {
@@ -76,35 +143,31 @@ static void switchScreen(Screen target) {
 static void handleUtterance(const String &user) {
   Serial.print(">> you:    "); Serial.println(user);
 
+  // All the heavy work (LLM round-trip, tool calls, TTS fetch) now runs
+  // on dedicated worker tasks, so this function just updates UI state
+  // and enqueues the request. Returns in microseconds — the main loop
+  // keeps animating / servicing touch / polling the web UI during the
+  // 10-30 s background processing.
   creatureSetMood(MOOD_THINK);
-  // Flip the subtitle to "thinking…" immediately so the user sees activity
-  // while Gemini grinds away; it gets overwritten with the reply text as
-  // soon as the HTTPS round-trip finishes.
   creatureSetSubtitle("thinking…");
   serverSetStatus("thinking…");
+  serverSetReply(user, "");     // record user turn, clear any stale reply
 
-  uint32_t t0 = millis();
-  String reply;
-  bool ok = aiAsk(user, reply);
-  Serial.printf("ai: aiAsk took %lu ms (ok=%d)\n",
-                (unsigned long)(millis() - t0), ok ? 1 : 0);
-  if (!ok || reply.length() == 0) {
-    reply = "I got nothing. Ask me again?";
+  if (!s_llmIn) return;
+
+  LlmReq req;
+  memset(&req, 0, sizeof(req));
+  size_t n = user.length();
+  if (n >= sizeof(req.text)) n = sizeof(req.text) - 1;
+  memcpy(req.text, user.c_str(), n);
+
+  // Last-wins: if a previous request is still queued, drop it so the
+  // newest utterance takes priority.
+  if (uxQueueSpacesAvailable(s_llmIn) == 0) {
+    LlmReq drop;
+    xQueueReceive(s_llmIn, &drop, 0);
   }
-  Serial.print("<< daemon: "); Serial.println(reply);
-  serverSetReply(user, reply);
-  creatureSetSubtitle(reply);
-
-  if (s_voiceOk) {
-    creatureSetMood(MOOD_TALK);
-    creatureSetTalking(true);
-    serverSetStatus("speaking…");
-    voiceSpeak(reply);
-  } else {
-    creatureSetMood(MOOD_IDLE);
-    serverSetStatus("idle");
-  }
-
+  xQueueSend(s_llmIn, &req, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +186,40 @@ static void maybeRefreshWallet() {
   if (millis() < s_nextWalletMs) return;
   s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
   walletRequestRefresh();                         // runs on background task
+}
+
+// Scheduled prompt. When heartbeat is toggled on we fire the first run
+// immediately (so the user gets instant feedback); subsequent runs are
+// spaced by the configured interval. Each tick flows through the normal
+// x402 pipeline so the wallet pays for it like any other chat turn.
+static void maybeFireHeartbeat() {
+  if (!s_wifiOk || !s_voiceOk) return;
+  if (voiceIsSpeaking())       return;   // don't stomp on current reply
+
+  bool on = devcfgHeartbeatEnabled();
+  if (on && !s_heartbeatWasOn) {
+    // Just flipped on — fire immediately by pretending the last run was
+    // far enough in the past.
+    s_lastHeartbeatMs = 0;
+  }
+  s_heartbeatWasOn = on;
+  if (!on) return;
+
+  uint32_t intervalMs = devcfgHeartbeatIntervalMin() * 60000UL;
+  if (intervalMs < 60000UL) intervalMs = 60000UL;   // lower bound: 1 min
+  if (s_lastHeartbeatMs != 0 &&
+      (millis() - s_lastHeartbeatMs) < intervalMs) return;
+
+  String prompt = devcfgHeartbeatPrompt();
+  prompt.trim();
+  if (prompt.length() == 0) return;
+
+  Serial.printf(">> heartbeat: %s\n", prompt.c_str());
+  s_lastHeartbeatMs = millis();
+
+  // Hand the heartbeat prompt to the LLM worker just like a normal chat
+  // so the main loop keeps animating while Gemini thinks.
+  handleUtterance(prompt);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +294,13 @@ void setup() {
   s_voiceOk = voiceBegin();
   Serial.printf("voice: %s\n", s_voiceOk ? "OK" : "failed");
 
+  // LLM worker task — heavy x402 round-trips run here so the main loop
+  // stays free to animate + service HTTP + touch during processing.
+  s_llmIn  = xQueueCreate(2, sizeof(LlmReq));
+  s_llmOut = xQueueCreate(4, sizeof(LlmReply));
+  xTaskCreatePinnedToCore(llmWorkerTask, "llm", 16384, nullptr,
+                          1, nullptr, 1);
+
   // Device-level settings (volume, brightness, BT). Applies brightness
   // PWM and restores last-known volume from NVS.
   devcfgBegin();
@@ -234,6 +338,17 @@ void setup() {
   }
   s_nextPriceMs  = millis() + PRICE_INTERVAL_MS;
   s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
+
+  // On-chain memory: derive the AES key from the wallet seed, start the
+  // background write task, and — if enabled — restore recent chat history
+  // from Solana memos so Daemon remembers across reboots.
+  memoryBegin();
+  if (s_wifiOk && devcfgMemoryEnabled() && memoryKeyReady()) {
+    creatureSetSubtitle("restoring memory…");
+    MemoryTurn loaded[10];
+    int n = memoryRecallTurns(loaded, 10);
+    if (n > 0) aiLoadHistory(loaded, n);
+  }
 
   // One-shot TTS diagnostic so we can see via serial what ElevenLabs
   // actually returns when POSTed through HTTPClient, and compare against
@@ -305,12 +420,18 @@ void loop() {
   voiceLoop();
   pumpSerialInput();
 
+  // Drain any LLM replies the worker has finished while we were ticking.
+  drainLlmReplies();
+
   // Background tickers — only run when audio is quiet so we don't stutter
   // mid-playback. Wallet/price fetches themselves now live on background
   // tasks (see wallet.cpp / price.cpp) so these are just cheap triggers.
-  if (!voiceIsSpeaking()) {
+  // Heartbeat runs the full chat pipeline (blocks for seconds) so we also
+  // gate it on not-currently-speaking.
+  if (!voiceIsSpeaking() && !s_llmBusy) {
     maybeRefreshPrice();
     maybeRefreshWallet();
+    maybeFireHeartbeat();
   }
 
   // Keep the top-left status showing the wallet's current USDC balance.

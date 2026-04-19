@@ -16,3 +16,9 @@ bool  aiAsk(const String &userText, String &outReply);   // blocking HTTPS call
 // Fire-and-forget prompt: does NOT touch the chat history. Handy for ambient
 // "say something random" chatter like the Solana ticker.
 bool  aiAskOneShot(const String &prompt, String &outReply);
+
+// Seed the in-memory chat history directly (e.g. from the on-chain
+// memory module at boot). Each turn is a {role, text} pair where role is
+// "user" or "model". Replaces whatever was in history before.
+struct MemoryTurn;   // defined in memory.h
+void  aiLoadHistory(const MemoryTurn *turns, int count);

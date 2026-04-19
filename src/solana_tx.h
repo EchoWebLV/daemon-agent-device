@@ -30,3 +30,12 @@ struct SolanaTxInput {
 // Build and sign the transaction; returns a base64 string ready to wrap
 // in the x402 PAYMENT-SIGNATURE payload. Empty string on failure.
 String solanaBuildSignedTxBase64(const SolanaTxInput &in);
+
+// Build a single-signer legacy transaction containing ONE Memo program
+// instruction carrying `memoBytes`. We're the fee payer + only signer, so
+// the returned base64 tx is ready to submit via sendTransaction RPC.
+// Used by the on-chain memory module for encrypted chat log writes.
+String solanaBuildMemoTxBase64(
+    const uint8_t walletPub[32],
+    const uint8_t blockhash[32],
+    const uint8_t *memoBytes, size_t memoLen);

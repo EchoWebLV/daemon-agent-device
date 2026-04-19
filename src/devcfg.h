@@ -48,3 +48,22 @@ String  devcfgServicesEnabled();
 void    devcfgSetServicesEnabled(const String &jsonArray);
 String  devcfgCustomServices();
 void    devcfgSetCustomServices(const String &jsonArray);
+
+// ---- On-chain memory (encrypted memo log on Solana mainnet) ---------------
+// When enabled, each completed user ↔ assistant exchange is encrypted
+// (AES-256-GCM with a key derived from the wallet seed) and written as a
+// Solana memo transaction, so Daemon remembers conversations across
+// reboots. Costs ~5000 lamports (~$0.0003) per exchange in SOL.
+bool    devcfgMemoryEnabled();
+void    devcfgSetMemoryEnabled(bool on);
+
+// ---- Heartbeat (scheduled prompt) -----------------------------------------
+// When enabled, the device runs `heartbeatPrompt` through the normal
+// aiAskOneShot + TTS pipeline every `heartbeatIntervalMin` minutes. Each
+// run costs USDC like any other chat. All fields persist across reboots.
+bool     devcfgHeartbeatEnabled();
+void     devcfgSetHeartbeatEnabled(bool on);
+String   devcfgHeartbeatPrompt();
+void     devcfgSetHeartbeatPrompt(const String &p);
+uint32_t devcfgHeartbeatIntervalMin();
+void     devcfgSetHeartbeatIntervalMin(uint32_t minutes);
