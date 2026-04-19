@@ -3,6 +3,7 @@
 #include "wallet.h"
 #include "price.h"
 #include "devcfg.h"
+#include "x402.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -47,22 +48,8 @@ static String buildSystemPrompt() {
   return out;
 }
 
-// Map the extension-style model id ("google/gemini-3.1-pro", etc.) to the
-// bare Gemini API name. Only Google models are supported on the device
-// today; anything else falls back to the compile-time default until x402
-// payment is wired up.
-static String pickGeminiModel() {
-  String m = devcfgLlmModel();
-  if (m.startsWith("google/")) {
-    String bare = m.substring(7);   // strip "google/"
-    // Gemini API expects these names as-is (gemini-2.5-flash, etc.)
-    return bare;
-  }
-  Serial.printf("ai: non-google model '%s' selected but x402 payment not "
-                "wired up yet — falling back to %s\n",
-                m.c_str(), GEMINI_MODEL);
-  return String(GEMINI_MODEL);
-}
+// (Gemini-direct routing helper has been retired — all chat now goes
+// through sol.blockrun.ai via x402 USDC payment.)
 
 // ---------------------------------------------------------------------------
 // Conversation memory
@@ -94,156 +81,123 @@ void aiResetHistory() {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level HTTP helper. Takes a pre-serialised JSON payload and writes the
-// extracted reply text into outReply. Returns true on success.
+// sol.blockrun.ai HTTP gateway — OpenAI-compatible /v1/chat/completions
+// behind an x402 USDC paywall on Solana mainnet. All chat calls flow
+// through here so the device actually pays for each reply from the wallet,
+// matching the Chrome extension's behaviour exactly.
 // ---------------------------------------------------------------------------
-static bool postToGemini(const String &payload, String &outReply) {
-  if (WiFi.status() != WL_CONNECTED) {
-    outReply = "I can't reach the cloud. Check Wi-Fi.";
-    return false;
+static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completions";
+
+// Build the OpenAI-style request body. `historyTurns` expects turns in the
+// Gemini format we already use (role=="user"/"model"); we translate them
+// to OpenAI roles on the fly.
+static String buildChatBody(const String &model,
+                            const Turn *historyTurns,
+                            int historyLen,
+                            const String &oneShotPrompt,
+                            int maxTokens,
+                            float temperature) {
+  JsonDocument doc;
+  doc["model"] = model;
+  doc["max_tokens"] = maxTokens;
+  doc["temperature"] = temperature;
+
+  JsonArray msgs = doc["messages"].to<JsonArray>();
+
+  // System prompt (personality + live wallet context).
+  JsonObject sys = msgs.add<JsonObject>();
+  sys["role"]    = "system";
+  sys["content"] = buildSystemPrompt();
+
+  if (historyTurns && historyLen > 0) {
+    for (int i = 0; i < historyLen; ++i) {
+      JsonObject m = msgs.add<JsonObject>();
+      // Gemini's "model" role → OpenAI's "assistant".
+      m["role"]    = (historyTurns[i].role == "model") ? "assistant" : "user";
+      m["content"] = historyTurns[i].text;
+    }
+  } else if (oneShotPrompt.length() > 0) {
+    JsonObject m = msgs.add<JsonObject>();
+    m["role"]    = "user";
+    m["content"] = oneShotPrompt;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();   // Google's CA chain rotates; skip pinning.
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
 
-  HTTPClient http;
-  String modelName = pickGeminiModel();
-  String url = "https://generativelanguage.googleapis.com/v1beta/models/";
-  url += modelName;
-  url += ":generateContent?key=";
-  url += GEMINI_API_KEY;
-
-  if (!http.begin(client, url)) {
-    outReply = "Network refused me. How rude.";
+// POSTs the chat completion through x402 and returns the assistant's reply
+// text. Fills outReply with a human-friendly error string on failure.
+static bool postChatThroughX402(const String &body, String &outReply) {
+  X402Result r = x402Post(String(LLM_ENDPOINT), body);
+  if (r.status != 200) {
+    Serial.printf("ai: x402 POST %d (err=%s)\n", r.status, r.error.c_str());
+    if (r.status == 402) {
+      outReply = "I couldn't complete the USDC payment for this reply.";
+    } else if (r.error.length() > 0) {
+      outReply = "Daemon's brain is offline: " + r.error;
+    } else {
+      outReply = "HTTP " + String(r.status);
+    }
     return false;
   }
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(20000);
-
-  int code = http.POST(payload);
-  if (code <= 0) {
-    Serial.printf("ai: POST failed: %s\n", http.errorToString(code).c_str());
-    outReply = "Something blinked in the wires.";
-    http.end();
-    return false;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  if (code < 200 || code >= 300) {
-    Serial.printf("ai: HTTP %d body=%s\n", code, body.c_str());
-    outReply = "Gemini said no (" + String(code) + ").";
-    return false;
+  if (r.costUsd > 0) {
+    Serial.printf("ai: paid $%.5f USDC for this reply\n", r.costUsd);
   }
 
   JsonDocument res;
-  DeserializationError err = deserializeJson(res, body);
-  if (err) {
-    Serial.printf("ai: JSON parse: %s\n", err.c_str());
+  if (deserializeJson(res, r.body)) {
     outReply = "The reply was scrambled.";
     return false;
   }
-
-  JsonVariant parts = res["candidates"][0]["content"]["parts"];
-  String reply;
-  if (parts.is<JsonArray>()) {
-    for (JsonVariant p : parts.as<JsonArray>()) {
-      const char *t = p["text"] | "";
-      reply += t;
-    }
-  }
+  const char *content = res["choices"][0]["message"]["content"] | "";
+  String reply = String(content);
   reply.trim();
   if (reply.length() == 0) {
-    const char *fin = res["candidates"][0]["finishReason"] | "";
-    Serial.printf("ai: empty reply, finishReason=%s\n", fin);
+    const char *finish = res["choices"][0]["finish_reason"] | "";
+    Serial.printf("ai: empty reply, finish_reason=%s\n", finish);
     outReply = "I forgot what I was going to say.";
     return false;
   }
-
   outReply = reply;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Multi-turn chat, with persistent history.
+// Multi-turn chat — goes through sol.blockrun.ai with x402 USDC payment.
 // ---------------------------------------------------------------------------
 bool aiAsk(const String &userText, String &outReply) {
   if (userText.length() == 0) return false;
   pushTurn("user", userText);
 
-  JsonDocument doc;
-  JsonArray contents = doc["contents"].to<JsonArray>();
-  for (int i = 0; i < s_histLen; ++i) {
-    JsonObject turn = contents.add<JsonObject>();
-    turn["role"] = s_history[i].role;
-    JsonArray parts = turn["parts"].to<JsonArray>();
-    JsonObject p = parts.add<JsonObject>();
-    p["text"] = s_history[i].text;
-  }
-  JsonObject sys = doc["systemInstruction"].to<JsonObject>();
-  JsonArray sysParts = sys["parts"].to<JsonArray>();
-  JsonObject sp = sysParts.add<JsonObject>();
-  sp["text"] = buildSystemPrompt();
-
-  JsonObject gen = doc["generationConfig"].to<JsonObject>();
-  gen["temperature"]     = 0.9;
-  gen["maxOutputTokens"] = 800;
-  gen["topP"]            = 0.95;
-  gen["thinkingConfig"]["thinkingLevel"] = "LOW";
-
-  // Let Gemini 3.1 Pro reach out to Google Search when the question needs
-  // fresh information (news, prices, latest Solana releases, etc).
-  JsonArray tools = doc["tools"].to<JsonArray>();
-  JsonObject t0 = tools.add<JsonObject>();
-  t0["googleSearch"].to<JsonObject>();   // empty object == enabled
-
-  String payload;
-  serializeJson(doc, payload);
+  String body = buildChatBody(devcfgLlmModel(),
+                              s_history, s_histLen,
+                              String(),
+                              /*maxTokens=*/ 512,
+                              /*temperature=*/ 0.9f);
 
   String reply;
-  bool ok = postToGemini(payload, reply);
+  bool ok = postChatThroughX402(body, reply);
   if (!ok) {
     s_histLen--;              // roll back the pending user turn
     outReply = reply;
     return false;
   }
-
   pushTurn("model", reply);
   outReply = reply;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Single-turn prompt (no history mutation). Used by ambient chatter.
+// Single-turn prompt (no history mutation).
 // ---------------------------------------------------------------------------
 bool aiAskOneShot(const String &prompt, String &outReply) {
   if (prompt.length() == 0) return false;
-
-  JsonDocument doc;
-  JsonArray contents = doc["contents"].to<JsonArray>();
-  JsonObject turn = contents.add<JsonObject>();
-  turn["role"] = "user";
-  JsonArray parts = turn["parts"].to<JsonArray>();
-  JsonObject p = parts.add<JsonObject>();
-  p["text"] = prompt;
-
-  JsonObject sys = doc["systemInstruction"].to<JsonObject>();
-  JsonArray sysParts = sys["parts"].to<JsonArray>();
-  JsonObject sp = sysParts.add<JsonObject>();
-  sp["text"] = buildSystemPrompt();
-
-  JsonObject gen = doc["generationConfig"].to<JsonObject>();
-  gen["temperature"]     = 1.1;
-  gen["maxOutputTokens"] = 800;
-  gen["topP"]            = 0.95;
-  gen["thinkingConfig"]["thinkingLevel"] = "LOW";
-
-  JsonArray tools = doc["tools"].to<JsonArray>();
-  JsonObject t0 = tools.add<JsonObject>();
-  t0["googleSearch"].to<JsonObject>();
-
-  String payload;
-  serializeJson(doc, payload);
-  return postToGemini(payload, outReply);
+  String body = buildChatBody(devcfgLlmModel(),
+                              nullptr, 0,
+                              prompt,
+                              /*maxTokens=*/ 512,
+                              /*temperature=*/ 1.1f);
+  return postChatThroughX402(body, outReply);
 }

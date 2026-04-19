@@ -5,16 +5,22 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Ed25519.h>   // rweather/Crypto
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 static bool                      s_ok = false;
 static std::vector<uint8_t>      s_secretBytes;   // 64 (full) or 32 (pubkey only)
+static uint8_t                   s_pubkeyBytes[32] = {0};
 static String                    s_pubkey;
 static double                    s_solBalance = 0.0;
 static std::vector<TokenHolding> s_tokens;
 static uint32_t                  s_lastRefreshMs = 0;
+
+// Cached associated-token-account for USDC — populated from the token
+// accounts RPC response so we don't have to derive it client-side.
+static String                    s_usdcAta;
 
 // Common token-mint → symbol map so the AI can name big holdings by ticker
 // without us round-tripping metadata for every refresh. Add more as needed.
@@ -62,10 +68,33 @@ bool walletBegin() {
   const uint8_t *pub = (s_secretBytes.size() == 64)
                       ? &s_secretBytes[32]
                       : s_secretBytes.data();
+  memcpy(s_pubkeyBytes, pub, 32);
   s_pubkey = base58Encode(pub, 32);
   s_ok = true;
-  Serial.printf("wallet: address %s (key size %u bytes)\n",
-                s_pubkey.c_str(), (unsigned)s_secretBytes.size());
+  Serial.printf("wallet: address %s (key size %u bytes, canSign=%d)\n",
+                s_pubkey.c_str(),
+                (unsigned)s_secretBytes.size(),
+                walletCanSign() ? 1 : 0);
+  return true;
+}
+
+bool walletCanSign() {
+  return s_ok && s_secretBytes.size() == 64;
+}
+
+const uint8_t *walletPubkeyBytes() {
+  return s_ok ? s_pubkeyBytes : nullptr;
+}
+
+// Ed25519 signing — rweather's library takes the 32-byte seed separately
+// from the 32-byte public key. Phantom/Solana secret keys pack them as
+// seed || pubkey in the 64-byte blob.
+bool walletSign(const uint8_t *data, size_t len, uint8_t sigOut[64]) {
+  if (!walletCanSign()) return false;
+  Ed25519::sign(sigOut,
+                /*privateKey=*/s_secretBytes.data(),         // first 32 = seed
+                /*publicKey=*/ s_secretBytes.data() + 32,    // last  32 = pub
+                data, len);
   return true;
 }
 
@@ -82,6 +111,8 @@ double walletUsdcAmount() {
   }
   return 0.0;
 }
+
+String walletUsdcAta() { return s_usdcAta; }
 
 String walletUsdcDisplayString() {
   if (!s_ok) return String("");
@@ -172,12 +203,22 @@ static void refreshTokens() {
   JsonArray accounts = doc["result"]["value"].as<JsonArray>();
   if (accounts.isNull()) { s_tokens.clear(); return; }
 
+  String foundUsdcAta;
   for (JsonObject acct : accounts) {
+    const char *ataAddr = acct["pubkey"] | "";
     JsonObject info = acct["account"]["data"]["parsed"]["info"];
     const char *mint = info["mint"] | "";
     JsonObject amt   = info["tokenAmount"];
     double ui        = amt["uiAmount"].as<double>();
     uint8_t dec      = amt["decimals"] | 0;
+
+    // Record the USDC ATA even if the balance is zero — we still need to
+    // spend from it when we have a positive balance and the RPC result
+    // order isn't guaranteed.
+    if (strcmp(mint, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") == 0) {
+      foundUsdcAta = ataAddr;
+    }
+
     if (ui <= 0.0) continue;                 // skip empty accounts
     TokenHolding h;
     h.mint     = mint;
@@ -186,6 +227,7 @@ static void refreshTokens() {
     h.decimals = dec;
     next.push_back(h);
   }
+  s_usdcAta = foundUsdcAta;
 
   // Keep the list short; top 10 by UI amount is plenty for a spoken AI.
   std::sort(next.begin(), next.end(),

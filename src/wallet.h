@@ -39,6 +39,24 @@ uint32_t walletLastRefreshAgeMs();
 double  walletUsdcAmount();
 String  walletUsdcDisplayString();
 
+// The associated-token-account address that holds this wallet's USDC.
+// Cached from the last getTokenAccountsByOwner response. Empty string if
+// the wallet has never held USDC (no ATA exists yet).
+String  walletUsdcAta();
+
+// 32-byte wallet public key (same bytes as base58-decoded walletPubkey()).
+// Returns nullptr if the wallet was initialised with only a pubkey-shaped
+// input that couldn't be parsed.
+const uint8_t *walletPubkeyBytes();
+
+// True when the wallet was initialised from a full 64-byte Phantom-style
+// secret key and can therefore sign.
+bool    walletCanSign();
+
+// Sign `len` bytes with the wallet's ed25519 key. Writes a 64-byte
+// signature into `sigOut`. Returns false if the wallet can't sign.
+bool    walletSign(const uint8_t *data, size_t len, uint8_t sigOut[64]);
+
 // Compact multi-line summary suitable for injection into Gemini's system
 // prompt. Example output:
 //   Your wallet: 9xHb...Qk3 (Solana mainnet).
