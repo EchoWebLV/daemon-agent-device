@@ -6,6 +6,14 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Ed25519.h>   // rweather/Crypto
+#include <Preferences.h>
+#include <esp_system.h>    // esp_fill_random
+
+// NVS namespace + key for the persisted Phantom-style 64-byte secret.
+// Namespace stays inside the main "daemon" prefs so it survives across
+// the same settings NVS partition that holds volume / personality / etc.
+static constexpr const char *NVS_NS       = "daemon";
+static constexpr const char *NVS_KEY_SEC  = "wallet_sec";  // 64-byte blob
 
 // ---------------------------------------------------------------------------
 // State
@@ -45,36 +53,104 @@ static const char *symbolForMint(const String &mint) {
 }
 
 // ---------------------------------------------------------------------------
+// Key management helpers (NVS-backed)
+// ---------------------------------------------------------------------------
+// Build a full 64-byte Phantom-style secret from a 32-byte seed by
+// deriving the ed25519 public key and concatenating seed || pubkey.
+static void buildFullSecretFromSeed(const uint8_t seed[32],
+                                    uint8_t outFull[64]) {
+  memcpy(outFull, seed, 32);
+  uint8_t pub[32];
+  Ed25519::derivePublicKey(pub, seed);
+  memcpy(outFull + 32, pub, 32);
+}
+
+// Generate a fresh 32-byte seed via the hardware TRNG and expand it into
+// the 64-byte Phantom format. esp_fill_random() is backed by the ESP32's
+// RNG peripheral, which is cryptographically secure as long as Wi-Fi or
+// Bluetooth are active (they are on this device) — see the ESP-IDF docs.
+static void generateFreshSecret(uint8_t outFull[64]) {
+  uint8_t seed[32];
+  esp_fill_random(seed, sizeof(seed));
+  buildFullSecretFromSeed(seed, outFull);
+}
+
+// Persist the 64-byte secret to NVS under the "daemon" namespace.
+static bool saveSecretToNvs(const uint8_t full[64]) {
+  Preferences nvs;
+  if (!nvs.begin(NVS_NS, false)) return false;
+  size_t n = nvs.putBytes(NVS_KEY_SEC, full, 64);
+  nvs.end();
+  return n == 64;
+}
+
+// Read back the 64-byte secret. Returns false when the slot is missing
+// (fresh device) or corrupt (wrong length).
+static bool loadSecretFromNvs(uint8_t outFull[64]) {
+  Preferences nvs;
+  if (!nvs.begin(NVS_NS, true)) return false;
+  bool has = nvs.isKey(NVS_KEY_SEC);
+  if (!has) { nvs.end(); return false; }
+  size_t n = nvs.getBytes(NVS_KEY_SEC, outFull, 64);
+  nvs.end();
+  return n == 64;
+}
+
+// Apply a 64-byte secret to the module state: store bytes, derive the
+// public key + base58 address, flip s_ok. Shared by both the boot-load
+// and the regenerate flows.
+static void applySecret(const uint8_t full[64]) {
+  s_secretBytes.assign(full, full + 64);
+  memcpy(s_pubkeyBytes, full + 32, 32);
+  s_pubkey = base58Encode(full + 32, 32);
+  s_ok = true;
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 bool walletBegin() {
-  String raw = String(SOLANA_KEY);
-  if (raw.startsWith("PASTE-") || raw.length() == 0) {
-    Serial.println("wallet: no key configured");
-    s_ok = false;
-    return false;
+  uint8_t full[64];
+
+  if (loadSecretFromNvs(full)) {
+    applySecret(full);
+    Serial.printf("wallet: loaded from NVS — address %s\n", s_pubkey.c_str());
+    return true;
   }
 
-  s_secretBytes = base58Decode(raw);
-  if (s_secretBytes.size() != 32 && s_secretBytes.size() != 64) {
-    Serial.printf("wallet: key decode yielded %u bytes (expected 32 or 64)\n",
-                  (unsigned)s_secretBytes.size());
-    s_ok = false;
+  // First-run flow: generate a fresh keypair and save it so this is a
+  // one-time event. The user gets a genuine new Solana wallet on every
+  // factory reset / fresh flash.
+  generateFreshSecret(full);
+  if (!saveSecretToNvs(full)) {
+    Serial.println("wallet: NVS save FAILED — continuing in-RAM only");
+    // Still apply so the device is at least usable until the next reboot.
+  }
+  applySecret(full);
+  Serial.printf("wallet: generated fresh wallet — address %s\n", s_pubkey.c_str());
+  return true;
+}
+
+String walletExportPrivateKeyBase58() {
+  if (!s_ok || s_secretBytes.size() != 64) return "";
+  return base58Encode(s_secretBytes.data(), 64);
+}
+
+bool walletGenerateNew() {
+  uint8_t full[64];
+  generateFreshSecret(full);
+  if (!saveSecretToNvs(full)) {
+    Serial.println("wallet: regenerate NVS save FAILED");
     return false;
   }
-
-  // For a 64-byte Phantom-style export the public key is the tail 32 bytes.
-  // For a 32-byte input we assume it's already the public address.
-  const uint8_t *pub = (s_secretBytes.size() == 64)
-                      ? &s_secretBytes[32]
-                      : s_secretBytes.data();
-  memcpy(s_pubkeyBytes, pub, 32);
-  s_pubkey = base58Encode(pub, 32);
-  s_ok = true;
-  Serial.printf("wallet: address %s (key size %u bytes, canSign=%d)\n",
-                s_pubkey.c_str(),
-                (unsigned)s_secretBytes.size(),
-                walletCanSign() ? 1 : 0);
+  // Reset derived state so balances / tokens / USDC ATA from the old
+  // wallet don't leak into the new one's UI until the next refresh.
+  s_solBalance    = 0.0;
+  s_tokens.clear();
+  s_usdcAta       = "";
+  s_lastRefreshMs = 0;
+  applySecret(full);
+  Serial.printf("wallet: regenerated — new address %s\n", s_pubkey.c_str());
   return true;
 }
 

@@ -2,6 +2,7 @@
 #include "secrets.h"
 #include "devcfg.h"
 #include "memory.h"
+#include "wallet.h"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -122,6 +123,26 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
 </div>
 
 <div class="panel" id="panel-settings">
+  <div class="card">
+    <h3>WALLET</h3>
+    <p class="hint">The device generated this Solana keypair on first boot. It signs every x402 payment, owns your on-chain memory, and is stored in NVS — no hardcoded key, no external wallet required.</p>
+    <div class="row" style="gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <code id="walletAddr" style="font-family:ui-monospace,monospace;font-size:12px;word-break:break-all;color:var(--text)">…</code>
+      <button class="btn ghost" id="copyAddr" style="padding:4px 10px;font-size:11px">copy</button>
+    </div>
+    <div class="row" style="gap:8px;margin-top:4px;flex-wrap:wrap">
+      <button class="btn ghost" id="revealKey" style="color:#f5a524;border-color:#f5a524">reveal private key</button>
+      <button class="btn ghost" id="regenWallet" style="color:#e5484d;border-color:#e5484d">generate new wallet</button>
+    </div>
+    <div id="walletSecretBox" class="hint" style="display:none;margin-top:10px;padding:10px;border:1px solid #f5a524;border-radius:8px;background:#f5a52411">
+      <div style="color:#f5a524;font-weight:600;margin-bottom:4px">⚠ PRIVATE KEY — anyone holding this can drain the wallet, sign transactions as Daemon, and decrypt your on-chain chat memory. Never share it. Never paste it into chat. Store it only in a place you already trust with your money.</div>
+      <code id="walletSecret" style="font-family:ui-monospace,monospace;font-size:11px;word-break:break-all"></code>
+      <div class="row" style="gap:8px;margin-top:8px">
+        <button class="btn ghost" id="copySecret" style="padding:4px 10px;font-size:11px">copy</button>
+        <button class="btn ghost" id="hideSecret" style="padding:4px 10px;font-size:11px">hide</button>
+      </div>
+    </div>
+  </div>
   <div class="card">
     <h3>LLM MODEL</h3>
     <p class="hint">Google/Gemini models work directly right now. Other providers route through the x402 gateway and need the wallet to pay per request — plumbing coming in the next firmware build.</p>
@@ -515,7 +536,81 @@ async function loadCfg(){
   if(cfg.memoryEnabled) refreshMemoryStats();
   renderHeartbeat();
   renderServices();
+  refreshWalletCard();
 }
+
+// ────────── wallet card ──────────
+async function refreshWalletCard(){
+  try{
+    const r = await fetch('/wallet');
+    const j = await r.json();
+    $('#walletAddr').textContent = j.address || '(no wallet)';
+  }catch(e){
+    $('#walletAddr').textContent = '(error)';
+  }
+}
+
+$('#copyAddr').onclick = async () => {
+  try{
+    await navigator.clipboard.writeText($('#walletAddr').textContent);
+    const b = $('#copyAddr'); const old = b.textContent;
+    b.textContent = 'copied ✓'; setTimeout(() => b.textContent = old, 1200);
+  }catch(e){}
+};
+
+$('#revealKey').onclick = async () => {
+  const warn = "⚠ REVEAL PRIVATE KEY ⚠\n\n" +
+               "This is the SIGNING KEY for Daemon's wallet. Anyone who sees it can:\n" +
+               "  • drain the SOL / USDC / tokens held here\n" +
+               "  • sign transactions AS this device\n" +
+               "  • decrypt every chat memory stored on-chain\n\n" +
+               "Only reveal it if you're backing it up somewhere safe. " +
+               "Never paste it into a chat, email, or screenshot.\n\n" +
+               "Continue?";
+  if (!confirm(warn)) return;
+  try{
+    const r = await fetch('/wallet/reveal');
+    const j = await r.json();
+    if (!j.privateKey) { alert('could not fetch key: ' + (j.error || 'unknown')); return; }
+    $('#walletSecret').textContent = j.privateKey;
+    $('#walletSecretBox').style.display = 'block';
+  }catch(e){ alert('network error'); }
+};
+
+$('#copySecret').onclick = async () => {
+  try{
+    await navigator.clipboard.writeText($('#walletSecret').textContent);
+    const b = $('#copySecret'); const old = b.textContent;
+    b.textContent = 'copied ✓'; setTimeout(() => b.textContent = old, 1200);
+  }catch(e){}
+};
+
+$('#hideSecret').onclick = () => {
+  $('#walletSecret').textContent = '';
+  $('#walletSecretBox').style.display = 'none';
+};
+
+$('#regenWallet').onclick = async () => {
+  const warn1 = "⚠ GENERATE NEW WALLET — DESTRUCTIVE ⚠\n\n" +
+                "This will:\n" +
+                "  • REPLACE the current keypair with a brand-new one\n" +
+                "  • ABANDON any SOL / USDC / tokens at the old address (stuck unless you backed up the old private key)\n" +
+                "  • MAKE your existing on-chain chat memory UNREADABLE (encrypted with the old key — gone forever)\n" +
+                "  • clear balances, token list, and USDC ATA cache\n\n" +
+                "Have you backed up the old private key if you need those funds?";
+  if (!confirm(warn1)) return;
+  const confirmText = prompt("Final check. Type NEW WALLET (in caps) to proceed:");
+  if (confirmText !== 'NEW WALLET') { alert('aborted — text didn\'t match'); return; }
+  try{
+    const r = await fetch('/wallet/regenerate', { method: 'POST' });
+    const j = await r.json();
+    if (!j.ok) { alert('failed: ' + (j.error || 'unknown')); return; }
+    alert('new wallet generated:\n' + j.address + '\n\nThe device will reboot to reload all caches.');
+    $('#walletAddr').textContent = j.address;
+    $('#walletSecret').textContent = '';
+    $('#walletSecretBox').style.display = 'none';
+  }catch(e){ alert('network error'); }
+};
 
 $('#saveSettings').onclick = async () => {
   cfg.model = $('#model').value;
@@ -845,6 +940,42 @@ static void handleMemoryGet() {
 }
 
 // ---------------------------------------------------------------------------
+// Wallet endpoints — address lookup, private-key reveal, key rotation.
+// ---------------------------------------------------------------------------
+static void handleWalletGet() {
+  String out = String("{\"address\":\"") + walletPubkey() + "\"}";
+  s_http.send(200, "application/json", out);
+}
+
+static void handleWalletReveal() {
+  String sec = walletExportPrivateKeyBase58();
+  if (sec.length() == 0) {
+    s_http.send(500, "application/json",
+                "{\"error\":\"no signing key available\"}");
+    return;
+  }
+  String out = String("{\"privateKey\":\"") + sec + "\"}";
+  s_http.send(200, "application/json", out);
+}
+
+static void handleWalletRegenerate() {
+  // Generate a new key first so if it fails we keep the old one intact.
+  if (!walletGenerateNew()) {
+    s_http.send(500, "application/json",
+                "{\"ok\":false,\"error\":\"NVS write failed\"}");
+    return;
+  }
+  String out = String("{\"ok\":true,\"address\":\"") + walletPubkey() + "\"}";
+  s_http.send(200, "application/json", out);
+
+  // Reboot after the response lands so every subsystem (memory AES key,
+  // USDC ATA cache, Arweave recall) rehydrates cleanly from the new seed.
+  Serial.println("wallet: rebooting to apply new keypair");
+  delay(250);
+  ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 // Scan once and log what's in range. Handy for debugging mis-typed SSIDs or
@@ -922,6 +1053,9 @@ void serverBeginHttp(SayCallback onSay) {
   s_http.on("/config", HTTP_GET,  handleConfigGet);
   s_http.on("/config", HTTP_POST, handleConfigPost);
   s_http.on("/memory", HTTP_GET,  handleMemoryGet);
+  s_http.on("/wallet",            HTTP_GET,  handleWalletGet);
+  s_http.on("/wallet/reveal",     HTTP_GET,  handleWalletReveal);
+  s_http.on("/wallet/regenerate", HTTP_POST, handleWalletRegenerate);
   s_http.begin();
   Serial.println("http: listening on :80");
 }

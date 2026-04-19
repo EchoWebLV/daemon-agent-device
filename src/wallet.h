@@ -14,9 +14,26 @@ struct TokenHolding {
   uint8_t  decimals;
 };
 
-// Decode SOLANA_KEY into bytes, derive and store the 32-byte public address.
-// Returns false if the key is malformed.
+// Load (or generate) the device's Solana keypair. On first boot the NVS
+// is empty and a fresh Ed25519 keypair is generated from the hardware
+// RNG and persisted. Subsequent boots read the same key back. Returns
+// false only if NVS is unusable (extremely rare).
 bool walletBegin();
+
+// Export the full 64-byte Phantom-style secret key as a base58 string
+// (same format Phantom shows in "Export Private Key"). This is the key
+// that lets someone sign transactions and decrypt on-chain memory — do
+// NOT share it. Used by the web UI's reveal-key flow behind a warning.
+String walletExportPrivateKeyBase58();
+
+// Wipe the current key and generate a fresh Ed25519 keypair. The old
+// wallet address becomes unreachable from this device (funds stuck
+// unless the user backed up the old key), and AES-encrypted chat memory
+// tied to the old seed becomes undecryptable. Returns false on NVS
+// failure. After success the caller should reload everything that
+// depends on the wallet (memory, x402 caches, on-screen balance, …) —
+// typically by rebooting.
+bool walletGenerateNew();
 
 // Returns "" if walletBegin() failed.
 String walletPubkey();
