@@ -175,6 +175,24 @@ void devcfgSetMemoryEnabled(bool on) {
   s_nvs.end();
 }
 
+// ---- Arweave (Irys) archive ----------------------------------------------
+bool devcfgArweaveEnabled() {
+  s_nvs.begin("daemon", true);
+  bool v = s_nvs.getBool("ar_on", false);
+  s_nvs.end();
+  return v;
+}
+void devcfgSetArweaveEnabled(bool on) {
+  s_nvs.begin("daemon", false);
+  s_nvs.putBool("ar_on", on);
+  // Unified policy: when the user flips the single "MEMORY" toggle on,
+  // we stop writing Solana memo txs so they don't keep paying for a
+  // backend the UI no longer exposes. Advanced users can still flip the
+  // memo backend back on via POST /config if they want redundancy.
+  if (on) s_nvs.putBool("mem_on", false);
+  s_nvs.end();
+}
+
 // ---- Heartbeat ------------------------------------------------------------
 bool devcfgHeartbeatEnabled() {
   s_nvs.begin("daemon", true);

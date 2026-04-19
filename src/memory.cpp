@@ -3,6 +3,7 @@
 #include "wallet.h"
 #include "base58.h"
 #include "solana_tx.h"
+#include "arweave.h"
 #include "secrets.h"
 
 #include <WiFi.h>
@@ -44,6 +45,12 @@ static volatile uint32_t s_pending      = 0;
 static volatile uint32_t s_written      = 0;
 static volatile uint32_t s_failed       = 0;
 static volatile uint32_t s_lastWriteMs  = 0;
+
+// Arweave stats (accessed from the write task + UI).
+static volatile uint32_t s_arWritten    = 0;
+static volatile uint32_t s_arFailed     = 0;
+static volatile uint32_t s_arLastMs     = 0;
+static String            s_arLastTxId   = "";
 
 // Each queued job carries the already-encrypted + base64-wrapped memo
 // content ready to paste into the Solana memo instruction.
@@ -256,33 +263,69 @@ static void memoryWriteTask(void *) {
       continue;
     }
 
-    uint8_t blockhash[32];
-    if (!fetchBlockhashBytes(blockhash)) {
-      Serial.println("memory: blockhash fetch failed");
-      s_failed++;
-      continue;
+    // ------------------------------------------------------------------
+    // Memo leg — only runs if the user still has the on-chain memo
+    // backend enabled. Default-off users skip this entirely (Arweave
+    // alone is free and permanent).
+    // ------------------------------------------------------------------
+    if (devcfgMemoryEnabled()) {
+      uint8_t blockhash[32];
+      if (!fetchBlockhashBytes(blockhash)) {
+        Serial.println("memory: blockhash fetch failed");
+        s_failed++;
+      } else {
+        const uint8_t *pub = walletPubkeyBytes();
+        if (!pub) {
+          s_failed++;
+        } else {
+          String txB64 = solanaBuildMemoTxBase64(
+              pub, blockhash,
+              (const uint8_t *)job.memoB64, job.memoLen);
+          if (txB64.length() == 0) {
+            Serial.println("memory: tx build failed");
+            s_failed++;
+          } else {
+            String sig;
+            if (sendRawTransaction(txB64, sig)) {
+              s_written++;
+              s_lastWriteMs = millis();
+              Serial.printf("memory: wrote (%u bytes memo) sig=%.16s…\n",
+                            (unsigned)job.memoLen, sig.c_str());
+            } else {
+              s_failed++;
+            }
+          }
+        }
+      }
     }
 
-    const uint8_t *pub = walletPubkeyBytes();
-    if (!pub) { s_failed++; continue; }
-
-    String txB64 = solanaBuildMemoTxBase64(
-        pub, blockhash,
-        (const uint8_t *)job.memoB64, job.memoLen);
-    if (txB64.length() == 0) {
-      Serial.println("memory: tx build failed");
-      s_failed++;
-      continue;
-    }
-
-    String sig;
-    if (sendRawTransaction(txB64, sig)) {
-      s_written++;
-      s_lastWriteMs = millis();
-      Serial.printf("memory: wrote (%u bytes memo) sig=%.16s…\n",
-                    (unsigned)job.memoLen, sig.c_str());
-    } else {
-      s_failed++;
+    // ------------------------------------------------------------------
+    // Arweave archive leg: upload the SAME encrypted blob to Arweave via
+    // Irys. Runs after the memo write so a slow/failed Irys upload never
+    // blocks the primary on-chain memo path. Under 100 KiB is free on
+    // Irys, so this costs nothing for typical chat memos.
+    // ------------------------------------------------------------------
+    if (devcfgArweaveEnabled()) {
+      ArweaveTag tags[] = {
+        { "Content-Type", "application/octet-stream" },
+        { "App-Name",     "daemon" },
+        { "App-Version",  "1" },
+        { "Kind",         "chat-memory-v1" },
+        { "Wallet",       walletPubkey() },
+      };
+      String txId;
+      bool arOk = arweaveUpload((const uint8_t *)job.memoB64, job.memoLen,
+                                tags, sizeof(tags) / sizeof(tags[0]),
+                                txId);
+      if (arOk) {
+        s_arWritten++;
+        s_arLastMs   = millis();
+        s_arLastTxId = txId;
+        Serial.printf("memory: archived to Arweave https://gateway.irys.xyz/%s\n",
+                      txId.c_str());
+      } else {
+        s_arFailed++;
+      }
     }
   }
 }
@@ -318,9 +361,11 @@ void memoryBegin() {
 bool memoryKeyReady() { return s_keyReady; }
 
 void memoryRecordExchange(const String &userText, const String &assistantText) {
-  if (!s_keyReady)                return;
-  if (!devcfgMemoryEnabled())     return;
-  if (!s_queue)                   return;
+  if (!s_keyReady)  return;
+  // Record the exchange if EITHER backend is enabled. The write task then
+  // decides per-job whether to do the memo leg, the Arweave leg, or both.
+  if (!devcfgMemoryEnabled() && !devcfgArweaveEnabled()) return;
+  if (!s_queue)     return;
 
   // Clamp each side so the combined JSON fits in one tx comfortably.
   String u = userText;      if (u.length() > MAX_USER_CHARS)   u = u.substring(0, MAX_USER_CHARS - 1)   + "…";
@@ -358,13 +403,65 @@ void memoryRecordExchange(const String &userText, const String &assistantText) {
   }
 }
 
-int memoryRecallTurns(MemoryTurn *out, int maxTurns) {
-  if (!s_keyReady || !devcfgMemoryEnabled() || !out || maxTurns <= 0) return 0;
+// Turn an encrypted base64 payload (same format as memo content) into up
+// to 2 chat turns by decrypting + parsing the JSON wrapper. Shared by the
+// Arweave and memo recall paths.
+static int decryptToTurns(const String &b64,
+                          MemoryTurn *out, int outCap, int outPos) {
+  String plain;
+  if (!decryptMemoPayload(b64, plain)) return 0;
+  JsonDocument jd;
+  if (deserializeJson(jd, plain)) return 0;
+  const char *u = jd["u"] | (const char *)nullptr;
+  const char *a = jd["a"] | (const char *)nullptr;
+  int written = 0;
+  if (u && outPos + written < outCap) {
+    out[outPos + written].role = "user";
+    out[outPos + written].text = u;
+    written++;
+  }
+  if (a && outPos + written < outCap) {
+    out[outPos + written].role = "model";
+    out[outPos + written].text = a;
+    written++;
+  }
+  return written;
+}
+
+// Pull recent encrypted blobs from Arweave (via Irys GraphQL) and decrypt
+// them into chat turns. Much faster than the Solana RPC scan below — one
+// GraphQL POST + N gateway GETs, each ~100 ms.
+static int recallFromArweave(MemoryTurn *out, int maxTurns) {
+  String owner = walletPubkey();
+  if (owner.length() == 0) return 0;
+
+  // Estimate: each exchange becomes up to 2 turns, so fetch ceil(max/2) txs.
+  int maxItems = (maxTurns + 1) / 2;
+  if (maxItems > 40) maxItems = 40;
+
+  std::vector<ArweaveItem> items;
+  if (!arweaveFetchRecent("daemon", "chat-memory-v1",
+                          owner, maxItems, items)) {
+    return 0;
+  }
+  s_stored = items.size();
+  int written = 0;
+  for (const auto &it : items) {
+    if (written >= maxTurns) break;
+    written += decryptToTurns(it.data, out, maxTurns, written);
+  }
+  Serial.printf("memory: recalled %d turns from %u Arweave items\n",
+                written, (unsigned)items.size());
+  return written;
+}
+
+// Legacy path — Solana Memo program scan. Kept as a fallback when Arweave
+// is disabled so historical memos written before the switch are still
+// visible, and so users can run memory without any Arweave dependency.
+static int recallFromMemo(MemoryTurn *out, int maxTurns) {
   String pubkey = walletPubkey();
   if (pubkey.length() == 0) return 0;
 
-  // Fetch enough signatures that non-memo txs (x402 payments etc.) don't
-  // starve us out. 50 is a reasonable window.
   String payload = String("{\"jsonrpc\":\"2.0\",\"id\":1,"
                           "\"method\":\"getSignaturesForAddress\","
                           "\"params\":[\"") + pubkey + "\",{\"limit\":50}]}";
@@ -376,8 +473,6 @@ int memoryRecallTurns(MemoryTurn *out, int maxTurns) {
   JsonArrayConst sigs = doc["result"].as<JsonArrayConst>();
   if (sigs.isNull()) return 0;
 
-  // getSignaturesForAddress returns newest-first; reverse so history is
-  // chronological (oldest → newest) when we feed it back to the LLM.
   std::vector<String> memos;
   for (JsonObjectConst sig : sigs) {
     const char *m = sig["memo"] | (const char *)nullptr;
@@ -390,34 +485,46 @@ int memoryRecallTurns(MemoryTurn *out, int maxTurns) {
   int written = 0;
   for (const String &memo : memos) {
     if (written >= maxTurns) break;
-    String plain;
-    if (!decryptMemoPayload(memo, plain)) continue;
-    JsonDocument jd;
-    if (deserializeJson(jd, plain)) continue;
-    const char *u = jd["u"] | (const char *)nullptr;
-    const char *a = jd["a"] | (const char *)nullptr;
-    if (u && written < maxTurns) {
-      out[written].role = "user";
-      out[written].text = u;
-      written++;
-    }
-    if (a && written < maxTurns) {
-      out[written].role = "model";
-      out[written].text = a;
-      written++;
-    }
+    written += decryptToTurns(memo, out, maxTurns, written);
   }
   Serial.printf("memory: recalled %d turns from %u memos\n",
                 written, (unsigned)memos.size());
   return written;
 }
 
+int memoryRecallTurns(MemoryTurn *out, int maxTurns) {
+  if (!s_keyReady || !out || maxTurns <= 0) return 0;
+  // Either backend being on counts as "memory enabled" from a recall
+  // perspective — we still want to restore history on boot even if the
+  // user has flipped the memo write path off and relies on Arweave.
+  bool mem = devcfgMemoryEnabled();
+  bool ar  = devcfgArweaveEnabled();
+  if (!mem && !ar) return 0;
+
+  // Prefer Arweave when enabled. If the Arweave recall returns nothing
+  // (fresh device, or the user just switched backends), fall back to the
+  // Solana memo scan so existing users don't appear to lose their history
+  // after toggling over to the Arweave-only UI.
+  if (ar) {
+    int n = recallFromArweave(out, maxTurns);
+    if (n > 0) return n;
+    Serial.println("memory: arweave empty, falling back to memo scan");
+  }
+  return recallFromMemo(out, maxTurns);
+}
+
 void memoryGetStats(MemoryStats &out) {
-  out.enabled     = devcfgMemoryEnabled();
-  out.keyReady    = s_keyReady;
-  out.stored      = s_stored;
-  out.pending     = s_pending;
-  out.written     = s_written;
-  out.failed      = s_failed;
-  out.lastWriteMs = s_lastWriteMs;
+  out.enabled         = devcfgMemoryEnabled();
+  out.keyReady        = s_keyReady;
+  out.stored          = s_stored;
+  out.pending         = s_pending;
+  out.written         = s_written;
+  out.failed          = s_failed;
+  out.lastWriteMs     = s_lastWriteMs;
+
+  out.arweaveEnabled  = devcfgArweaveEnabled();
+  out.arweaveWritten  = s_arWritten;
+  out.arweaveFailed   = s_arFailed;
+  out.arweaveLastMs   = s_arLastMs;
+  out.arweaveLastTxId = s_arLastTxId;
 }

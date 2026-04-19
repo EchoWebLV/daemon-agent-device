@@ -32,9 +32,16 @@ struct MemoryStats {
   bool     keyReady;          // wallet has a seed and HKDF succeeded
   uint32_t stored;            // memos found at last recall
   uint32_t pending;           // writes currently queued
-  uint32_t written;           // successful writes since boot
-  uint32_t failed;            // failed writes since boot
+  uint32_t written;           // successful memo writes since boot
+  uint32_t failed;            // failed memo writes since boot
   uint32_t lastWriteMs;       // millis() of last success, 0 if none
+
+  // Arweave (Irys) stats — independent from the memo stats above.
+  bool     arweaveEnabled;
+  uint32_t arweaveWritten;
+  uint32_t arweaveFailed;
+  uint32_t arweaveLastMs;
+  String   arweaveLastTxId;   // last successful Arweave tx ID (43 chars)
 };
 
 // Derive key + start background write task. Safe to call even when the

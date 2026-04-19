@@ -30,9 +30,16 @@ static bool s_lastMem = false;
 static bool s_lastHb  = false;
 static bool s_valid   = false;
 
+// "Memory is on" means either backend is active — Arweave is the primary
+// UI toggle now but the legacy Solana-memo path still counts so power
+// users with memo-only setups still see the indicator.
+static bool memoryIsOn() {
+  return devcfgArweaveEnabled() || devcfgMemoryEnabled();
+}
+
 void statusIconsDraw(TFT_eSPI *tft, int centerX, int centerY,
                      uint16_t color, uint16_t bgColor) {
-  bool mem = devcfgMemoryEnabled();
+  bool mem = memoryIsOn();
   bool hb  = devcfgHeartbeatEnabled();
 
   int totalW = (mem && hb) ? (ICON_W * 2 + GAP)
@@ -64,8 +71,8 @@ void statusIconsDraw(TFT_eSPI *tft, int centerX, int centerY,
 
 bool statusIconsNeedRedraw() {
   if (!s_valid) return true;
-  return devcfgMemoryEnabled()   != s_lastMem
-      || devcfgHeartbeatEnabled() != s_lastHb;
+  return memoryIsOn()              != s_lastMem
+      || devcfgHeartbeatEnabled()  != s_lastHb;
 }
 
 void statusIconsResetCache() { s_valid = false; }

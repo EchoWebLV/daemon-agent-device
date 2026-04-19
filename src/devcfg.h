@@ -67,6 +67,14 @@ void    devcfgSetCustomServices(const String &jsonArray);
 bool    devcfgMemoryEnabled();
 void    devcfgSetMemoryEnabled(bool on);
 
+// ---- Arweave/Irys archive ------------------------------------------------
+// When on, every memory write ALSO uploads the same encrypted blob to
+// Arweave via Irys. Under 100 KiB uploads are free, so chat memos add
+// zero cost but gain permanent decentralized storage. Requires memory
+// to be enabled (the encryption pipeline is shared).
+bool    devcfgArweaveEnabled();
+void    devcfgSetArweaveEnabled(bool on);
+
 // ---- Heartbeat (scheduled prompt) -----------------------------------------
 // When enabled, the device runs `heartbeatPrompt` through the normal
 // aiAskOneShot + TTS pipeline every `heartbeatIntervalMin` minutes. Each

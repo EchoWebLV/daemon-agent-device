@@ -31,6 +31,7 @@
 #include "wallet.h"
 #include "price.h"
 #include "memory.h"
+#include "arweave.h"
 #include "touch.h"
 #include "walletscreen.h"
 #include "settingsscreen.h"
@@ -234,7 +235,15 @@ static void pumpSerialInput() {
     if (c == '\r') continue;
     if (c == '\n') {
       s_serialBuf.trim();
-      if (s_serialBuf.length() > 0) handleUtterance(s_serialBuf);
+      if (s_serialBuf.length() > 0) {
+        // Dev-only commands. Anything that isn't recognised falls through
+        // to the normal chat pipeline.
+        if (s_serialBuf == "/ar-test") {
+          arweaveSelfTest();
+        } else {
+          handleUtterance(s_serialBuf);
+        }
+      }
       s_serialBuf = "";
     } else {
       s_serialBuf += (char)c;
@@ -344,7 +353,10 @@ void setup() {
   // background write task, and — if enabled — restore recent chat history
   // from Solana memos so Daemon remembers across reboots.
   memoryBegin();
-  if (s_wifiOk && devcfgMemoryEnabled() && memoryKeyReady()) {
+  // Recall when either storage backend is on — memoryRecallTurns picks
+  // Arweave (fast GraphQL path) if enabled, otherwise Solana memo scan.
+  if (s_wifiOk && (devcfgMemoryEnabled() || devcfgArweaveEnabled()) &&
+      memoryKeyReady()) {
     creatureSetSubtitle("restoring memory…");
     MemoryTurn loaded[10];
     int n = memoryRecallTurns(loaded, 10);

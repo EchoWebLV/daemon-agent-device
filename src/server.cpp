@@ -137,14 +137,14 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
     </div>
   </div>
   <div class="card">
-    <h3>MEMORY (ON-CHAIN)</h3>
-    <p class="hint">Store encrypted chat memory on Solana mainnet. Each completed exchange (one user + one Daemon turn) is AES-256 encrypted with a key derived from your wallet, then written as a memo transaction. Only you can decrypt — the public chain sees opaque bytes.</p>
-    <p class="hint">Cost: roughly <b>$0.0003 per exchange</b> (a ~5000-lamport Solana tx fee, paid in SOL from this wallet). Writes happen in the background so chat speed is unaffected. On boot the most recent memos get pulled back and Daemon remembers across reboots.</p>
+    <h3>MEMORY</h3>
+    <p class="hint">Store encrypted chat memory on <b>Arweave</b> (via the Irys bundler) and replay it on boot so Daemon remembers you across reboots and flashes. Each completed exchange (one user turn + one Daemon reply) is AES-256-GCM encrypted with a key derived from your wallet — only you can decrypt. Tagged with <code>App-Name=daemon</code> and your pubkey so the device can pull them back in one GraphQL query.</p>
+    <p class="hint"><b>Cost: $0.00</b> for the vast majority of exchanges. Uploads under 100 KiB are free on Irys, and every real chat memo is well under 1 KiB. Larger payloads would be paid in SOL from this wallet.</p>
     <div class="row" style="align-items:center;gap:10px;margin-bottom:6px">
-      <button class="toggle" id="memToggle" aria-label="memory on/off"></button>
-      <span id="memStatus" style="font-size:12px;color:var(--dim)">off</span>
+      <button class="toggle" id="arToggle" aria-label="memory on/off"></button>
+      <span id="arStatus" style="font-size:12px;color:var(--dim)">off</span>
     </div>
-    <p class="hint" id="memStats" style="margin:4px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
+    <p class="hint" id="arStats" style="margin:4px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
   </div>
   <div class="card">
     <h3>HEARTBEAT</h3>
@@ -466,16 +466,18 @@ function populateModels(){
 populateModels();
 
 function renderMemory(stats){
-  const on = !!cfg.memoryEnabled;
-  $('#memToggle').classList.toggle('on', on);
-  $('#memStatus').textContent = on ? 'on' : 'off';
+  const on = !!cfg.arweaveEnabled;
+  $('#arToggle').classList.toggle('on', on);
+  $('#arStatus').textContent = on ? 'on' : 'off';
   if(stats){
-    const approxUsd = (stats.written * 0.0003).toFixed(4);
-    const ago = stats.lastWriteMs > 0 ? Math.round(stats.lastWriteMs / 1000) + ' s uptime' : 'never';
-    $('#memStats').innerHTML =
-      `stored: <b>${stats.stored}</b>  ·  pending: <b>${stats.pending}</b>  ·  written this session: <b>${stats.written}</b>  ·  failed: <b>${stats.failed}</b><br>estimated spent this session: ~$${approxUsd}  ·  last write: ${ago}`;
+    const arAgo = stats.arweaveLastMs > 0 ? Math.round(stats.arweaveLastMs / 1000) + ' s uptime' : 'never';
+    const txHtml = stats.arweaveLastTxId
+      ? `<a href="https://gateway.irys.xyz/${stats.arweaveLastTxId}" target="_blank" style="color:var(--accent);font-family:ui-monospace,monospace">${stats.arweaveLastTxId.substring(0,10)}…</a>`
+      : '<span style="color:var(--dim)">—</span>';
+    $('#arStats').innerHTML =
+      `stored: <b>${stats.stored}</b>  ·  uploaded this session: <b>${stats.arweaveWritten}</b>  ·  failed: <b>${stats.arweaveFailed}</b>  ·  last: ${arAgo}<br>latest tx: ${txHtml}`;
   } else {
-    $('#memStats').textContent = '';
+    $('#arStats').textContent = '';
   }
 }
 
@@ -486,14 +488,14 @@ async function refreshMemoryStats(){
     renderMemory(j);
   }catch(e){}
 }
-setInterval(() => { if(cfg.memoryEnabled) refreshMemoryStats(); }, 5000);
+setInterval(() => { if(cfg.arweaveEnabled) refreshMemoryStats(); }, 5000);
 
-$('#memToggle').onclick = async () => {
-  cfg.memoryEnabled = !cfg.memoryEnabled;
+$('#arToggle').onclick = async () => {
+  cfg.arweaveEnabled = !cfg.arweaveEnabled;
   renderMemory();
   await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({memoryEnabled: cfg.memoryEnabled})});
-  if(cfg.memoryEnabled) refreshMemoryStats();
+    body: JSON.stringify({arweaveEnabled: cfg.arweaveEnabled})});
+  if(cfg.arweaveEnabled) refreshMemoryStats();
 };
 
 function renderHeartbeat(){
@@ -767,7 +769,8 @@ static void handleConfigGet() {
   out += "\"heartbeatEnabled\":"    + String(devcfgHeartbeatEnabled() ? "true" : "false") + ",";
   out += "\"heartbeatPrompt\":\""   + hb                        + "\",";
   out += "\"heartbeatIntervalMin\":" + String(devcfgHeartbeatIntervalMin()) + ",";
-  out += "\"memoryEnabled\":"       + String(devcfgMemoryEnabled() ? "true" : "false");
+  out += "\"memoryEnabled\":"       + String(devcfgMemoryEnabled() ? "true" : "false") + ",";
+  out += "\"arweaveEnabled\":"      + String(devcfgArweaveEnabled() ? "true" : "false");
   out += "}";
   s_http.send(200, "application/json", out);
 }
@@ -813,23 +816,30 @@ static void handleConfigPost() {
     devcfgSetHeartbeatIntervalMin((uint32_t)doc["heartbeatIntervalMin"].as<int>());
   if (doc["memoryEnabled"].is<bool>())
     devcfgSetMemoryEnabled(doc["memoryEnabled"].as<bool>());
+  if (doc["arweaveEnabled"].is<bool>())
+    devcfgSetArweaveEnabled(doc["arweaveEnabled"].as<bool>());
   s_http.send(200, "application/json", "{\"ok\":true}");
 }
 
 static void handleMemoryGet() {
   MemoryStats st;
   memoryGetStats(st);
-  // Report uptime-of-last-write so the browser can display "X seconds ago".
-  uint32_t ageSec = (st.lastWriteMs == 0) ? 0
-                                          : ((millis() - st.lastWriteMs) / 1000);
+  // Report seconds-since-last-write so the browser can show "X seconds ago".
+  uint32_t memAge = (st.lastWriteMs  == 0) ? 0 : ((millis() - st.lastWriteMs)  / 1000);
+  uint32_t arAge  = (st.arweaveLastMs == 0) ? 0 : ((millis() - st.arweaveLastMs) / 1000);
   String out = "{";
-  out += "\"enabled\":"     + String(st.enabled   ? "true" : "false") + ",";
-  out += "\"keyReady\":"    + String(st.keyReady  ? "true" : "false") + ",";
-  out += "\"stored\":"      + String(st.stored)   + ",";
-  out += "\"pending\":"     + String(st.pending)  + ",";
-  out += "\"written\":"     + String(st.written)  + ",";
-  out += "\"failed\":"      + String(st.failed)   + ",";
-  out += "\"lastWriteMs\":" + String(ageSec);
+  out += "\"enabled\":"        + String(st.enabled        ? "true" : "false") + ",";
+  out += "\"keyReady\":"       + String(st.keyReady       ? "true" : "false") + ",";
+  out += "\"stored\":"         + String(st.stored)        + ",";
+  out += "\"pending\":"        + String(st.pending)       + ",";
+  out += "\"written\":"        + String(st.written)       + ",";
+  out += "\"failed\":"         + String(st.failed)        + ",";
+  out += "\"lastWriteMs\":"    + String(memAge)           + ",";
+  out += "\"arweaveEnabled\":" + String(st.arweaveEnabled ? "true" : "false") + ",";
+  out += "\"arweaveWritten\":" + String(st.arweaveWritten)+ ",";
+  out += "\"arweaveFailed\":"  + String(st.arweaveFailed) + ",";
+  out += "\"arweaveLastMs\":"  + String(arAge)            + ",";
+  out += "\"arweaveLastTxId\":\"" + st.arweaveLastTxId     + "\"";
   out += "}";
   s_http.send(200, "application/json", out);
 }

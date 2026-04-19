@@ -178,8 +178,11 @@ static void paintBluetooth() {
 }
 
 static void paintMemory() {
-  paintToggleRow(ROWS[R_MEM], devcfgMemoryEnabled());
-  s_lastMem = devcfgMemoryEnabled();
+  // "MEMORY" on the device now controls the Arweave archive — Irys is the
+  // unified storage backend. The legacy Solana-memo path is still in the
+  // codebase (toggleable via POST /config) but hidden from normal UI.
+  paintToggleRow(ROWS[R_MEM], devcfgArweaveEnabled());
+  s_lastMem = devcfgArweaveEnabled();
 }
 
 static void paintHeartbeat() {
@@ -294,7 +297,7 @@ static void handleInput() {
     }
     const Row &mem = ROWS[R_MEM];
     if (inRect(tx, ty, 0, mem.y, SCR_W, mem.h)) {
-      devcfgSetMemoryEnabled(!devcfgMemoryEnabled());
+      devcfgSetArweaveEnabled(!devcfgArweaveEnabled());
       return;
     }
     const Row &hb = ROWS[R_HB];
@@ -331,7 +334,7 @@ void settingsScreenTick() {
   if (ssid != s_lastSSID) paintWifi();
 
   if (devcfgBluetooth()     != s_lastBt)  paintBluetooth();
-  if (devcfgMemoryEnabled() != s_lastMem) paintMemory();
+  if (devcfgArweaveEnabled() != s_lastMem) paintMemory();
   if (devcfgHeartbeatEnabled() != s_lastHb) paintHeartbeat();
 
   if (devcfgVolume() != s_lastVol) {
