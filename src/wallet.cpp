@@ -1,6 +1,7 @@
 #include "wallet.h"
 #include "secrets.h"
 #include "base58.h"
+#include "netgate.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -8,6 +9,9 @@
 #include <Ed25519.h>   // rweather/Crypto
 #include <Preferences.h>
 #include <esp_system.h>    // esp_fill_random
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // NVS namespace + key for the persisted Phantom-style 64-byte secret.
 // Namespace stays inside the main "daemon" prefs so it survives across
@@ -29,6 +33,38 @@ static uint32_t                  s_lastRefreshMs = 0;
 // Cached associated-token-account for USDC — populated from the token
 // accounts RPC response so we don't have to derive it client-side.
 static String                    s_usdcAta;
+
+// Mutex guarding all mutable state above: s_tokens, s_usdcAta,
+// s_solBalance, s_pubkey, s_lastRefreshMs. Acquired by the background
+// wallet task on write, and by every public getter + walletContext()
+// on read. Lazy-initialised on first use so walletBegin() can lock
+// during its own NVS load.
+static SemaphoreHandle_t         s_stateMutex = nullptr;
+
+static void ensureStateMutex() {
+  if (!s_stateMutex) s_stateMutex = xSemaphoreCreateMutex();
+}
+
+// RAII scoped-lock. On construction it blocks (up to timeoutMs) for the
+// mutex; `ok()` tells you whether we actually got it. Releasing in the
+// destructor means every early-return path stays correct without
+// hand-written goto cleanup.
+class WalletLock {
+public:
+  explicit WalletLock(uint32_t timeoutMs = 1000) : held_(false) {
+    ensureStateMutex();
+    if (s_stateMutex &&
+        xSemaphoreTake(s_stateMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE) {
+      held_ = true;
+    }
+  }
+  ~WalletLock() {
+    if (held_ && s_stateMutex) xSemaphoreGive(s_stateMutex);
+  }
+  bool ok() const { return held_; }
+private:
+  bool held_;
+};
 
 // Common token-mint → symbol map so the AI can name big holdings by ticker
 // without us round-tripping metadata for every refresh. Add more as needed.
@@ -98,8 +134,11 @@ static bool loadSecretFromNvs(uint8_t outFull[64]) {
 
 // Apply a 64-byte secret to the module state: store bytes, derive the
 // public key + base58 address, flip s_ok. Shared by both the boot-load
-// and the regenerate flows.
+// and the regenerate flows. Locks s_stateMutex so a readers don't see
+// a half-updated pubkey / pubkeyBytes pair.
 static void applySecret(const uint8_t full[64]) {
+  WalletLock lk;
+  if (!lk.ok()) return;
   s_secretBytes.assign(full, full + 64);
   memcpy(s_pubkeyBytes, full + 32, 32);
   s_pubkey = base58Encode(full + 32, 32);
@@ -145,10 +184,15 @@ bool walletGenerateNew() {
   }
   // Reset derived state so balances / tokens / USDC ATA from the old
   // wallet don't leak into the new one's UI until the next refresh.
-  s_solBalance    = 0.0;
-  s_tokens.clear();
-  s_usdcAta       = "";
-  s_lastRefreshMs = 0;
+  {
+    WalletLock lk;
+    if (lk.ok()) {
+      s_solBalance    = 0.0;
+      s_tokens.clear();
+      s_usdcAta       = "";
+      s_lastRefreshMs = 0;
+    }
+  }
   applySecret(full);
   Serial.printf("wallet: regenerated — new address %s\n", s_pubkey.c_str());
   return true;
@@ -178,21 +222,43 @@ bool walletSign(const uint8_t *data, size_t len, uint8_t sigOut[64]) {
   return true;
 }
 
-String walletPubkey()                  { return s_pubkey; }
-double walletSolBalance()              { return s_solBalance; }
-const std::vector<TokenHolding> &walletTokens() { return s_tokens; }
+String walletPubkey() {
+  WalletLock lk;
+  return lk.ok() ? s_pubkey : String();
+}
+
+double walletSolBalance() {
+  WalletLock lk;
+  return lk.ok() ? s_solBalance : 0.0;
+}
+
+std::vector<TokenHolding> walletTokens() {
+  WalletLock lk;
+  if (!lk.ok()) return {};
+  return s_tokens;                            // copy out under lock
+}
+
+size_t walletTokenCount() {
+  WalletLock lk;
+  return lk.ok() ? s_tokens.size() : 0;
+}
 
 // ---- USDC helpers ---------------------------------------------------------
 static const char *USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 double walletUsdcAmount() {
+  WalletLock lk;
+  if (!lk.ok()) return 0.0;
   for (const TokenHolding &t : s_tokens) {
     if (t.mint == USDC_MINT) return t.amount;
   }
   return 0.0;
 }
 
-String walletUsdcAta() { return s_usdcAta; }
+String walletUsdcAta() {
+  WalletLock lk;
+  return lk.ok() ? s_usdcAta : String();
+}
 
 String walletUsdcDisplayString() {
   if (!s_ok) return String("");
@@ -242,6 +308,12 @@ static bool rpcCall(const String &payload, String &outBody) {
   constexpr uint32_t BACKOFF = 350;
 
   for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+    // Wallet refresh is Low priority — if the gate is busy (voice is
+    // fetching + LLM is thinking, e.g.) we skip this attempt and the
+    // next periodic refresh will pick it up.
+    NetGate gate("wallet", NetGate::Priority::Low);
+    if (!gate.ok()) continue;
+
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
@@ -271,18 +343,30 @@ static bool rpcCall(const String &payload, String &outBody) {
 // Refresh: getBalance + getTokenAccountsByOwner
 // ---------------------------------------------------------------------------
 static void refreshSolBalance() {
+  // Snapshot the pubkey under lock so we don't race a regenerate.
+  String pk;
+  { WalletLock lk; if (lk.ok()) pk = s_pubkey; }
+  if (pk.length() == 0) return;
+
   String payload = String("{\"jsonrpc\":\"2.0\",\"id\":1,"
                           "\"method\":\"getBalance\",\"params\":[\"") +
-                   s_pubkey + "\"]}";
+                   pk + "\"]}";
   String body;
   if (!rpcCall(payload, body)) return;
   JsonDocument doc;
   if (deserializeJson(doc, body) != DeserializationError::Ok) return;
   uint64_t lamports = doc["result"]["value"].as<uint64_t>();
-  s_solBalance = (double)lamports / 1e9;
+
+  WalletLock lk;
+  if (lk.ok()) s_solBalance = (double)lamports / 1e9;
 }
 
 static void refreshTokens() {
+  // Snapshot pubkey under lock.
+  String pk;
+  { WalletLock lk; if (lk.ok()) pk = s_pubkey; }
+  if (pk.length() == 0) return;
+
   // getTokenAccountsByOwner with the SPL token program filter returns every
   // token account the wallet holds, parsed so we don't have to decode the
   // 165-byte account ourselves.
@@ -290,7 +374,7 @@ static void refreshTokens() {
   String payload = String(
       "{\"jsonrpc\":\"2.0\",\"id\":1,"
       "\"method\":\"getTokenAccountsByOwner\",\"params\":[\"") +
-      s_pubkey + "\",{\"programId\":\"" + PGM + "\"},"
+      pk + "\",{\"programId\":\"" + PGM + "\"},"
       "{\"encoding\":\"jsonParsed\"}]}";
 
   String body;
@@ -300,7 +384,12 @@ static void refreshTokens() {
 
   std::vector<TokenHolding> next;
   JsonArray accounts = doc["result"]["value"].as<JsonArray>();
-  if (accounts.isNull()) { s_tokens.clear(); return; }
+  if (accounts.isNull()) {
+    // Empty list still needs to replace the stored one under lock.
+    WalletLock lk;
+    if (lk.ok()) { s_tokens.clear(); s_usdcAta = ""; }
+    return;
+  }
 
   String foundUsdcAta;
   for (JsonObject acct : accounts) {
@@ -326,7 +415,6 @@ static void refreshTokens() {
     h.decimals = dec;
     next.push_back(h);
   }
-  s_usdcAta = foundUsdcAta;
 
   // Keep the list short; top 10 by UI amount is plenty for a spoken AI.
   std::sort(next.begin(), next.end(),
@@ -334,16 +422,37 @@ static void refreshTokens() {
               return a.amount > b.amount;
             });
   if (next.size() > 10) next.resize(10);
-  s_tokens = std::move(next);
+
+  // Single atomic swap of both cached fields under lock. Any reader
+  // that was blocked on the mutex now sees the new fully-built state.
+  WalletLock lk;
+  if (lk.ok()) {
+    s_usdcAta = foundUsdcAta;
+    s_tokens  = std::move(next);
+  }
 }
 
 void walletRefresh() {
   if (!s_ok) return;
   refreshSolBalance();
   refreshTokens();
-  s_lastRefreshMs = millis();
+
+  double   sol;
+  size_t   nTok;
+  uint32_t ts = millis();
+  {
+    WalletLock lk;
+    if (lk.ok()) {
+      s_lastRefreshMs = ts;
+      sol  = s_solBalance;
+      nTok = s_tokens.size();
+    } else {
+      sol  = 0.0;
+      nTok = 0;
+    }
+  }
   Serial.printf("wallet: refresh done — %.4f SOL, %u token accounts\n",
-                s_solBalance, (unsigned)s_tokens.size());
+                sol, (unsigned)nTok);
 }
 
 // --- Background task --------------------------------------------------
@@ -382,29 +491,49 @@ static String shortAddr(const String &p) {
 }
 
 String walletContext(double solUsdPrice) {
-  if (!s_ok) {
+  // Snapshot everything we need under one lock so the string we build
+  // reflects a single consistent point in time. Copying a handful of
+  // Strings + a small vector out of shared state is cheap; holding the
+  // lock across the whole build would block the wallet refresh task
+  // longer than we need.
+  bool   ok;
+  String pubkey;
+  double sol;
+  std::vector<TokenHolding> tokens;
+  {
+    WalletLock lk;
+    if (!lk.ok()) {
+      return "(wallet: state locked — snapshot unavailable)";
+    }
+    ok     = s_ok;
+    pubkey = s_pubkey;
+    sol    = s_solBalance;
+    tokens = s_tokens;
+  }
+  if (!ok) {
     return "(No wallet key configured — Daemon has no holdings yet.)";
   }
+
   String out;
   out.reserve(256);
   out += "Your wallet address is ";
-  out += s_pubkey;
+  out += pubkey;
   out += " (Solana mainnet).\n";
   out += "Native SOL balance: ";
-  out += String(s_solBalance, 4);
+  out += String(sol, 4);
   if (solUsdPrice > 0) {
     char buf[32];
-    snprintf(buf, sizeof(buf), " (~$%.2f)", s_solBalance * solUsdPrice);
+    snprintf(buf, sizeof(buf), " (~$%.2f)", sol * solUsdPrice);
     out += buf;
   }
   out += ".\n";
-  if (s_tokens.empty()) {
+  if (tokens.empty()) {
     out += "SPL tokens: none.\n";
   } else {
     out += "SPL token holdings: ";
-    for (size_t i = 0; i < s_tokens.size(); ++i) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
       if (i) out += ", ";
-      const TokenHolding &t = s_tokens[i];
+      const TokenHolding &t = tokens[i];
       char buf[48];
       // Cut decimals so the spoken line doesn't drone long numbers.
       double a = t.amount;

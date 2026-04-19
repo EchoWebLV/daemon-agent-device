@@ -2,6 +2,7 @@
 #include "ai.h"
 #include "devcfg.h"
 #include "voice.h"
+#include "netgate.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -319,6 +320,12 @@ XPostResult xpostSubmit(const String &text) {
   escaped.replace("\r", "\\r");
   escaped.replace("\t", "\\t");
   String body = String("{\"text\":\"") + escaped + "\"}";
+
+  NetGate gate("xpost-api", NetGate::Priority::Normal);
+  if (!gate.ok()) {
+    r.error = "netgate timeout";
+    return r;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();                     // same policy as x402.cpp

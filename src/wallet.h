@@ -46,9 +46,15 @@ void walletRefresh();
 // Returns immediately, so the main loop never freezes during RPC calls.
 void walletRequestRefresh();
 
-// Most recent values from walletRefresh(). All read-only.
+// Most recent values from walletRefresh(). All are thread-safe snapshots:
+// the wallet task writes to internal state under a FreeRTOS mutex, and
+// these getters each take the same mutex + copy out the value. The
+// previous API exposed raw references into `s_tokens`, which crashed the
+// board when the wallet task re-assigned the vector mid-iteration on
+// another task (LLM worker / main loop / xpost worker).
 double walletSolBalance();
-const std::vector<TokenHolding> &walletTokens();
+std::vector<TokenHolding> walletTokens();   // returns a snapshot copy
+size_t   walletTokenCount();                // cheap under-lock size query
 uint32_t walletLastRefreshAgeMs();
 
 // Convenience: USDC balance (SPL token, mint EPjFWdd5...) and a short,

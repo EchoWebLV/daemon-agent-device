@@ -1,5 +1,6 @@
 #include "voice.h"
 #include "secrets.h"
+#include "netgate.h"
 
 #include <Audio.h>
 #include <WiFiClientSecure.h>
@@ -200,6 +201,14 @@ static bool fetchMp3ToFs(const String &text) {
   body += ELEVENLABS_MODEL;
   body += "\",\"voice_settings\":{\"stability\":0.45,\"similarity_boost\":0.8,"
           "\"style\":0.3,\"use_speaker_boost\":true}}";
+
+  // Voice is Critical priority — user is waiting to hear the reply, so
+  // we're willing to wait up to the default 10 s for a slot and heap.
+  NetGate gate("voice", NetGate::Priority::Critical);
+  if (!gate.ok()) {
+    Serial.println("voice: netgate refused — deferring TTS fetch");
+    return false;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();

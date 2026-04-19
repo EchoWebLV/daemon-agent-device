@@ -3,6 +3,7 @@
 #include "solana_tx.h"
 #include "base58.h"
 #include "secrets.h"
+#include "netgate.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -60,6 +61,12 @@ static bool rpcCall(const String &payload, String &outBody) {
   constexpr uint32_t BACKOFF  = 350;   // ms between tries (linear)
 
   for (int attempt = 0; attempt < MAX_TRIES; ++attempt) {
+    // x402 inner RPC calls happen inside the LLM request flow, so we
+    // inherit the LLM's Critical priority — don't starve a user-initiated
+    // chat on a transient heap dip.
+    NetGate gate("x402-rpc", NetGate::Priority::Critical);
+    if (!gate.ok()) continue;
+
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
@@ -291,6 +298,16 @@ static void doOneRequest(const char *method,
                          int    &outStatus,
                          String &outBody,
                          String &outPayReq) {
+  // x402 chat request — Critical priority (user's question is in flight).
+  // Use a longer timeout than the default because the gateway can take
+  // ~20 s for a single round.
+  NetGate gate("x402-req", NetGate::Priority::Critical, 20000);
+  if (!gate.ok()) {
+    outStatus = -1;
+    outBody   = "(netgate timeout)";
+    return;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;

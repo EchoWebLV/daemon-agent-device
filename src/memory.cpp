@@ -6,6 +6,7 @@
 #include "arweave.h"
 #include "voice.h"
 #include "secrets.h"
+#include "netgate.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -76,6 +77,14 @@ static String pickRpcUrl() {
 
 static bool rpcCall(const String &payload, String &outBody) {
   if (WiFi.status() != WL_CONNECTED) return false;
+
+  // Memory writes run on a dedicated task and already defer on
+  // voiceIsBusy elsewhere; the netgate adds a second layer of DRAM-floor
+  // protection so we never open a TLS handshake when mbedTLS would
+  // fail to allocate.
+  NetGate gate("memory-rpc", NetGate::Priority::Normal);
+  if (!gate.ok()) return false;
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;

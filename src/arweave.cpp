@@ -1,5 +1,6 @@
 #include "arweave.h"
 #include "wallet.h"
+#include "netgate.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -205,6 +206,12 @@ bool arweaveUpload(const uint8_t *data, size_t dataLen,
                 (unsigned)dataLen);
 
   // ---- 6. POST to Irys --------------------------------------------------
+  NetGate gate("arweave-upload", NetGate::Priority::Normal);
+  if (!gate.ok()) {
+    Serial.println("arweave: netgate refused upload — deferred");
+    return false;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();                          // Irys cert not pinned yet
   HTTPClient http;
@@ -259,6 +266,9 @@ bool arweaveUploadString(const String &data,
 // ---------------------------------------------------------------------------
 static bool httpsPost(const String &url, const String &contentType,
                       const String &body, String &outResponse, int &outCode) {
+  NetGate gate("arweave-post", NetGate::Priority::Normal);
+  if (!gate.ok()) { outCode = -2; return false; }
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -272,6 +282,9 @@ static bool httpsPost(const String &url, const String &contentType,
 }
 
 static bool httpsGet(const String &url, String &outResponse, int &outCode) {
+  NetGate gate("arweave-get", NetGate::Priority::Normal);
+  if (!gate.ok()) { outCode = -2; return false; }
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;

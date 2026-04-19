@@ -1,4 +1,5 @@
 #include "price.h"
+#include "netgate.h"
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -13,6 +14,12 @@ bool priceBegin() {
 
 void priceRefresh() {
   if (WiFi.status() != WL_CONNECTED) return;
+
+  // Price ticker is Low priority — if the gate refuses (heap tight or
+  // both TLS slots busy), we just skip this cycle and retry in 30 s.
+  NetGate gate("price", NetGate::Priority::Low);
+  if (!gate.ok()) return;
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;

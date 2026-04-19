@@ -308,7 +308,7 @@ void walletScreenDraw() {
 
   s_lastSolShown   = walletSolBalance();
   s_lastPriceShown = priceSOLUSD();
-  s_lastTokenCount = walletTokens().size();
+  s_lastTokenCount = walletTokenCount();
 }
 
 void walletScreenTick() {
@@ -318,20 +318,21 @@ void walletScreenTick() {
   if (now - s_lastTickMs < 200) return;       // ~5 Hz dynamic repaint
   s_lastTickMs = now;
 
-  bool balanceChanged =
-      (walletSolBalance() != s_lastSolShown) ||
-      (priceSOLUSD()      != s_lastPriceShown);
-  bool holdingsChanged =
-      (walletTokens().size() != s_lastTokenCount);
+  double sol  = walletSolBalance();
+  double px   = priceSOLUSD();
+  size_t nTok = walletTokenCount();           // cheap size-only query
+
+  bool balanceChanged  = (sol != s_lastSolShown) || (px != s_lastPriceShown);
+  bool holdingsChanged = (nTok != s_lastTokenCount);
 
   if (balanceChanged) {
     paintBalanceCard();
-    s_lastSolShown   = walletSolBalance();
-    s_lastPriceShown = priceSOLUSD();
+    s_lastSolShown   = sol;
+    s_lastPriceShown = px;
   }
   if (holdingsChanged) {
     paintHoldings();
-    s_lastTokenCount = walletTokens().size();
+    s_lastTokenCount = nTok;
   }
 
   // Always keep the status bar fresh (price ticker + indicator toggles)
