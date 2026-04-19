@@ -58,8 +58,16 @@ static uint32_t s_nextWalletMs = 0;
 // Heartbeat state. Tracks when the last scheduled prompt fired so we can
 // space repeat runs by `devcfgHeartbeatIntervalMin()` regardless of what
 // the user reconfigures in the middle of a cycle.
+//
+// `s_heartbeatPrimed` is the "have we ever observed a devcfg value" flag
+// so we can tell the difference between "user just toggled it on" (fire
+// immediately) and "the device booted with heartbeat already on from a
+// previous session" (wait a full interval). Without this, every reset
+// caused a heartbeat run within the first second of boot — exactly the
+// "heartbeat fires without me turning it on" symptom.
 static uint32_t s_lastHeartbeatMs = 0;
 static bool     s_heartbeatWasOn  = false;
+static bool     s_heartbeatPrimed = false;
 
 // ---------------------------------------------------------------------------
 // LLM worker task. Processes chat requests off the Arduino loop so the
@@ -394,28 +402,68 @@ static void maybeRefreshWallet() {
 // x402 pipeline so the wallet pays for it like any other chat turn.
 static void maybeFireHeartbeat() {
   if (!s_wifiOk || !s_voiceOk) return;
-  if (voiceIsSpeaking())       return;   // don't stomp on current reply
+  // voiceIsBusy() covers BOTH an in-flight TTS fetch and active playback.
+  // Checking only voiceIsSpeaking() would let heartbeat start a second
+  // x402 + TLS session while the voice worker is still downloading the
+  // previous reply, which easily peaks past the NetGate's 2-slot / 60 KB
+  // DRAM floor and crashes the board. s_llmBusy also guards the LLM
+  // worker path so we never queue a second chat turn on top of an
+  // unfinished one.
+  if (voiceIsBusy() || s_llmBusy) return;
+
+  // NVS reads are not free (mutex + partition access). We call this
+  // function every loop iteration (~60 Hz), so we cache the interval
+  // and prompt in RAM and only re-read them periodically. The web UI
+  // and settings screen only change these values rarely, so a 5 s
+  // staleness is invisible to the user but removes ~300 NVS hits/s
+  // when heartbeat is enabled.
+  static uint32_t s_hbCfgNextReloadMs = 0;
+  static uint32_t s_hbIntervalMs      = 60000;
+  static String   s_hbPrompt;
 
   bool on = devcfgHeartbeatEnabled();
+
+  // Prime the edge detector on the first call after boot: treat the
+  // current NVS value as the "previous" value and start the interval
+  // clock NOW, so a device that rebooted with heartbeat already on
+  // doesn't fire a phantom run within the first second of boot.
+  if (!s_heartbeatPrimed) {
+    s_heartbeatWasOn  = on;
+    s_lastHeartbeatMs = millis();
+    s_heartbeatPrimed = true;
+    s_hbCfgNextReloadMs = 0;   // force a cfg reload on first fire
+  }
+
   if (on && !s_heartbeatWasOn) {
-    // Just flipped on — fire immediately by pretending the last run was
-    // far enough in the past.
-    s_lastHeartbeatMs = 0;
+    // True user-initiated flip while the device was running — fire
+    // immediately by pretending the last run was far in the past, and
+    // reload the cached cfg in case the user changed the interval /
+    // prompt in the same UI visit.
+    s_lastHeartbeatMs   = 0;
+    s_hbCfgNextReloadMs = 0;
   }
   s_heartbeatWasOn = on;
   if (!on) return;
 
-  uint32_t intervalMs = devcfgHeartbeatIntervalMin() * 60000UL;
-  if (intervalMs < 60000UL) intervalMs = 60000UL;   // lower bound: 1 min
-  if (s_lastHeartbeatMs != 0 &&
-      (millis() - s_lastHeartbeatMs) < intervalMs) return;
+  if (millis() >= s_hbCfgNextReloadMs) {
+    s_hbIntervalMs = devcfgHeartbeatIntervalMin() * 60000UL;
+    if (s_hbIntervalMs < 60000UL) s_hbIntervalMs = 60000UL;   // 1 min floor
+    s_hbPrompt = devcfgHeartbeatPrompt();
+    s_hbPrompt.trim();
+    s_hbCfgNextReloadMs = millis() + 5000;
+  }
 
-  String prompt = devcfgHeartbeatPrompt();
-  prompt.trim();
+  if (s_lastHeartbeatMs != 0 &&
+      (millis() - s_lastHeartbeatMs) < s_hbIntervalMs) return;
+
+  String prompt = s_hbPrompt;
   if (prompt.length() == 0) return;
 
   Serial.printf(">> heartbeat: %s\n", prompt.c_str());
-  s_lastHeartbeatMs = millis();
+  // Use a non-zero millis() value even if clock is literally 0 at boot,
+  // so the interval-check logic never mistakes "just fired at t=0" for
+  // "never fired" and loops.
+  s_lastHeartbeatMs = millis() | 1UL;
 
   // Hand the heartbeat prompt to the LLM worker just like a normal chat
   // so the main loop keeps animating while Gemini thinks.
@@ -729,12 +777,13 @@ void loop() {
   // Drain any LLM replies the worker has finished while we were ticking.
   drainLlmReplies();
 
-  // Background tickers — only run when audio is quiet so we don't stutter
-  // mid-playback. Wallet/price fetches themselves now live on background
-  // tasks (see wallet.cpp / price.cpp) so these are just cheap triggers.
-  // Heartbeat runs the full chat pipeline (blocks for seconds) so we also
-  // gate it on not-currently-speaking.
-  if (!voiceIsSpeaking() && !s_llmBusy) {
+  // Background tickers — only run when BOTH the voice subsystem (fetch
+  // or playback) AND the LLM worker are idle, so we never stack a second
+  // heavyweight TLS session on top of a first one. Wallet/price fetches
+  // themselves now live on background tasks (see wallet.cpp / price.cpp)
+  // so these are just cheap triggers. Heartbeat + xpost each have their
+  // own internal gate on voiceIsBusy as a second line of defence.
+  if (!voiceIsBusy() && !s_llmBusy) {
     maybeRefreshPrice();
     maybeRefreshWallet();
     maybeFireHeartbeat();

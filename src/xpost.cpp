@@ -477,7 +477,11 @@ void xpostSchedulerTick() {
   if (!devcfgXPostEnabled())          return;
   if (!devcfgXCredentialsPresent())   return;
   if (WiFi.status() != WL_CONNECTED)  return;
-  if (voiceIsSpeaking())              return;   // share rule w/ heartbeat
+  // voiceIsBusy() covers BOTH fetch-in-progress and active playback. If
+  // we only gated on voiceIsSpeaking() the scheduler could kick off a
+  // TLS-heavy aiAskOneShot while the voice worker is mid-download, which
+  // pushes the ESP32-S3 past its concurrent-TLS budget and crashes.
+  if (voiceIsBusy())                  return;   // share rule w/ heartbeat
   if (s_xpBusy)                       return;   // previous run still in flight
 
   uint32_t intervalMs = devcfgXPostIntervalMin() * 60000UL;

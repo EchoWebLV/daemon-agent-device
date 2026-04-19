@@ -12,6 +12,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 // ---------------------------------------------------------------------------
 // I2S pins (PCM5101 on the Waveshare 2.8")
@@ -47,6 +48,28 @@ static TaskHandle_t s_fetchTask  = nullptr;
 static QueueHandle_t s_speakQueue = nullptr;
 static volatile bool s_ready     = false;
 static volatile bool s_playing   = false;
+
+// Mutex around every `s_audio->xxx()` call. The Audio object is mutated
+// by three separate tasks (audioTaskEntry on core 0 pumping loop(),
+// fetchTaskEntry on core 1 calling connecttoFS(), and the main Arduino
+// loop calling isRunning() / stopSong() / setVolume()), and the library
+// is NOT internally thread-safe. Observed symptom without this mutex:
+// intermittent LittleFS `lfs_mlist_isopen` assert + reset at the moment
+// a new reply begins playing, because connecttoFS() is mid-file-swap
+// while audioTaskEntry is inside decoder code that reads the same FD.
+static SemaphoreHandle_t s_audioMutex = nullptr;
+
+struct AudioLock {
+  bool held_;
+  explicit AudioLock(uint32_t timeoutMs = portMAX_DELAY) : held_(false) {
+    if (!s_audioMutex) return;
+    held_ = (xSemaphoreTake(s_audioMutex,
+                            timeoutMs == portMAX_DELAY
+                              ? portMAX_DELAY
+                              : pdMS_TO_TICKS(timeoutMs)) == pdTRUE);
+  }
+  ~AudioLock() { if (held_ && s_audioMutex) xSemaphoreGive(s_audioMutex); }
+};
 // True while the fetch task holds a TLS session to ElevenLabs and/or is
 // writing to LittleFS. Flipped on at dequeue, off after connecttoFS
 // completes (whether or not the fetch succeeded).
@@ -141,8 +164,16 @@ static void beepTone(uint16_t freq, uint16_t durationMs, int16_t amp) {
 // ---------------------------------------------------------------------------
 static void audioTaskEntry(void *) {
   for (;;) {
-    if (s_audio) s_audio->loop();
-    if (s_playing && s_audio && !s_audio->isRunning()) s_playing = false;
+    // Hold the mutex only for the duration of one decoder tick. If a
+    // connecttoFS() swap is in flight on core 1 we wait up to 50 ms for
+    // it, then yield so the idle task still runs even under contention.
+    {
+      AudioLock lk(50);
+      if (lk.held_ && s_audio) {
+        s_audio->loop();
+        if (s_playing && !s_audio->isRunning()) s_playing = false;
+      }
+    }
     vTaskDelay(1);
   }
 }
@@ -226,23 +257,31 @@ static void fetchTaskEntry(void *) {
 
     if (!okFetch) { s_fetching = false; continue; }
 
-    // Clean up the stale other-codec file in this slot so flash doesn't
-    // slowly accumulate orphaned /tts_*.mp3 and /tts_*.wav pairs.
-    String stale = chosenPath.endsWith(".wav")
-                     ? String("/tts_") + slotChar + ".mp3"
-                     : String("/tts_") + slotChar + ".wav";
-    if (LittleFS.exists(stale)) LittleFS.remove(stale);
-
     uint32_t tFetched = millis();
 
     // Fetch succeeded — hand the new file to the decoder. connecttoFS
     // internally stops the current song and closes its file handle, so
-    // we don't need the old stopSong-then-wait dance anymore.
-    bool ok = s_audio->connecttoFS(LittleFS, chosenPath.c_str());
+    // we don't need the old stopSong-then-wait dance anymore. Hold the
+    // Audio mutex so the core-0 audio task doesn't pump loop() on a
+    // decoder that's mid-re-initialisation.
+    bool ok;
+    {
+      AudioLock lk;   // blocks until the audio task releases its tick
+      ok = s_audio->connecttoFS(LittleFS, chosenPath.c_str());
+    }
     if (ok) {
       s_slotPath[target] = chosenPath;
       s_playbackIdx      = target;
       s_fetchIdx         = 1 - target;
+
+      // Only AFTER the decoder has successfully picked up the new file
+      // do we remove the stale other-codec file in this slot. Doing
+      // this before connecttoFS risked deleting the only copy if
+      // connecttoFS then failed.
+      String stale = chosenPath.endsWith(".wav")
+                       ? String("/tts_") + slotChar + ".mp3"
+                       : String("/tts_") + slotChar + ".wav";
+      if (LittleFS.exists(stale)) LittleFS.remove(stale);
     }
     s_playing  = ok;
     s_fetching = false;
@@ -468,6 +507,14 @@ bool voiceBegin() {
     return false;
   }
 
+  // Create the Audio mutex BEFORE we spawn the audio task or the fetch
+  // task — both take it on every iteration.
+  if (!s_audioMutex) s_audioMutex = xSemaphoreCreateMutex();
+  if (!s_audioMutex) {
+    Serial.println("voice: audio mutex alloc FAILED");
+    return false;
+  }
+
   s_audio = new Audio(/*internalDAC=*/false);
   s_audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
   s_audio->setVolume(21);
@@ -504,7 +551,14 @@ bool voiceBegin() {
 }
 
 void voiceLoop() {
-  if (s_playing && s_audio && !s_audio->isRunning()) s_playing = false;
+  // Same mutex as audioTaskEntry — isRunning() reads decoder state that
+  // connecttoFS() may be mid-writing. Short 5 ms wait keeps the main
+  // Arduino loop snappy; if we can't grab the lock right now, the audio
+  // task will update s_playing on its next tick anyway.
+  AudioLock lk(5);
+  if (lk.held_ && s_playing && s_audio && !s_audio->isRunning()) {
+    s_playing = false;
+  }
 }
 
 bool voiceSpeak(const String &text) {
@@ -525,19 +579,31 @@ bool voiceSpeak(const String &text) {
     SpeakJob drop;
     xQueueReceive(s_speakQueue, &drop, 0);
   }
-  // Flip busy BEFORE the send so any background task checking
-  // voiceIsBusy() right after this call sees the pending work and
-  // doesn't race us into mbedTLS OOM.
-  s_fetching = true;
-  bool queued = (xQueueSend(s_speakQueue, &job, 0) == pdTRUE);
-  if (!queued) s_fetching = false;
-  return queued;
+  // Do NOT set s_fetching from the caller's thread. Previous code flipped
+  // it true here and false on queue failure, which could race with the
+  // worker task's own ownership of the flag and clear it while a TLS
+  // session was still live. voiceIsBusy() below now looks at queue depth
+  // directly, so heartbeat / xpost / memory still see the pending work
+  // immediately without us touching the worker's state.
+  return xQueueSend(s_speakQueue, &job, 0) == pdTRUE;
 }
 
 bool voiceIsSpeaking() { return s_playing; }
-bool voiceIsBusy()     { return s_fetching || s_playing; }
+bool voiceIsBusy() {
+  // "Busy" = anything that means the voice subsystem is currently
+  // consuming TLS / HTTPS / LittleFS / I2S resources, so other heavy
+  // network tasks know to back off.
+  //   * s_fetching — worker is mid-HTTP or mid-LittleFS write
+  //   * s_playing  — decoder is pumping audio
+  //   * queue>0    — a new utterance is queued but the worker hasn't
+  //                  picked it up yet (e.g. still finishing last run)
+  if (s_fetching || s_playing) return true;
+  if (s_speakQueue && uxQueueMessagesWaiting(s_speakQueue) > 0) return true;
+  return false;
+}
 
 void voiceStop() {
+  AudioLock lk;
   if (s_audio && s_audio->isRunning()) s_audio->stopSong();
   s_playing = false;
 }
@@ -546,6 +612,7 @@ void voiceDiagnose() { /* no-op now */ }
 
 void voiceSetVolume(uint8_t v) {
   if (v > 21) v = 21;
+  AudioLock lk;
   if (s_audio) s_audio->setVolume(v);
 }
 

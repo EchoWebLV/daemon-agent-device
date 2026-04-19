@@ -454,53 +454,39 @@ static X402Result x402Request(const char  *method,
   }
 
   // ── Pass 3: retry with the PAYMENT-SIGNATURE header. Fresh TLS client,
-  //     previous payment-build clients already gone. Same retry wrap so
-  //     transient gateway failures don't waste an x402 payment.
+  //     previous payment-build clients already gone. `doOneRequestWithRetry`
+  //     still absorbs transient TCP / TLS / gateway flakes (network
+  //     errors, 5xx, 429) at the HTTP layer — those retries are safe
+  //     because they never re-sign a new Solana transaction.
   //
-  //     On a 402 here the facilitator rejected our signed Solana
-  //     transaction — most often because the blockhash expired or the
-  //     Solana RPC was slow to confirm. We get ONE more shot with a
-  //     completely fresh payment envelope (new blockhash, new signature)
-  //     before giving up, which turns the common intermittent
-  //     "couldn't complete USDC payment" into a transparent recovery.
-  //     Two payments in flight are never an issue because each carries
-  //     a different blockhash-based signature, so Solana treats them
-  //     as distinct — and we only ever call once if the first succeeds.
+  //     We deliberately do NOT rebuild a fresh payment envelope on a 402
+  //     here. A 402 after we've already sent our PAYMENT-SIGNATURE means
+  //     the facilitator saw our signed tx but didn't confirm it in time.
+  //     The tx may or may not have landed on-chain. Re-signing with a
+  //     new blockhash produces an independently-valid second USDC
+  //     transfer — Solana has no idempotency for SPL transfers, so both
+  //     can settle and the user silently pays 2×. We surface the 402 to
+  //     the caller instead and log enough context to diagnose.
   // ──
-  constexpr int PAYMENT_RETRY_COUNT = 2;   // 1 initial + 1 fresh rebuild
   int    code2 = -1;
   String body2;
   String payReq2;
-  for (int attempt = 0; attempt < PAYMENT_RETRY_COUNT; ++attempt) {
-    if (attempt > 0) {
-      Serial.println("x402: first payment bounced — rebuilding with a fresh blockhash");
-      paymentHeader = buildPaymentPayload(pr, url, &amountStr);
-      if (paymentHeader.length() == 0) {
-        Serial.println("x402: rebuild failed, giving up");
-        break;
-      }
-    }
-    code2 = -1;
-    body2 = String();
-    payReq2 = String();
-    doOneRequestWithRetry(method, url, jsonBody, authBearer, paymentHeader,
-                          code2, body2, payReq2);
-    if (code2 != 402) break;                 // success OR hard error
-  }
+  doOneRequestWithRetry(method, url, jsonBody, authBearer, paymentHeader,
+                        code2, body2, payReq2);
 
   r.status = code2;
   r.body   = body2;
   if (code2 == 200) {
     r.costUsd = amountStr.toDouble() / 1e6;
   } else {
-    r.error = "retry status " + String(code2);
+    r.error = "payment status " + String(code2);
     // Log the first ~500 chars of the body so we can see WHY the
     // facilitator rejected our signed tx (expired blockhash, wrong
     // recipient ATA, insufficient USDC, etc.). Without this every
-    // payment failure just surfaces as a vague "retry status 402".
+    // payment failure just surfaces as a vague "status 402".
     String snippet = body2.length() > 500 ? body2.substring(0, 500) + "…"
                                           : body2;
-    Serial.printf("x402: retry %d body=%s\n", code2, snippet.c_str());
+    Serial.printf("x402: payment %d body=%s\n", code2, snippet.c_str());
     Serial.printf("x402: amount=%s source_ata=%s\n",
                   amountStr.c_str(), walletUsdcAta().c_str());
   }
