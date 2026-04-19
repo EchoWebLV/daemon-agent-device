@@ -530,6 +530,16 @@ void setup() {
   devcfgBegin();
   creatureSetFaceStyle(devcfgFaceStyle());
 
+  // TEMP: force-pin Wi-Fi to "yordan iphone" for the current bring-up.
+  // Only writes to NVS if the stored creds differ, so the UI can still
+  // override by saving a different SSID after boot. Delete this block
+  // once a real Wi-Fi has been picked from the settings screen.
+  if (devcfgWifiSSID() != "yordan iphone" ||
+      devcfgWifiPassword() != "12345678") {
+    devcfgSetWifi("yordan iphone", "12345678");
+    Serial.println("wifi: pinned creds -> 'yordan iphone' (temp override)");
+  }
+
   // Wi-Fi + web server. These are best-effort; creature still animates
   // without them. That lets you iterate on the drawing without a network.
   creatureSetStatus("JOINING WIFI");

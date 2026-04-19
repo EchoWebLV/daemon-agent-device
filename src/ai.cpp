@@ -236,7 +236,7 @@ bool aiAsk(const String &userText, String &outReply) {
   seedWorkingMessages(working);
 
   String reply;
-  bool ok = runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.9f, reply);
+  bool ok = runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.7f, reply);
   if (!ok) {
     s_histLen--;              // roll back the pending user turn
     outReply = reply;
@@ -277,5 +277,5 @@ bool aiAskOneShot(const String &prompt, String &outReply) {
   usr["role"]    = "user";
   usr["content"] = prompt;
 
-  return runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 1.1f, outReply);
+  return runChatLoop(working, /*maxTokens=*/ 512, /*temp=*/ 0.7f, outReply);
 }

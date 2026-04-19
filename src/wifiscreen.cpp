@@ -61,6 +61,7 @@ static bool   s_resultOk = false;
 // helpers like goBackOneStep() can reference them.
 static bool     s_scanInFlight;
 static uint32_t s_scanStartMs;
+static uint8_t  s_scanAttempt = 0;   // 0 = first pass, 1 = one auto-retry
 
 // ---------------------------------------------------------------------------
 // Utility
@@ -166,9 +167,26 @@ static void goBackOneStep() {
 // (Storage declared above near the other state variables.)
 // ---------------------------------------------------------------------------
 static void kickScan() {
-  // WiFi.scanNetworks(async=true) returns immediately; we poll scanComplete.
+  // Important: do NOT power-cycle the radio here. An earlier version called
+  // WiFi.disconnect(true, ...) which sets wifioff=true, shutting the radio
+  // down; the subsequent 80 ms delay wasn't enough for it to come back up,
+  // and scanNetworks() returned 0 results (looked like "no APs around").
+  //
+  // If we're mid-connect or auto-reconnecting, gently halt that *without*
+  // turning the radio off, then scan in STA mode. Scanning while already
+  // associated is also fine on ESP32, so we leave an existing link alone.
   WiFi.scanDelete();
-  WiFi.scanNetworks(true);
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(/*wifioff=*/false, /*eraseap=*/false);
+  }
+  WiFi.mode(WIFI_STA);
+
+  // show_hidden=true, passive=false, max_ms_per_chan default — works best
+  // for catching all 2.4 GHz APs in a single pass.
+  int kicked = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
+  Serial.printf("wifi: kickScan -> %d (status=%d)\n",
+                kicked, (int)WiFi.status());
   s_scanInFlight = true;
   s_scanStartMs  = millis();
 }
@@ -598,12 +616,16 @@ void wifiScreenEnter() {
     WiFi.scanDelete();
     s_scanInFlight = false;
   }
+  s_scanAttempt = 0;
   Serial.println("wifi: enter (MODE_SCANNING, fresh state)");
 }
 
 bool wifiScreenConsumeExit() {
   if (!s_wantExit) return false;
   s_wantExit = false;
+  // kickScan() disables auto-reconnect so its scan actually returns APs;
+  // restore it on the way out so a dropped link heals itself normally.
+  WiFi.setAutoReconnect(true);
   return true;
 }
 
@@ -642,13 +664,34 @@ void wifiScreenTick() {
 
       int res = WiFi.scanComplete();
       if (res >= 0) {
+        Serial.printf("wifi: scanComplete=%d (attempt %u)\n",
+                      res, (unsigned)s_scanAttempt);
+        // On ESP32 the first scan after a mode flip occasionally completes
+        // with zero APs even when they're clearly around. Give it exactly
+        // one automatic retry before dropping the user into an empty list.
+        if (res == 0 && s_scanAttempt == 0) {
+          WiFi.scanDelete();
+          s_scanInFlight = false;
+          s_scanAttempt  = 1;
+          kickScan();
+          break;
+        }
         ingestScanResults(res);
         s_scanInFlight = false;
+        s_scanAttempt  = 0;
         s_mode = MODE_LIST;
         s_needFullDraw = true;
       } else if (res == WIFI_SCAN_FAILED) {
-        Serial.println("wifi scan failed");
+        Serial.printf("wifi: scan failed (attempt %u)\n",
+                      (unsigned)s_scanAttempt);
+        if (s_scanAttempt == 0) {
+          s_scanInFlight = false;
+          s_scanAttempt  = 1;
+          kickScan();
+          break;
+        }
         s_scanInFlight = false;
+        s_scanAttempt  = 0;
         s_mode = MODE_LIST;
         s_needFullDraw = true;
       } else if (millis() - s_scanStartMs > 20000) {
@@ -656,6 +699,7 @@ void wifiScreenTick() {
         Serial.println("wifi scan timed out");
         WiFi.scanDelete();
         s_scanInFlight = false;
+        s_scanAttempt  = 0;
         s_mode = MODE_LIST;
         s_needFullDraw = true;
       }
