@@ -488,6 +488,10 @@ void loop() {
       int dir = (sw == SWIPE_RIGHT) ? 1 : -1;
       uint8_t next = (uint8_t)((creatureFaceStyle() + DEVCFG_FACE_COUNT + dir)
                                % DEVCFG_FACE_COUNT);
+      static const char *kFaceNames[] = { "Daemon", "Robot", "ToyRobot", "Calc" };
+      Serial.printf("face: swipe %s -> %u (%s)\n",
+                    (sw == SWIPE_RIGHT) ? "right" : "left",
+                    (unsigned)next, kFaceNames[next]);
       creatureSetFaceStyle(next);
       devcfgSetFaceStyle(next);
       creatureRepaint();

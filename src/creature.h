@@ -57,7 +57,7 @@ void creatureSetSubtitle(const String &text);
 // Face style selector.
 //   0 = Daemon     (default neon almond eyes)
 //   1 = Robot      (round glowing eyes with a pupil)
-//   2 = Pixel      (chunky 8-bit sprite)
+//   2 = Toy Robot  (blue chassis + red antenna + grille mouth)
 //   3 = Calculator (= | 7-segment LCD look)
 // Values outside 0..3 are clamped. Triggers a full face repaint.
 void creatureSetFaceStyle(uint8_t style);

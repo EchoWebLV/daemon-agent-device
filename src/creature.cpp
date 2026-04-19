@@ -58,7 +58,7 @@ static TFT_eSPI    *s_tft       = nullptr;
 static TFT_eSprite *s_faceBuf   = nullptr;   // per-frame double buffer
 static CreatureMood s_mood      = MOOD_IDLE;
 static bool         s_talking   = false;
-static uint8_t      s_faceStyle = 0;         // 0=Daemon, 1=Robot, 2=Pixel
+static uint8_t      s_faceStyle = 0;         // 0=Daemon, 1=Robot, 2=ToyBot, 3=Calc
 static uint32_t     s_lastTickMs = 0;
 static uint32_t     s_lastBlinkMs = 0;
 static uint32_t     s_blinkStartMs = 0;
@@ -288,62 +288,166 @@ static void drawMouthRobot(TFT_eSprite *s, float openness, CreatureMood mood,
 }
 
 // ---------------------------------------------------------------------------
-// FACE STYLE 2 — PIXEL
-// Chunky 8-bit style. Each "pixel" is a PIX px square block so the whole
-// face reads as a low-res sprite. Eyes are hollow-squares with a solid
-// iris; the mouth is a stepped bar that grows in block increments.
+// FACE STYLE 2 — TOY ROBOT
+// Cute squarish blue robot head with a glowing red antenna bulb, diagonal
+// shine stripes, four corner rivets, two round red eyes with black pupils,
+// and a yellow speaker-grille mouth that animates when talking.
+//
+// Drawn in three layers: head chassis (frame + antenna + rivets + shine),
+// then eyes, then mouth — so the animated features sit on top of the
+// static chassis.
 // ---------------------------------------------------------------------------
-static void drawEyePixel(TFT_eSprite *s, int cxScreen, int cyScreen,
-                         float /*pulse*/, float blinkT, CreatureMood mood) {
-  int cx = cxScreen - FACE_X;
-  int cy = cyScreen - FACE_Y;
+static constexpr uint16_t C_TR_BODY     = 0x5DDB;   // light cyan-blue fill
+static constexpr uint16_t C_TR_SHINE    = 0xC75F;   // pale cyan sheen stripe
+static constexpr uint16_t C_TR_RIM      = 0x1B6D;   // darker blue rim / rivets
+static constexpr uint16_t C_TR_EYE      = 0xF800;   // red eye
+static constexpr uint16_t C_TR_EYE_DK   = 0x9800;   // dark red eye rim
+static constexpr uint16_t C_TR_EYE_HL   = 0xFFFF;   // eye highlight speckle
+static constexpr uint16_t C_TR_PUPIL    = 0x0000;   // black pupil
+static constexpr uint16_t C_TR_MOUTH_BG = 0xFCE0;   // orange-yellow fill
+static constexpr uint16_t C_TR_MOUTH_BAR= 0x2965;   // dark grille bars
+static constexpr uint16_t C_TR_ANT_BULB = 0xF800;
+static constexpr uint16_t C_TR_ANT_DK   = 0x9800;
+static constexpr uint16_t C_TR_STALK    = 0xA514;   // light grey stalk
+static constexpr uint16_t C_TR_SPARK    = 0xFFFF;   // motion / "on" lines
 
-  const int PIX    = 6;                  // chunky block size
-  const int cols   = 7;                  // 7×7 grid → 42×42 px eye
-  const int rows   = 7;
-  uint16_t col = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_ACCENT;
-  uint16_t core = (mood == MOOD_ANGRY) ? C_GLOW_ANG : C_CORE;
+// Head geometry in sprite coordinates. Sprite origin (0,0) == screen
+// (FACE_X, FACE_Y). The head encloses both eyes (sprite cy≈85) and the
+// mouth (sprite cy≈155) with room above for the antenna.
+static constexpr int TR_HEAD_CX = 120;
+static constexpr int TR_HEAD_CY = 122;
+static constexpr int TR_HEAD_W  = 178;
+static constexpr int TR_HEAD_H  = 158;
+static constexpr int TR_HEAD_R  = 20;
 
-  // Closed-eye pattern: just the middle row. Lets us blink cheaply.
-  bool closing = false;
-  int  closedRows = 0;
-  if (blinkT >= 0.0f) {
-    float c = 0.5f * (1.0f - cosf(blinkT * 2.0f * (float)PI));
-    closing = true;
-    closedRows = (int)roundf(c * 3.0f);       // 0..3 rows peeled off top+bot
-  }
+static void drawHeadToyRobot(TFT_eSprite *s, int bobDY, CreatureMood mood,
+                             float pulse) {
+  const int cx = TR_HEAD_CX;
+  const int cy = TR_HEAD_CY + bobDY;
+  const int hx = cx - TR_HEAD_W / 2;
+  const int hy = cy - TR_HEAD_H / 2;
 
-  for (int ry = 0; ry < rows; ++ry) {
-    if (closing && (ry < closedRows || ry >= rows - closedRows)) continue;
-    for (int rx = 0; rx < cols; ++rx) {
-      bool on = false;
-      // Outline ring
-      bool border = (rx == 0 || rx == cols - 1 || ry == 0 || ry == rows - 1);
-      bool corner = (border && ((rx == 0 || rx == cols - 1) &&
-                                (ry == 0 || ry == rows - 1)));
-      if (border && !corner) on = true;
-      // Iris block (3×3 in the middle)
-      bool iris = (rx >= 2 && rx <= 4 && ry >= 2 && ry <= 4);
-      // Pupil centre
-      bool pupil = (rx == 3 && ry == 3);
+  // ── Antenna ──
+  // Stalk rises from the top-centre of the head. Bulb pulses ±2 px with
+  // the idle breathing so the robot reads as powered-on.
+  const int stalkTop = hy - 20;
+  const int stalkBot = hy + 1;
+  s->drawFastVLine(cx,     stalkTop, stalkBot - stalkTop, C_TR_STALK);
+  s->drawFastVLine(cx + 1, stalkTop, stalkBot - stalkTop, C_TR_STALK);
 
-      int px = cx + (rx - cols / 2) * PIX;
-      int py = cy + (ry - rows / 2) * PIX;
+  int bulbR = 7 + (int)(1.5f * (pulse > 0.0f ? pulse : 0.0f));
+  int bulbCy = stalkTop - bulbR - 1;
+  s->fillCircle(cx, bulbCy, bulbR + 1, C_TR_ANT_DK);
+  s->fillCircle(cx, bulbCy, bulbR,     C_TR_ANT_BULB);
+  s->fillCircle(cx - 2, bulbCy - 2, 2, C_TR_EYE_HL);   // shiny speck
 
-      if (on)    s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, col);
-      if (iris)  s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, col);
-      if (pupil) s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, core);
+  // Sparkle starburst around the bulb (6 radial ticks). Hidden when
+  // angry; otherwise always on so the antenna always looks "live".
+  if (mood != MOOD_ANGRY) {
+    const int N = 6;
+    for (int i = 0; i < N; ++i) {
+      float a = (float)i * (2.0f * (float)PI / (float)N) - 0.5f * (float)PI;
+      int r0 = bulbR + 4;
+      int r1 = bulbR + ((i % 2 == 0) ? 10 : 7);
+      int x0 = cx + (int)(cosf(a) * r0);
+      int y0 = bulbCy + (int)(sinf(a) * r0);
+      int x1 = cx + (int)(cosf(a) * r1);
+      int y1 = bulbCy + (int)(sinf(a) * r1);
+      s->drawLine(x0, y0, x1, y1, C_TR_SPARK);
     }
   }
 
-  // Tiny shadow drop a block to the right+down of the outline — gives a
-  // subtle 3D feel without going full isometric.
-  for (int rx = 1; rx < cols; ++rx) {
-    int px = cx + (rx - cols / 2) * PIX;
-    int py = cy + (rows / 2 + 1) * PIX;
-    if (!closing || closedRows < 3)
-      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, 2, C_HALO_1);
+  // ── Head body ──
+  // 2-px darker rim drawn behind the body fill for an outline effect
+  // against the black background (we can't use a black outline — that's
+  // the sprite bg colour).
+  s->fillRoundRect(hx - 2, hy - 2, TR_HEAD_W + 4, TR_HEAD_H + 4,
+                   TR_HEAD_R + 2, C_TR_RIM);
+  s->fillRoundRect(hx,     hy,     TR_HEAD_W,     TR_HEAD_H,
+                   TR_HEAD_R,      C_TR_BODY);
+
+  // Diagonal shine stripes. Each scanline draws a horizontal band whose
+  // x-offset slides with y so the whole band reads as a parallelogram
+  // tilted right. Clipped to a rounded rect so it respects the head shape.
+  auto drawStripe = [&](int startX, int w) {
+    for (int dy = 0; dy < TR_HEAD_H; ++dy) {
+      int y = hy + dy;
+      int xs = hx + startX + dy / 2;
+      int xe = xs + w;
+      int edgeDist = min(dy, TR_HEAD_H - 1 - dy);
+      int inset = (edgeDist < TR_HEAD_R)
+                  ? (int)(TR_HEAD_R - sqrtf((float)(TR_HEAD_R * TR_HEAD_R) -
+                                            (float)((TR_HEAD_R - edgeDist) *
+                                                    (TR_HEAD_R - edgeDist))))
+                  : 0;
+      int clipL = hx + inset;
+      int clipR = hx + TR_HEAD_W - inset;
+      if (xs < clipL) xs = clipL;
+      if (xe > clipR) xe = clipR;
+      if (xe > xs) s->drawFastHLine(xs, y, xe - xs, C_TR_SHINE);
+    }
+  };
+  drawStripe(34, 18);
+  drawStripe(96, 10);
+
+  // ── Rivets at each corner ──
+  const int rvIn = 14;
+  const int rvs[4][2] = {
+    { hx + rvIn,              hy + rvIn              },
+    { hx + TR_HEAD_W - rvIn,  hy + rvIn              },
+    { hx + rvIn,              hy + TR_HEAD_H - rvIn  },
+    { hx + TR_HEAD_W - rvIn,  hy + TR_HEAD_H - rvIn  },
+  };
+  for (const auto &r : rvs) {
+    s->fillCircle(r[0], r[1], 3, C_TR_RIM);
+    s->drawPixel(r[0] - 1, r[1] - 1, C_TR_EYE_HL);
   }
+}
+
+static void drawEyeToyRobot(TFT_eSprite *s, int cxScreen, int cyScreen,
+                            float pulse, float blinkT, CreatureMood mood) {
+  int cx = cxScreen - FACE_X;
+  int cy = cyScreen - FACE_Y;
+
+  int r = 15 + (int)(1.0f * pulse);
+  if (mood == MOOD_LISTEN) r += 2;
+  if (mood == MOOD_THINK)  r -= 1;
+
+  uint16_t col   = (mood == MOOD_ANGRY) ? 0xFB40 : C_TR_EYE;
+  uint16_t colDk = C_TR_EYE_DK;
+
+  // Happy → curved squinty arc of red dots, like a smile for the eyes.
+  if (mood == MOOD_HAPPY) {
+    for (int dx = -12; dx <= 12; ++dx) {
+      int yy = cy + 3 - (int)((144 - dx * dx) / 28);
+      s->fillCircle(cx + dx, yy, 3, col);
+    }
+    return;
+  }
+
+  // Blink — squash vertically. Near full closure we render a thin red
+  // slit (eyelid closing on a glow) rather than a dot.
+  if (blinkT >= 0.0f) {
+    float c = 0.5f * (1.0f - cosf(blinkT * 2.0f * (float)PI));
+    float closure = 1.0f - c;
+    int rh = max(1, (int)(r * (0.1f + 0.9f * closure)));
+    for (int dy = -rh; dy <= rh; ++dy) {
+      float t = (float)dy / (float)rh;
+      int dx = (int)(r * sqrtf(max(0.0f, 1.0f - t * t)));
+      s->drawFastHLine(cx - dx, cy + dy, dx * 2 + 1, col);
+    }
+    if (closure > 0.45f) {
+      int pr = max(1, (int)(4.0f * closure));
+      s->fillCircle(cx, cy, pr, C_TR_PUPIL);
+    }
+    return;
+  }
+
+  // Default open eye: dark rim + red disc + black pupil + white speck.
+  s->fillCircle(cx, cy, r + 1, colDk);
+  s->fillCircle(cx, cy, r,     col);
+  s->fillCircle(cx, cy, 4,     C_TR_PUPIL);
+  s->fillCircle(cx - r / 2 + 1, cy - r / 2 + 1, 2, C_TR_EYE_HL);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,37 +549,44 @@ static void drawMouthCalculator(TFT_eSprite *s, float openness,
   drawCalcPill(s, cx, cy, halfW, halfH, col);
 }
 
-static void drawMouthPixel(TFT_eSprite *s, float openness, CreatureMood mood,
-                           int yOffset) {
+static void drawMouthToyRobot(TFT_eSprite *s, float openness, CreatureMood mood,
+                              int yOffset) {
   int cx = MOUTH_CX - FACE_X;
   int cy = MOUTH_CY - FACE_Y + yOffset;
-  const int PIX = 6;
 
   if (openness < 0.0f) openness = 0.0f;
   if (openness > 1.0f) openness = 1.0f;
 
   if (mood == MOOD_HAPPY) {
-    // 5-block grin with curled ends.
-    int ys[] = { 1, 0, -1, 0, 1 };
-    for (int i = 0; i < 5; ++i) {
-      int px = cx + (i - 2) * PIX;
-      int py = cy + ys[i] * PIX;
-      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, C_ACCENT);
+    // Orange upward grin arc. Drawn as a thick band of filled dots so it
+    // stands out against the blue head chassis behind it.
+    for (int dx = -22; dx <= 22; ++dx) {
+      int yy = cy + 6 - (int)((484 - dx * dx) / 70);
+      s->fillCircle(cx + dx, yy, 3, C_TR_MOUTH_BG);
     }
     return;
   }
 
-  // Mouth is a rectangular grid, 7 wide × (1..4) tall depending on open.
-  int rows = 1 + (int)(openness * 3.5f);
-  int cols = 7;
-  for (int ry = 0; ry < rows; ++ry) {
-    for (int rx = 0; rx < cols; ++rx) {
-      int px = cx + (rx - cols / 2) * PIX;
-      int py = cy + ry * PIX - (rows - 1) * PIX / 2;
-      uint16_t c = (ry == 0 || ry == rows - 1 || rx == 0 || rx == cols - 1)
-                       ? C_ACCENT : C_HALO_3;
-      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, c);
-    }
+  // Base grille: orange-yellow rounded rect with 5 vertical dark bars.
+  // Height grows with `openness` so the whole panel "breathes" while
+  // talking.
+  const int halfW = 30;
+  const int halfH = 7 + (int)(openness * 9.0f);
+
+  s->fillRoundRect(cx - halfW - 1, cy - halfH - 1,
+                   (halfW + 1) * 2, (halfH + 1) * 2, 5, C_TR_RIM);
+  s->fillRoundRect(cx - halfW,     cy - halfH,
+                   halfW * 2,       halfH * 2,       4, C_TR_MOUTH_BG);
+
+  const int bars    = 5;
+  const int barW    = 3;
+  const int innerW  = halfW * 2 - 8;
+  const int spacing = (bars > 1) ? (innerW - barW) / (bars - 1) : 0;
+  const int barY    = cy - halfH + 2;
+  const int barH    = halfH * 2 - 4;
+  for (int i = 0; i < bars; ++i) {
+    int bx = cx - halfW + 4 + i * spacing;
+    if (barH > 0) s->fillRect(bx, barY, barW, barH, C_TR_MOUTH_BAR);
   }
 }
 
@@ -761,10 +872,11 @@ void creatureTick() {
       drawEyeRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
       drawMouthRobot(s_faceBuf, s_mouthEnv, s_mood, bobDY);
       break;
-    case 2:   // Pixel
-      drawEyePixel(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
-      drawEyePixel(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
-      drawMouthPixel(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+    case 2:   // Toy Robot — cute blue head with red antenna + grille mouth
+      drawHeadToyRobot(s_faceBuf, bobDY, s_mood, pulse);
+      drawEyeToyRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
+      drawEyeToyRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
+      drawMouthToyRobot(s_faceBuf, s_mouthEnv, s_mood, bobDY);
       break;
     case 3:   // Calculator — =  |  analog LCD
       drawEyeCalculator(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
