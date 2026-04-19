@@ -1,41 +1,68 @@
 #include "walletscreen.h"
 #include "wallet.h"
 #include "price.h"
+#include "statusicons.h"
+
+#include <qrcode.h>
 
 static constexpr int16_t SCR_W    = 240;
 static constexpr int16_t SCR_H    = 320;
 static constexpr int16_t STATUS_H = 16;
 
-// Palette (RGB565)
+// Palette (RGB565) — tuned to feel like Phantom's dark theme: deep navy
+// backgrounds, lavender-blue accent, soft lilac dim text.
 static constexpr uint16_t C_BG        = 0x0000;
-static constexpr uint16_t C_ACCENT    = 0x04BF;    // Daemon blue
-static constexpr uint16_t C_ACCENT_HI = 0x07FF;    // cyan rim
+static constexpr uint16_t C_CARD      = 0x0861;   // subtle navy card
+static constexpr uint16_t C_CARD_HI   = 0x10A3;   // slightly lifted navy
+static constexpr uint16_t C_ACCENT    = 0x6B9F;   // Phantom-ish lavender
+static constexpr uint16_t C_ACCENT_HI = 0x9CBF;   // brighter lavender
 static constexpr uint16_t C_TEXT      = 0xFFFF;
-static constexpr uint16_t C_DIM       = 0x7BEF;
-static constexpr uint16_t C_GREEN     = 0x07E0;
-static constexpr uint16_t C_DIVIDER   = 0x18E3;
+static constexpr uint16_t C_DIM       = 0x9493;
+static constexpr uint16_t C_QR_BG     = 0xFFFF;   // QR background (white)
+static constexpr uint16_t C_QR_FG     = 0x0000;   // QR ink (black)
+static constexpr uint16_t C_DIVIDER   = 0x2124;
 
 static TFT_eSPI *s_tft = nullptr;
 
-// We redraw the screen once on enter and again whenever the underlying
-// wallet numbers change. This flag is reset each full paint so the tick
-// function can cheaply repaint only the dynamic USD value.
-static double   s_lastSolShown  = -1.0;
+// Cached dynamic values — the dense address+QR header is static once drawn,
+// so the tick loop only repaints the balance and holdings when they change.
+static double   s_lastSolShown   = -1.0;
 static double   s_lastPriceShown = -1.0;
 static size_t   s_lastTokenCount = (size_t)-1;
 static uint32_t s_lastTickMs     = 0;
+static String   s_qrAddrDrawn;                    // whose QR is on screen
 
+// Layout anchors — computed top-down so everything is easy to shuffle.
+static constexpr int16_t GAP_TOP        = STATUS_H + 4;
+
+static constexpr int16_t ADDR_PILL_Y    = GAP_TOP;
+static constexpr int16_t ADDR_PILL_H    = 22;
+
+static constexpr int16_t QR_MODULE_PX   = 3;      // version-4 QR = 33 modules
+static constexpr int16_t QR_SIZE_PX     = QR_MODULE_PX * 33;   // 99
+static constexpr int16_t QR_PAD         = 8;      // white quiet-zone margin
+static constexpr int16_t QR_BOX_SIZE    = QR_SIZE_PX + QR_PAD * 2; // 115
+static constexpr int16_t QR_BOX_X       = (SCR_W - QR_BOX_SIZE) / 2;
+static constexpr int16_t QR_BOX_Y       = ADDR_PILL_Y + ADDR_PILL_H + 6;  // ~48
+
+static constexpr int16_t BAL_Y          = QR_BOX_Y + QR_BOX_SIZE + 10;    // ~173
+static constexpr int16_t BAL_H          = 44;
+
+static constexpr int16_t HOLD_DIV_Y     = BAL_Y + BAL_H + 6;              // ~223
+static constexpr int16_t HOLD_LIST_Y    = HOLD_DIV_Y + 16;                // ~239
+static constexpr int16_t FOOTER_Y       = SCR_H - 14;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 bool walletScreenBegin(TFT_eSPI *tft) {
   s_tft = tft;
   return tft != nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 static String truncAddr(const String &p) {
-  if (p.length() < 10) return p;
-  return p.substring(0, 6) + "…" + p.substring(p.length() - 6);
+  if (p.length() < 14) return p;
+  return p.substring(0, 5) + "…" + p.substring(p.length() - 5);
 }
 
 static String fmtAmount(double a) {
@@ -47,8 +74,7 @@ static String fmtAmount(double a) {
   return String(buf);
 }
 
-// Insert thousand-separator commas into an integer string, e.g. "12450" ->
-// "12,450". Operates on the part before the decimal point if any.
+// Insert thousand-separator commas into an integer string.
 static String withCommas(const String &s) {
   int dot = s.indexOf('.');
   String intPart  = (dot < 0) ? s : s.substring(0, dot);
@@ -65,7 +91,8 @@ static String withCommas(const String &s) {
 }
 
 // ---------------------------------------------------------------------------
-// Painters
+// Status bar (same layout as the other screens — title left, price right,
+// feature indicators centred).
 // ---------------------------------------------------------------------------
 static void paintStatusBar() {
   s_tft->fillRect(0, 0, SCR_W, STATUS_H, C_BG);
@@ -75,99 +102,192 @@ static void paintStatusBar() {
   s_tft->setCursor(4, 4);
   s_tft->print("WALLET");
 
-  // right: SOL price ticker (same as creature screen)
   String price = priceDisplayString();
   if (price.length() > 0) {
     s_tft->setTextDatum(TR_DATUM);
     s_tft->setTextColor(C_ACCENT_HI, C_BG);
     s_tft->drawString(price, SCR_W - 4, 4);
   }
+
+  statusIconsDraw(s_tft, SCR_W / 2, STATUS_H / 2, C_ACCENT_HI, C_BG);
 }
 
-static void paintHeader(int16_t y) {
-  // Address
+// ---------------------------------------------------------------------------
+// Address pill — rounded card with the truncated pubkey centred inside.
+// ---------------------------------------------------------------------------
+static void paintAddressPill() {
+  const int16_t x = 20;
+  const int16_t y = ADDR_PILL_Y;
+  const int16_t w = SCR_W - 40;
+  const int16_t h = ADDR_PILL_H;
+
+  s_tft->fillRect(0, y, SCR_W, h, C_BG);          // clear row
+  s_tft->fillRoundRect(x, y, w, h, h / 2, C_CARD);
+  s_tft->drawRoundRect(x, y, w, h, h / 2, C_ACCENT);
+
   s_tft->setTextDatum(MC_DATUM);
   s_tft->setTextFont(2);
-  s_tft->setTextColor(C_DIM, C_BG);
-  s_tft->drawString(truncAddr(walletPubkey()), SCR_W / 2, y);
+  s_tft->setTextColor(C_TEXT, C_CARD);
+  s_tft->drawString(truncAddr(walletPubkey()), SCR_W / 2, y + h / 2);
+}
 
-  // Big SOL balance
+// ---------------------------------------------------------------------------
+// QR code of the receive address. Drawn once per address change so we don't
+// pay the ~80 ms encode cost on every tick.
+// ---------------------------------------------------------------------------
+static void paintQr(bool force) {
+  String addr = walletPubkey();
+  if (!force && addr == s_qrAddrDrawn) return;
+  s_qrAddrDrawn = addr;
+
+  // White quiet-zone background (larger than the code by QR_PAD on each
+  // side). Rounded corners + lavender frame give it a Phantom-card look.
+  s_tft->fillRoundRect(QR_BOX_X - 3, QR_BOX_Y - 3,
+                       QR_BOX_SIZE + 6, QR_BOX_SIZE + 6, 8, C_ACCENT);
+  s_tft->fillRoundRect(QR_BOX_X, QR_BOX_Y,
+                       QR_BOX_SIZE, QR_BOX_SIZE, 6, C_QR_BG);
+
+  if (addr.length() == 0) {
+    s_tft->setTextDatum(MC_DATUM);
+    s_tft->setTextFont(2);
+    s_tft->setTextColor(C_DIM, C_QR_BG);
+    s_tft->drawString("no wallet", QR_BOX_X + QR_BOX_SIZE / 2,
+                                   QR_BOX_Y + QR_BOX_SIZE / 2);
+    return;
+  }
+
+  // Version-4 QR (33 modules) comfortably fits a 44-char base58 pubkey
+  // with low error correction. Buffer is sized by the library helper.
+  const uint8_t version = 4;
+  QRCode qr;
+  uint8_t buf[qrcode_getBufferSize(version)];
+  int8_t rc = qrcode_initText(&qr, buf, version, ECC_LOW, addr.c_str());
+  if (rc != 0) {
+    s_tft->setTextDatum(MC_DATUM);
+    s_tft->setTextFont(2);
+    s_tft->setTextColor(C_DIM, C_QR_BG);
+    s_tft->drawString("qr error", QR_BOX_X + QR_BOX_SIZE / 2,
+                                  QR_BOX_Y + QR_BOX_SIZE / 2);
+    return;
+  }
+
+  const int16_t x0 = QR_BOX_X + QR_PAD;
+  const int16_t y0 = QR_BOX_Y + QR_PAD;
+  for (uint8_t j = 0; j < qr.size; ++j) {
+    for (uint8_t i = 0; i < qr.size; ++i) {
+      if (qrcode_getModule(&qr, i, j)) {
+        s_tft->fillRect(x0 + i * QR_MODULE_PX,
+                        y0 + j * QR_MODULE_PX,
+                        QR_MODULE_PX, QR_MODULE_PX, C_QR_FG);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Balance card — single rounded rect with the big SOL number on top and the
+// USD value underneath. Hides when the wallet has zero balance.
+// ---------------------------------------------------------------------------
+static void paintBalanceCard() {
+  const int16_t x = 20;
+  const int16_t y = BAL_Y;
+  const int16_t w = SCR_W - 40;
+  const int16_t h = BAL_H;
+
+  s_tft->fillRect(0, y, SCR_W, h, C_BG);
+  s_tft->fillRoundRect(x, y, w, h, 10, C_CARD);
+  s_tft->drawRoundRect(x, y, w, h, 10, C_DIVIDER);
+
   double sol = walletSolBalance();
   char solBuf[32];
-  snprintf(solBuf, sizeof(solBuf), "%.4f", sol);
-  s_tft->setTextFont(6);                       // big 7-seg style digits
-  s_tft->setTextColor(C_ACCENT_HI, C_BG);
-  s_tft->drawString(solBuf, SCR_W / 2, y + 38);
+  snprintf(solBuf, sizeof(solBuf), "%.4f SOL", sol);
 
-  // "SOL" suffix label under the big number
-  s_tft->setTextFont(2);
-  s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->drawString("SOL", SCR_W / 2, y + 74);
+  s_tft->setTextDatum(MC_DATUM);
+  s_tft->setTextFont(4);                          // bigger digits
+  s_tft->setTextColor(C_TEXT, C_CARD);
+  s_tft->drawString(solBuf, SCR_W / 2, y + 16);
 
-  // USD value
   double p = priceSOLUSD();
   char usdBuf[32];
   if (p > 0) snprintf(usdBuf, sizeof(usdBuf), "~ $%.2f", sol * p);
   else       snprintf(usdBuf, sizeof(usdBuf), "~ $ --");
-  s_tft->setTextColor(C_TEXT, C_BG);
-  s_tft->drawString(usdBuf, SCR_W / 2, y + 94);
-}
-
-static void paintDivider(int16_t y, const char *label) {
-  s_tft->fillRect(0, y, SCR_W, 1, C_DIVIDER);
-  s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextFont(2);
-  s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->setCursor(6, y + 4);
-  s_tft->print(label);
+  s_tft->setTextColor(C_DIM, C_CARD);
+  s_tft->drawString(usdBuf, SCR_W / 2, y + h - 12);
 }
 
-static void paintTokens(int16_t yTop, int16_t yBottom) {
+// ---------------------------------------------------------------------------
+// Holdings list — compact rows with amount + symbol, styled like Phantom's
+// token cards. We only have room for ~2 rows on this layout; extras are
+// summarised with an "…and N more" footer.
+// ---------------------------------------------------------------------------
+static void paintHoldings() {
+  // Header line
+  s_tft->fillRect(0, HOLD_DIV_Y, SCR_W, SCR_H - FOOTER_Y - HOLD_DIV_Y, C_BG);
+  s_tft->drawFastHLine(20, HOLD_DIV_Y + 4, SCR_W - 40, C_DIVIDER);
+  s_tft->setTextDatum(TC_DATUM);
+  s_tft->setTextFont(1);
+  s_tft->setTextColor(C_DIM, C_BG);
+  s_tft->drawString("HOLDINGS", SCR_W / 2, HOLD_DIV_Y - 4);
+
   const auto &tokens = walletTokens();
-  const int  lineH   = 18;
-  int y = yTop;
 
-  s_tft->setTextFont(2);
+  const int16_t rowH      = 22;
+  const int16_t rowX      = 20;
+  const int16_t rowW      = SCR_W - 40;
+  const int   maxRows     = 2;
+  const int   available   = FOOTER_Y - HOLD_LIST_Y;
+  const int   rowsToDraw  = min((int)tokens.size(), maxRows);
+
   if (tokens.empty()) {
-    s_tft->setTextDatum(TL_DATUM);
+    s_tft->setTextDatum(TC_DATUM);
+    s_tft->setTextFont(2);
     s_tft->setTextColor(C_DIM, C_BG);
-    s_tft->drawString("(no SPL tokens)", 10, y + 2);
+    s_tft->drawString("(no SPL tokens)", SCR_W / 2, HOLD_LIST_Y + 4);
     return;
   }
 
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    if (y + lineH > yBottom) {
-      // Didn't fit. Draw an ellipsis and stop.
-      s_tft->setTextDatum(TL_DATUM);
-      s_tft->setTextColor(C_DIM, C_BG);
-      s_tft->drawString("...", 10, y);
-      break;
-    }
+  (void)available;
+  for (int i = 0; i < rowsToDraw; ++i) {
+    int16_t y = HOLD_LIST_Y + i * (rowH + 4);
+    s_tft->fillRoundRect(rowX, y, rowW, rowH, 8, C_CARD);
+
     const TokenHolding &t = tokens[i];
     String amount = withCommas(fmtAmount(t.amount));
     String symbol = (t.symbol.length() > 0) ? t.symbol
                                             : t.mint.substring(0, 4) + "…";
 
-    // Left: amount (right-aligned at 140 px)
-    s_tft->setTextDatum(TR_DATUM);
-    s_tft->setTextColor(C_TEXT, C_BG);
-    s_tft->drawString(amount, 140, y);
+    // Small colored dot on the left acts as a placeholder token icon.
+    s_tft->fillCircle(rowX + 14, y + rowH / 2, 6, C_ACCENT);
 
-    // Right: symbol (left-aligned after 150 px)
-    s_tft->setTextDatum(TL_DATUM);
-    s_tft->setTextColor(C_ACCENT, C_BG);
-    s_tft->setCursor(150, y);
-    s_tft->print(symbol);
+    s_tft->setTextFont(2);
+    s_tft->setTextDatum(ML_DATUM);
+    s_tft->setTextColor(C_TEXT, C_CARD);
+    s_tft->drawString(symbol, rowX + 28, y + rowH / 2);
 
-    y += lineH;
+    s_tft->setTextDatum(MR_DATUM);
+    s_tft->setTextColor(C_ACCENT_HI, C_CARD);
+    s_tft->drawString(amount, rowX + rowW - 10, y + rowH / 2);
+  }
+
+  if ((int)tokens.size() > rowsToDraw) {
+    int16_t y = HOLD_LIST_Y + rowsToDraw * (rowH + 4) + 2;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "+ %d more",
+             (int)tokens.size() - rowsToDraw);
+    s_tft->setTextDatum(TC_DATUM);
+    s_tft->setTextFont(1);
+    s_tft->setTextColor(C_DIM, C_BG);
+    s_tft->drawString(buf, SCR_W / 2, y);
   }
 }
 
 static void paintFooter() {
+  s_tft->fillRect(0, FOOTER_Y - 2, SCR_W, SCR_H - FOOTER_Y + 2, C_BG);
   s_tft->setTextDatum(MC_DATUM);
   s_tft->setTextFont(1);
   s_tft->setTextColor(C_DIM, C_BG);
-  s_tft->drawString("swipe right  ->  DAEMON", SCR_W / 2, SCR_H - 10);
+  s_tft->drawString("swipe right  ->  DAEMON", SCR_W / 2, FOOTER_Y);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,15 +296,14 @@ static void paintFooter() {
 void walletScreenDraw() {
   if (!s_tft) return;
   s_tft->fillScreen(C_BG);
+  statusIconsResetCache();
+  s_qrAddrDrawn = "";     // force QR repaint
+
   paintStatusBar();
-
-  const int16_t HEADER_Y = 26;
-  paintHeader(HEADER_Y);
-
-  const int16_t DIV_Y = HEADER_Y + 120;   // ~y=146
-  paintDivider(DIV_Y, "HOLDINGS");
-
-  paintTokens(DIV_Y + 24, SCR_H - 18);
+  paintAddressPill();
+  paintQr(true);
+  paintBalanceCard();
+  paintHoldings();
   paintFooter();
 
   s_lastSolShown   = walletSolBalance();
@@ -196,20 +315,30 @@ void walletScreenTick() {
   if (!s_tft) return;
 
   uint32_t now = millis();
-  if (now - s_lastTickMs < 200) return;       // cheap dynamic repaint ~5 Hz
+  if (now - s_lastTickMs < 200) return;       // ~5 Hz dynamic repaint
   s_lastTickMs = now;
 
-  bool changed =
-      (walletSolBalance()  != s_lastSolShown)   ||
-      (priceSOLUSD()       != s_lastPriceShown) ||
+  bool balanceChanged =
+      (walletSolBalance() != s_lastSolShown) ||
+      (priceSOLUSD()      != s_lastPriceShown);
+  bool holdingsChanged =
       (walletTokens().size() != s_lastTokenCount);
 
-  if (changed) {
-    walletScreenDraw();
-    return;
+  if (balanceChanged) {
+    paintBalanceCard();
+    s_lastSolShown   = walletSolBalance();
+    s_lastPriceShown = priceSOLUSD();
+  }
+  if (holdingsChanged) {
+    paintHoldings();
+    s_lastTokenCount = walletTokens().size();
   }
 
-  // Otherwise just keep the status-bar price ticker fresh (in case the
-  // price updated without numbers otherwise changing).
+  // Always keep the status bar fresh (price ticker + indicator toggles)
+  // and make sure the QR is up to date if the wallet key somehow changed.
   paintStatusBar();
+  if (walletPubkey() != s_qrAddrDrawn) {
+    paintAddressPill();
+    paintQr(false);
+  }
 }

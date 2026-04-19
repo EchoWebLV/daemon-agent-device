@@ -1,6 +1,7 @@
 #include "settingsscreen.h"
 #include "devcfg.h"
 #include "price.h"
+#include "statusicons.h"
 #include "touch.h"
 
 #include <WiFi.h>
@@ -29,16 +30,24 @@ struct Row {
   int16_t     ctrlX, ctrlW;     // the slider bar / tappable zone
 };
 
-static Row  ROWS[4] = {
-  { "WI-FI",      26,  52, 120,  110 },
-  { "BLUETOOTH",  78,  52, 170,   60 },
-  { "VOLUME",     130, 52, 110,  120 },
-  { "BRIGHTNESS", 182, 52, 110,  120 },
+// Six rows: Wi-Fi is tallest (has IP+RSSI sub-line), sliders are medium,
+// the three toggle rows (Bluetooth / Memory / Heartbeat) are compact.
+// All heights include the divider below — total stack ends at y=284 with
+// footer text sitting at y=306, so everything fits on the 320-px screen.
+static Row  ROWS[6] = {
+  { "WI-FI",      22,  50, 120,  110 },
+  { "BLUETOOTH",  72,  38, 170,   60 },
+  { "VOLUME",     110, 42, 110,  120 },
+  { "BRIGHTNESS", 152, 42, 110,  120 },
+  { "MEMORY",     194, 38, 170,   60 },
+  { "HEARTBEAT",  232, 38, 170,   60 },
 };
 static constexpr int R_WIFI = 0;
 static constexpr int R_BT   = 1;
 static constexpr int R_VOL  = 2;
 static constexpr int R_BRI  = 3;
+static constexpr int R_MEM  = 4;
+static constexpr int R_HB   = 5;
 
 static TFT_eSPI *s_tft = nullptr;
 
@@ -46,6 +55,8 @@ static TFT_eSPI *s_tft = nullptr;
 static uint8_t  s_lastVol       = 255;
 static uint8_t  s_lastBri       = 255;
 static bool     s_lastBt        = false;
+static bool     s_lastMem       = false;
+static bool     s_lastHb        = false;
 static String   s_lastSSID      = "\x01";
 static String   s_lastPrice     = "\x01";
 
@@ -99,6 +110,11 @@ static void paintStatusBar() {
   }
   s_lastPrice = price;
 
+  // Feature indicators (memory + heartbeat) sit just left of the price so
+  // they stay visible from every screen. Centring on the title's right half
+  // keeps the SETTINGS label uncluttered.
+  statusIconsDraw(s_tft, STATUS_H + 80, STATUS_H / 2, C_ACCENT_HI, C_BG);
+
   // Close button: [ x ]
   s_tft->drawRoundRect(CLOSE_X + 2, CLOSE_Y + 2, CLOSE_W - 4, CLOSE_H - 4, 3, C_ACCENT);
   s_tft->setTextFont(2);
@@ -141,24 +157,34 @@ static void paintWifi() {
   s_lastSSID = ssid;
 }
 
-static void paintBluetooth() {
-  paintRowFrame(ROWS[R_BT]);
-  bool on = devcfgBluetooth();
-  // pill toggle
-  int16_t x = ROWS[R_BT].ctrlX;
-  int16_t y = ROWS[R_BT].y + 14;
-  int16_t w = ROWS[R_BT].ctrlW;
-  int16_t h = 22;
+// Paint a compact on/off toggle row. Single-line layout: label on the left
+// (drawn by paintRowFrame), a pill switch on the right. No ON/OFF text
+// beneath — the pill fill colour conveys state clearly enough and keeps
+// the row short so we can fit six rows on one screen.
+static void paintToggleRow(const Row &r, bool on) {
+  paintRowFrame(r);
+  int16_t h = 20;
+  int16_t x = r.ctrlX;
+  int16_t y = r.y + (r.h - h) / 2 - 2;    // vertically centred in row
+  int16_t w = r.ctrlW;
   s_tft->fillRoundRect(x, y, w, h, h / 2, on ? C_ACCENT : C_BAR_BG);
-  // knob
   int16_t kx = on ? (x + w - h) : x;
   s_tft->fillCircle(kx + h / 2, y + h / 2, h / 2 - 2, C_TEXT);
-  // state label
-  s_tft->setTextFont(2);
-  s_tft->setTextDatum(TC_DATUM);
-  s_tft->setTextColor(C_DIM, C_BG);
-  s_tft->drawString(on ? "ON" : "OFF", x + w / 2, ROWS[R_BT].y + 40);
-  s_lastBt = on;
+}
+
+static void paintBluetooth() {
+  paintToggleRow(ROWS[R_BT], devcfgBluetooth());
+  s_lastBt = devcfgBluetooth();
+}
+
+static void paintMemory() {
+  paintToggleRow(ROWS[R_MEM], devcfgMemoryEnabled());
+  s_lastMem = devcfgMemoryEnabled();
+}
+
+static void paintHeartbeat() {
+  paintToggleRow(ROWS[R_HB], devcfgHeartbeatEnabled());
+  s_lastHb = devcfgHeartbeatEnabled();
 }
 
 static void paintSlider(const Row &r, int value, int maxValue) {
@@ -194,11 +220,14 @@ static void paintFooter() {
 void settingsScreenDraw() {
   if (!s_tft) return;
   s_tft->fillScreen(C_BG);
+  statusIconsResetCache();
   paintStatusBar();
   paintWifi();
   paintBluetooth();
   paintSlider(ROWS[R_VOL], devcfgVolume(),     21);
   paintSlider(ROWS[R_BRI], devcfgBrightness(), 255);
+  paintMemory();
+  paintHeartbeat();
   paintFooter();
   s_lastVol = devcfgVolume();
   s_lastBri = devcfgBrightness();
@@ -261,6 +290,17 @@ static void handleInput() {
     const Row &bt = ROWS[R_BT];
     if (inRect(tx, ty, 0, bt.y, SCR_W, bt.h)) {
       devcfgSetBluetooth(!devcfgBluetooth());
+      return;
+    }
+    const Row &mem = ROWS[R_MEM];
+    if (inRect(tx, ty, 0, mem.y, SCR_W, mem.h)) {
+      devcfgSetMemoryEnabled(!devcfgMemoryEnabled());
+      return;
+    }
+    const Row &hb = ROWS[R_HB];
+    if (inRect(tx, ty, 0, hb.y, SCR_W, hb.h)) {
+      devcfgSetHeartbeatEnabled(!devcfgHeartbeatEnabled());
+      return;
     }
   }
 }
@@ -283,12 +323,16 @@ void settingsScreenTick() {
 
   // Incremental repaint — only rows whose state changed.
   String price = priceDisplayString();
-  if (price != s_lastPrice) { paintStatusBar(); }
+  if (price != s_lastPrice || statusIconsNeedRedraw()) {
+    paintStatusBar();
+  }
 
   String ssid = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("(offline)");
   if (ssid != s_lastSSID) paintWifi();
 
-  if (devcfgBluetooth() != s_lastBt) paintBluetooth();
+  if (devcfgBluetooth()     != s_lastBt)  paintBluetooth();
+  if (devcfgMemoryEnabled() != s_lastMem) paintMemory();
+  if (devcfgHeartbeatEnabled() != s_lastHb) paintHeartbeat();
 
   if (devcfgVolume() != s_lastVol) {
     paintSlider(ROWS[R_VOL], devcfgVolume(), 21);

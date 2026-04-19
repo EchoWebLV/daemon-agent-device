@@ -1,4 +1,5 @@
 #include "creature.h"
+#include "statusicons.h"
 #include <math.h>
 #include <vector>
 
@@ -211,7 +212,8 @@ static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood,
 static void drawStatusIfChanged(bool force) {
   bool statusChanged = s_status != s_lastStatusDrawn;
   bool priceChanged  = s_price  != s_lastPriceDrawn;
-  if (!force && !statusChanged && !priceChanged) return;
+  bool iconsChanged  = statusIconsNeedRedraw();
+  if (!force && !statusChanged && !priceChanged && !iconsChanged) return;
 
   s_tft->fillRect(0, 0, SCR_W, STATUS_H, C_BG);
   s_tft->setTextFont(1);
@@ -226,6 +228,11 @@ static void drawStatusIfChanged(bool force) {
     s_tft->setTextColor(C_ACCENT, C_BG);
     s_tft->drawString(s_price, SCR_W - 4, 4);
   }
+
+  // Feature indicators sit centred between the USDC balance (left) and
+  // the SOL ticker (right). They appear only when their respective toggle
+  // is on, and disappear the instant the user flips it off.
+  statusIconsDraw(s_tft, SCR_W / 2, STATUS_H / 2, C_ACCENT, C_BG);
 
   s_lastStatusDrawn = s_status;
   s_lastPriceDrawn  = s_price;
@@ -353,6 +360,7 @@ void creatureRepaint() {
   s_lastStatusDrawn = "\x01invalid\x01";
   s_lastPriceDrawn  = "\x01invalid\x01";
   s_lastSubKey      = "\x01invalid\x01";
+  statusIconsResetCache();
   drawStatusIfChanged(true);
   drawSubtitleIfChanged(true);
 }
