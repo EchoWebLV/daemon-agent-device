@@ -1,10 +1,30 @@
+// ============================================================================
+//  voice.cpp — ELEVENLABS-ONLY VARIANT.
+//
+//  This file is NOT compiled in-place. It lives in /variants/ so PlatformIO
+//  ignores it. To activate, copy it over src/voice.cpp:
+//
+//      cp variants/voice_elevenlabs.cpp src/voice.cpp
+//
+//  …and then `pio run -t upload`.
+//
+//  What this variant does:
+//    - Sends TTS requests straight to ElevenLabs over HTTPS.
+//    - No local Piper server dependency, works anywhere with internet.
+//    - Keeps all the latency optimizations landed so far: two alternating
+//      slot files, reused WiFiClientSecure + HTTPClient with keep-alive,
+//      Nagle off, mp3_22050_32 output, optimize_streaming_latency=4.
+//
+//  Companion variant: variants/voice_piper.cpp  — Piper-on-LAN first,
+//  ElevenLabs fallback. Swap to it the same way when you're on a network
+//  that can reach your Mac's Piper server.
+// ============================================================================
 #include "voice.h"
 #include "secrets.h"
 #include "netgate.h"
 
 #include <Audio.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
@@ -26,20 +46,13 @@ static constexpr int I2S_DOUT = 47;
 // that cut audio off after ~6 KB, so we stage the full response on-disk
 // first and then let the library do what it's good at.
 //
-// Two alternating slot indices instead of one file: a new utterance can
-// be downloaded into the idle slot while the other slot is still being
+// Two alternating slot files instead of one: a new utterance can be
+// downloaded into the idle slot while the other slot is still being
 // read by the decoder. That eliminates the ~530 ms "stop + wait for
-// LittleFS handle close" stall and lets the fetch overlap with the tail
-// of the currently-playing reply.
-//
-// Each slot's path is tracked as a full String so the extension can
-// differ between utterances — Piper returns WAV, ElevenLabs returns MP3,
-// and the Audio library dispatches codec strictly by file extension
-// (`.wav` vs `.mp3`).
-static constexpr int SLOT_COUNT = 2;
-static String        s_slotPath[SLOT_COUNT] = { "/tts_a.mp3", "/tts_b.mp3" };
-static int           s_playbackIdx = 0;   // decoder is holding this slot
-static int           s_fetchIdx    = 1;   // next write target
+// LittleFS handle close" stall and lets the HTTPS fetch overlap with
+// the tail of the currently-playing reply.
+static constexpr const char *TTS_FS_A = "/tts_a.mp3";
+static constexpr const char *TTS_FS_B = "/tts_b.mp3";
 
 static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
@@ -52,24 +65,21 @@ static volatile bool s_playing   = false;
 // completes (whether or not the fetch succeeded).
 static volatile bool s_fetching  = false;
 
-// Reused HTTPS client + HTTPClient for ElevenLabs. mbedTLS contexts are
-// ~40 KB each and the handshake to api.elevenlabs.io is ~500–800 ms on
-// the ESP32-S3, so keeping a single connection alive across utterances
-// saves both heap churn and a big chunk of wall-clock latency.
-// setReuse(true) + HTTP/1.1 keep-alive means the second utterance onward
-// skips the handshake entirely.
+// The slot the decoder is currently holding a handle on (or last held).
+// New fetches always write to the *other* slot. Swapped only after a
+// successful connecttoFS, so a failed fetch doesn't ever hand the
+// decoder a truncated file.
+static const char *s_playbackSlot = TTS_FS_A;
+static const char *s_fetchSlot    = TTS_FS_B;
+
+// Reused HTTPS client + HTTPClient. mbedTLS contexts are ~40 KB each and
+// the handshake to api.elevenlabs.io is ~500–800 ms on the ESP32-S3, so
+// keeping a single connection alive across utterances saves both heap
+// churn and a big chunk of wall-clock latency. setReuse(true) + HTTP/1.1
+// keep-alive means the second utterance onward skips the handshake
+// entirely.
 static WiFiClientSecure *s_httpsClient = nullptr;
 static HTTPClient        s_http;
-
-// Reused plaintext client for the local Piper server on the LAN. No TLS,
-// no reverse proxy, no internet hop — typical round-trip is 200–400 ms
-// for a full WAV back, vs 1–3 s for ElevenLabs' remote synthesis.
-static WiFiClient *s_piperClient = nullptr;
-static HTTPClient  s_piperHttp;
-// When Piper has errored recently we briefly skip it and go straight to
-// ElevenLabs, so a dead/disconnected Mac server doesn't add seconds of
-// latency to every utterance. Reset automatically on success.
-static uint32_t    s_piperBackoffUntil = 0;
 
 // Queue job — carries the full utterance text so the fetch runs off the
 // main loop. We allocate the text inline (C string) so the FreeRTOS queue
@@ -148,24 +158,12 @@ static void audioTaskEntry(void *) {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch task — runs the blocking TTS POST + LittleFS write off the main
-// Arduino loop so the UI keeps ticking while Daemon fetches his reply
-// audio. ElevenLabs is the preferred voice (higher quality); Piper on
-// the LAN is the fallback that kicks in if ElevenLabs is unreachable,
-// out of credits, or rate-limited.
+// Fetch task — runs the blocking ElevenLabs HTTPS POST + LittleFS write
+// off the main Arduino loop so the UI keeps ticking while Daemon fetches
+// his reply audio. Writes the MP3 into whichever of the two slot files
+// is *not* currently held by the decoder, then swaps the decoder over.
 // ---------------------------------------------------------------------------
-static bool fetchMp3FromElevenLabs(const String &text, const char *outPath);
-static bool fetchWavFromPiper     (const String &text, const char *outPath);
-
-// When either provider has errored recently we briefly skip it, so a
-// dead server / blown credit balance doesn't pile the timeout onto every
-// utterance. Reset on success. Both counters use the same 30 s window
-// because the failure modes are similar: transient for ElevenLabs
-// (network hiccup, rate limit, provider blip), transient for Piper
-// (Mac asleep, server crashed, hotspot reset).
-static constexpr uint32_t ELEVENLABS_BACKOFF_MS = 30000;
-static constexpr uint32_t PIPER_BACKOFF_MS      = 30000;
-static uint32_t           s_elevenlabsBackoffUntil = 0;
+static bool fetchMp3ToFs(const String &text, const char *outPath);
 
 static void fetchTaskEntry(void *) {
   for (;;) {
@@ -182,75 +180,30 @@ static void fetchTaskEntry(void *) {
     s_fetching = true;
 
     // Fetch into the *idle* slot — the decoder may still be playing out
-    // of s_slotPath[s_playbackIdx]. Writing to a different file avoids
-    // the LittleFS `lfs_mlist_isopen` assert entirely and lets the fetch
-    // overlap with the tail of the previous utterance.
-    const int  target   = s_fetchIdx;
-    const char slotChar = (char)('a' + target);
-
+    // of s_playbackSlot. Writing to a different file avoids the LittleFS
+    // `lfs_mlist_isopen` assert entirely and means the HTTPS round-trip
+    // overlaps with the tail of the previous utterance.
+    const char *target = s_fetchSlot;
     uint32_t t0 = millis();
-
-    String chosenPath;
-    bool   okFetch  = false;
-    bool   usedPiper = false;
-
-    // Primary: ElevenLabs. Only skipped if a recent call has failed —
-    // otherwise we always pay the ~800 ms first-boot TLS handshake once
-    // in exchange for the higher-quality voice.
-    bool elevenlabsSkipped = (millis() < s_elevenlabsBackoffUntil);
-    if (!elevenlabsSkipped) {
-      chosenPath = String("/tts_") + slotChar + ".mp3";
-      okFetch    = fetchMp3FromElevenLabs(text, chosenPath.c_str());
-      if (okFetch) {
-        s_elevenlabsBackoffUntil = 0;
-      } else {
-        s_elevenlabsBackoffUntil = millis() + ELEVENLABS_BACKOFF_MS;
-        Serial.println("voice: elevenlabs failed — backing off, falling back to Piper");
-      }
-    }
-
-    // Fallback: local Piper on the LAN. Kicks in when ElevenLabs is
-    // unreachable / in backoff, or not configured at all.
-    if (!okFetch && strlen(PIPER_HOST) > 0 &&
-        millis() >= s_piperBackoffUntil) {
-      chosenPath = String("/tts_") + slotChar + ".wav";
-      okFetch    = fetchWavFromPiper(text, chosenPath.c_str());
-      usedPiper  = okFetch;
-      if (okFetch) {
-        s_piperBackoffUntil = 0;
-      } else {
-        s_piperBackoffUntil = millis() + PIPER_BACKOFF_MS;
-        Serial.println("voice: piper fallback also failed — giving up this utterance");
-      }
-    }
-
-    if (!okFetch) { s_fetching = false; continue; }
-
-    // Clean up the stale other-codec file in this slot so flash doesn't
-    // slowly accumulate orphaned /tts_*.mp3 and /tts_*.wav pairs.
-    String stale = chosenPath.endsWith(".wav")
-                     ? String("/tts_") + slotChar + ".mp3"
-                     : String("/tts_") + slotChar + ".wav";
-    if (LittleFS.exists(stale)) LittleFS.remove(stale);
-
+    if (!fetchMp3ToFs(text, target)) { s_fetching = false; continue; }
     uint32_t tFetched = millis();
 
     // Fetch succeeded — hand the new file to the decoder. connecttoFS
     // internally stops the current song and closes its file handle, so
     // we don't need the old stopSong-then-wait dance anymore.
-    bool ok = s_audio->connecttoFS(LittleFS, chosenPath.c_str());
+    bool ok = s_audio->connecttoFS(LittleFS, target);
     if (ok) {
-      s_slotPath[target] = chosenPath;
-      s_playbackIdx      = target;
-      s_fetchIdx         = 1 - target;
+      // Swap: the file we just handed to the decoder becomes the new
+      // playback slot, and the other one becomes the next fetch target.
+      s_playbackSlot = target;
+      s_fetchSlot    = (target == TTS_FS_A) ? TTS_FS_B : TTS_FS_A;
     }
     s_playing  = ok;
     s_fetching = false;
-    Serial.printf("voice: %s fetch=%lums swap=%lums ok=%d -> %s\n",
-                  usedPiper ? "piper" : "elevenlabs",
+    Serial.printf("voice: elevenlabs fetch=%lums swap=%lums ok=%d slot=%s\n",
                   (unsigned long)(tFetched - t0),
                   (unsigned long)(millis() - tFetched),
-                  ok ? 1 : 0, chosenPath.c_str());
+                  ok ? 1 : 0, target);
     if (!ok) Serial.println("voice: connecttoFS failed");
   }
 }
@@ -276,79 +229,9 @@ static String jsonEscape(const String &in) {
 }
 
 // ---------------------------------------------------------------------------
-// Blocking fetch: POST → Piper (LAN) → WAV → LittleFS slot.
-// No TLS, no cloud round-trip. Typical wall-clock is 150–400 ms on the
-// iPhone hotspot; synthesis cost is zero.
-// ---------------------------------------------------------------------------
-static bool fetchWavFromPiper(const String &text, const char *outPath) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (strlen(PIPER_HOST) == 0)       return false;
-
-  // Voice is Critical priority. Piper is cheap, but other TLS-hungry
-  // tasks still shouldn't pile up on top of us.
-  NetGate gate("voice", NetGate::Priority::Critical);
-  if (!gate.ok()) return false;
-
-  if (!s_piperClient) {
-    s_piperClient = new WiFiClient();
-    s_piperClient->setNoDelay(true);
-  }
-
-  String url = String("http://") + PIPER_HOST + ":" + String(PIPER_PORT) + "/";
-
-  String body = "{\"text\":\"";
-  body += jsonEscape(text);
-  body += "\"}";
-
-  s_piperHttp.setReuse(true);
-  // Piper takes ~200 ms to synthesize short text. 4 s is a generous ceiling
-  // that still fails fast enough for the fallback to kick in before the
-  // user gives up on the reply.
-  s_piperHttp.setTimeout(4000);
-  if (!s_piperHttp.begin(*s_piperClient, url)) {
-    Serial.println("voice: piper http.begin failed");
-    return false;
-  }
-  s_piperHttp.addHeader("Content-Type", "application/json");
-  s_piperHttp.addHeader("Accept",       "audio/wav");
-  s_piperHttp.addHeader("Connection",   "keep-alive");
-
-  uint32_t t0 = millis();
-  int code = s_piperHttp.POST(body);
-  uint32_t tHdr = millis();
-  if (code != 200) {
-    Serial.printf("voice: piper HTTP %d\n", code);
-    s_piperHttp.end();
-    s_piperClient->stop();
-    return false;
-  }
-
-  File f = LittleFS.open(outPath, FILE_WRITE);
-  if (!f) {
-    Serial.println("voice: LittleFS open failed (piper)");
-    s_piperHttp.end();
-    return false;
-  }
-  int written = s_piperHttp.writeToStream(&f);
-  f.close();
-  s_piperHttp.end();
-  if (written <= 0) {
-    Serial.printf("voice: piper writeToStream failed (%d)\n", written);
-    s_piperClient->stop();
-    return false;
-  }
-  Serial.printf("voice: piper %d bytes WAV in %lu ms (hdr %lu ms) -> %s\n",
-                written,
-                (unsigned long)(millis() - t0),
-                (unsigned long)(tHdr - t0),
-                outPath);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
 // Blocking fetch: POST → ElevenLabs → MP3 → LittleFS slot
 // ---------------------------------------------------------------------------
-static bool fetchMp3FromElevenLabs(const String &text, const char *outPath) {
+static bool fetchMp3ToFs(const String &text, const char *outPath) {
   if (String(ELEVENLABS_API_KEY).startsWith("PASTE-") ||
       strlen(ELEVENLABS_API_KEY) < 10) {
     Serial.println("voice: no ElevenLabs key configured");
@@ -488,18 +371,14 @@ bool voiceBegin() {
     Serial.println("voice: speak queue alloc FAILED");
     return false;
   }
-  // 12 KB stack — we now hold a plaintext Piper client + a TLS
-  // ElevenLabs client concurrently, plus some String allocations for
-  // path building. 10 KB was tight.
-  if (xTaskCreatePinnedToCore(fetchTaskEntry, "voice-fetch", 12288,
+  if (xTaskCreatePinnedToCore(fetchTaskEntry, "voice-fetch", 10240,
                               nullptr, 3, &s_fetchTask, 1) != pdPASS) {
     Serial.println("voice: fetch task create FAILED");
     return false;
   }
 
   s_ready = true;
-  Serial.printf("voice: ready (piper=%s:%d, elevenlabs fallback)\n",
-                PIPER_HOST, PIPER_PORT);
+  Serial.println("voice: ready (ElevenLabs only)");
   return true;
 }
 

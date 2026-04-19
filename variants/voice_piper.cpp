@@ -1,3 +1,27 @@
+// ============================================================================
+//  voice.cpp — ELEVENLABS-PRIMARY + PIPER-FALLBACK VARIANT.
+//
+//  This file is NOT compiled in-place. It lives in /variants/ so PlatformIO
+//  ignores it. To activate, copy it over src/voice.cpp:
+//
+//      cp variants/voice_piper.cpp src/voice.cpp
+//
+//  …and then `pio run -t upload`.
+//
+//  What this variant does:
+//    - Tries ElevenLabs FIRST on every utterance — higher-quality voice,
+//      paid per credit, needs internet. Uses the TLS keep-alive path so
+//      repeat utterances skip the ~800 ms handshake.
+//    - Falls back to the local Piper HTTP server (PIPER_HOST/PIPER_PORT in
+//      secrets.h) if ElevenLabs is unreachable, rate-limited, or out of
+//      credits. A 30 s per-provider backoff keeps a bad state from eating
+//      a timeout on every utterance.
+//    - Two-slot file architecture + keep-alive on both clients.
+//
+//  Companion variant: variants/voice_elevenlabs.cpp  — ElevenLabs only,
+//  no Piper code at all. Swap to it when you never want the Piper path
+//  compiled in (e.g. to save flash / RAM).
+// ============================================================================
 #include "voice.h"
 #include "secrets.h"
 #include "netgate.h"
