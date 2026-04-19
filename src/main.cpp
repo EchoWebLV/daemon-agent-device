@@ -427,8 +427,8 @@ void setup() {
   if (s_wifiOk && (devcfgMemoryEnabled() || devcfgArweaveEnabled()) &&
       memoryKeyReady()) {
     creatureSetSubtitle("restoring memory…");
-    MemoryTurn loaded[20];
-    int n = memoryRecallTurns(loaded, 20);
+    MemoryTurn loaded[10];
+    int n = memoryRecallTurns(loaded, 10);
     if (n > 0) aiLoadHistory(loaded, n);
   }
 
