@@ -287,7 +287,7 @@ static void paintFooter() {
   s_tft->setTextDatum(MC_DATUM);
   s_tft->setTextFont(1);
   s_tft->setTextColor(C_DIM, C_BG);
-  s_tft->drawString("swipe right  ->  DAEMON", SCR_W / 2, FOOTER_Y);
+  s_tft->drawString("swipe down to close", SCR_W / 2, FOOTER_Y);
 }
 
 // ---------------------------------------------------------------------------

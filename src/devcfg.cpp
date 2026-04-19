@@ -13,6 +13,7 @@ static Preferences s_nvs;
 static uint8_t  s_volume     = 21;
 static uint8_t  s_brightness = 255;
 static bool     s_bluetooth  = false;
+static uint8_t  s_faceStyle  = 0;
 
 static void applyBrightness(uint8_t b) {
   if (b < MIN_BRIGHTNESS) b = MIN_BRIGHTNESS;
@@ -29,6 +30,8 @@ void devcfgBegin() {
   s_volume     = s_nvs.getUChar("vol",   21);
   s_brightness = s_nvs.getUChar("bri",   255);
   s_bluetooth  = s_nvs.getBool ("bt",    false);
+  s_faceStyle  = s_nvs.getUChar("face",  0);
+  if (s_faceStyle >= DEVCFG_FACE_COUNT) s_faceStyle = 0;
   s_nvs.end();
 
   applyBrightness(s_brightness);
@@ -41,6 +44,16 @@ void devcfgBegin() {
 uint8_t devcfgVolume()      { return s_volume; }
 uint8_t devcfgBrightness()  { return s_brightness; }
 bool    devcfgBluetooth()   { return s_bluetooth; }
+uint8_t devcfgFaceStyle()   { return s_faceStyle; }
+
+void devcfgSetFaceStyle(uint8_t s) {
+  if (s >= DEVCFG_FACE_COUNT) s = 0;
+  if (s == s_faceStyle) return;
+  s_faceStyle = s;
+  s_nvs.begin("daemon", false);
+  s_nvs.putUChar("face", s);
+  s_nvs.end();
+}
 
 void devcfgSetVolume(uint8_t v) {
   if (v > 21) v = 21;

@@ -304,6 +304,7 @@ void setup() {
   // Device-level settings (volume, brightness, BT). Applies brightness
   // PWM and restores last-known volume from NVS.
   devcfgBegin();
+  creatureSetFaceStyle(devcfgFaceStyle());
 
   // Wi-Fi + web server. These are best-effort; creature still animates
   // without them. That lets you iterate on the drawing without a network.
@@ -391,10 +392,27 @@ void loop() {
     // or exits the panel; we just pipe the swipe through.
     wifiScreenHandleSwipe(sw);
     if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_WALLET) {
+    // Wallet is now a "pull-up" drawer: swipe down to dismiss it back to
+    // the creature. We deliberately don't let settings open from here so
+    // the close gesture is unambiguous — users return to the creature
+    // screen first, then pull settings down from the top edge.
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_CREATURE);
   } else {
-    if (sw == SWIPE_LEFT)  switchScreen(SCREEN_WALLET);
-    if (sw == SWIPE_RIGHT) switchScreen(SCREEN_CREATURE);
-    if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
+    // Creature screen:
+    //   SWIPE_LEFT / SWIPE_RIGHT → cycle face style (skin picker)
+    //   SWIPE_UP                 → open the wallet drawer
+    //   SWIPE_DOWN (top edge)    → open settings
+    if (sw == SWIPE_LEFT || sw == SWIPE_RIGHT) {
+      int dir = (sw == SWIPE_RIGHT) ? 1 : -1;
+      uint8_t next = (uint8_t)((creatureFaceStyle() + DEVCFG_FACE_COUNT + dir)
+                               % DEVCFG_FACE_COUNT);
+      creatureSetFaceStyle(next);
+      devcfgSetFaceStyle(next);
+      creatureRepaint();
+    }
+    if (sw == SWIPE_UP)   switchScreen(SCREEN_WALLET);
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_SETTINGS);
   }
 
   // Talking state still drives the creature regardless of which screen is

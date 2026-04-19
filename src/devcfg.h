@@ -22,6 +22,16 @@ void    devcfgSetBrightness(uint8_t b);
 bool    devcfgBluetooth();
 void    devcfgSetBluetooth(bool on);
 
+// Face style picker.
+//   0 = Daemon     (neon almond eyes — default)
+//   1 = Robot      (circular eyes with pupils)
+//   2 = Pixel      (blocky 8-bit style)
+//   3 = Calculator ( = | analog LCD / 7-segment look)
+// Swipe right on the creature screen cycles through them.
+static constexpr uint8_t DEVCFG_FACE_COUNT = 4;
+uint8_t devcfgFaceStyle();
+void    devcfgSetFaceStyle(uint8_t s);
+
 // Wi-Fi credentials. Empty string means "use the compile-time fallback
 // from secrets.h" (only matters on first boot). Setting these persists
 // the new SSID/password so the user can change networks from the UI.

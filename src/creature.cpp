@@ -58,6 +58,7 @@ static TFT_eSPI    *s_tft       = nullptr;
 static TFT_eSprite *s_faceBuf   = nullptr;   // per-frame double buffer
 static CreatureMood s_mood      = MOOD_IDLE;
 static bool         s_talking   = false;
+static uint8_t      s_faceStyle = 0;         // 0=Daemon, 1=Robot, 2=Pixel
 static uint32_t     s_lastTickMs = 0;
 static uint32_t     s_lastBlinkMs = 0;
 static uint32_t     s_blinkStartMs = 0;
@@ -204,6 +205,278 @@ static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood,
   int tongueY = cy + halfH - 2;
   int tongueR = 5 + (int)(openness * 3.0f);
   s->fillCircle(cx, tongueY + tongueR / 2, tongueR, C_ACCENT);
+}
+
+// ---------------------------------------------------------------------------
+// FACE STYLE 1 — ROBOT
+// Big circular eyes with a glowing halo + a smaller dark pupil that drifts
+// with the gaze. The mouth is a thin rounded bar that opens vertically
+// when talking. Reads as a classic friendly bot.
+// ---------------------------------------------------------------------------
+static void drawEyeRobot(TFT_eSprite *s, int cxScreen, int cyScreen,
+                         float pulse, float blinkT, CreatureMood mood) {
+  int cx = cxScreen - FACE_X;
+  int cy = cyScreen - FACE_Y;
+
+  // Outer eye radius. Pulse scales ±5% so the idle glow "breathes".
+  float rOuter = 30.0f * (1.0f + 0.05f * pulse);
+  float vScale = 1.0f;
+
+  if (blinkT >= 0.0f) {
+    float c = 0.5f * (1.0f - cosf(blinkT * 2.0f * (float)PI));
+    vScale = 0.1f + 0.9f * (1.0f - c);
+  }
+
+  uint16_t cGlow = (mood == MOOD_ANGRY) ? C_GLOW_ANG : C_ACCENT;
+  uint16_t cCore = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_CORE;
+
+  // Five concentric ellipses (fake ellipse via cheap y-compression) —
+  // outermost halo → core. vScale squashes everything vertically for blinks.
+  auto squashedCircle = [&](int r, uint16_t color) {
+    int ry = max(1, (int)(r * vScale));
+    for (int dy = -ry; dy <= ry; ++dy) {
+      float t = (float)dy / (float)ry;
+      int dx = (int)(r * sqrtf(max(0.0f, 1.0f - t * t)));
+      s->drawFastHLine(cx - dx, cy + dy, dx * 2 + 1, color);
+    }
+  };
+
+  squashedCircle((int)(rOuter + 10), C_HALO_0);
+  squashedCircle((int)(rOuter + 6),  C_HALO_1);
+  squashedCircle((int)(rOuter + 3),  C_HALO_2);
+  squashedCircle((int)rOuter,        cGlow);
+  squashedCircle((int)(rOuter * 0.72f), C_MID);
+  squashedCircle((int)(rOuter * 0.48f), cCore);
+
+  // Pupil — small dark dot that drifts slightly with the current gaze.
+  // Gaze is already applied to the screen coordinates passed in, so we
+  // add a tiny extra offset for "looking around" parallax.
+  if (vScale > 0.25f) {
+    int pr = 6;
+    s->fillCircle(cx, cy, pr, C_BG);
+    s->fillCircle(cx - 1, cy - 1, 2, cCore);     // specular highlight
+  }
+}
+
+static void drawMouthRobot(TFT_eSprite *s, float openness, CreatureMood mood,
+                           int yOffset) {
+  int cx = MOUTH_CX - FACE_X;
+  int cy = MOUTH_CY - FACE_Y + yOffset;
+
+  if (openness < 0.0f) openness = 0.0f;
+  if (openness > 1.0f) openness = 1.0f;
+
+  if (mood == MOOD_HAPPY) {
+    // Upward smile — wider and thinner than the Daemon arc.
+    for (int dx = -28; dx <= 28; dx += 1) {
+      int yy = cy + (int)(8.0f - (dx * dx) / 110.0f);
+      s->fillCircle(cx + dx, yy, 2, C_ACCENT);
+    }
+    return;
+  }
+
+  // Base horizontal bar. Grows vertically with `openness`.
+  int halfW = 30;
+  int halfH = 2 + (int)(openness * 10.0f);
+  s->fillRoundRect(cx - halfW, cy - halfH, halfW * 2, halfH * 2,
+                   halfH, C_ACCENT);
+
+  // Inner highlight stripe — gives the bar a subtle "speaker grille" feel.
+  if (halfH > 3) {
+    s->drawFastHLine(cx - halfW + 6, cy, (halfW - 6) * 2 + 1, C_CORE);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FACE STYLE 2 — PIXEL
+// Chunky 8-bit style. Each "pixel" is a PIX px square block so the whole
+// face reads as a low-res sprite. Eyes are hollow-squares with a solid
+// iris; the mouth is a stepped bar that grows in block increments.
+// ---------------------------------------------------------------------------
+static void drawEyePixel(TFT_eSprite *s, int cxScreen, int cyScreen,
+                         float /*pulse*/, float blinkT, CreatureMood mood) {
+  int cx = cxScreen - FACE_X;
+  int cy = cyScreen - FACE_Y;
+
+  const int PIX    = 6;                  // chunky block size
+  const int cols   = 7;                  // 7×7 grid → 42×42 px eye
+  const int rows   = 7;
+  uint16_t col = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_ACCENT;
+  uint16_t core = (mood == MOOD_ANGRY) ? C_GLOW_ANG : C_CORE;
+
+  // Closed-eye pattern: just the middle row. Lets us blink cheaply.
+  bool closing = false;
+  int  closedRows = 0;
+  if (blinkT >= 0.0f) {
+    float c = 0.5f * (1.0f - cosf(blinkT * 2.0f * (float)PI));
+    closing = true;
+    closedRows = (int)roundf(c * 3.0f);       // 0..3 rows peeled off top+bot
+  }
+
+  for (int ry = 0; ry < rows; ++ry) {
+    if (closing && (ry < closedRows || ry >= rows - closedRows)) continue;
+    for (int rx = 0; rx < cols; ++rx) {
+      bool on = false;
+      // Outline ring
+      bool border = (rx == 0 || rx == cols - 1 || ry == 0 || ry == rows - 1);
+      bool corner = (border && ((rx == 0 || rx == cols - 1) &&
+                                (ry == 0 || ry == rows - 1)));
+      if (border && !corner) on = true;
+      // Iris block (3×3 in the middle)
+      bool iris = (rx >= 2 && rx <= 4 && ry >= 2 && ry <= 4);
+      // Pupil centre
+      bool pupil = (rx == 3 && ry == 3);
+
+      int px = cx + (rx - cols / 2) * PIX;
+      int py = cy + (ry - rows / 2) * PIX;
+
+      if (on)    s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, col);
+      if (iris)  s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, col);
+      if (pupil) s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, core);
+    }
+  }
+
+  // Tiny shadow drop a block to the right+down of the outline — gives a
+  // subtle 3D feel without going full isometric.
+  for (int rx = 1; rx < cols; ++rx) {
+    int px = cx + (rx - cols / 2) * PIX;
+    int py = cy + (rows / 2 + 1) * PIX;
+    if (!closing || closedRows < 3)
+      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, 2, C_HALO_1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FACE STYLE 3 — CALCULATOR (minimal `| |` + `—` mascot face)
+// Two small vertical pills for eyes and a thin horizontal capsule for the
+// mouth, all rendered in the same crisp accent colour as the rest of the
+// chrome. Intentionally minimalist to match the reference sketch — no
+// halo, no 7-segment ghosting, just two ovals and a line on a black
+// background.
+// ---------------------------------------------------------------------------
+static void drawCalcPill(TFT_eSprite *s, int cx, int cy,
+                         int halfW, int halfH, uint16_t color) {
+  // Rounded capsule: a filled rectangle bookended by two filled circles.
+  // Works for both orientations depending on whether halfW < halfH (vertical
+  // pill) or halfW > halfH (horizontal pill).
+  if (halfW <= 0 || halfH <= 0) return;
+  if (halfH >= halfW) {
+    // Vertical pill — short axis is width.
+    s->fillRect(cx - halfW, cy - halfH + halfW,
+                halfW * 2, max(0, (halfH - halfW) * 2), color);
+    s->fillCircle(cx, cy - halfH + halfW, halfW, color);
+    s->fillCircle(cx, cy + halfH - halfW, halfW, color);
+  } else {
+    // Horizontal pill — short axis is height.
+    s->fillRect(cx - halfW + halfH, cy - halfH,
+                max(0, (halfW - halfH) * 2), halfH * 2, color);
+    s->fillCircle(cx - halfW + halfH, cy, halfH, color);
+    s->fillCircle(cx + halfW - halfH, cy, halfH, color);
+  }
+}
+
+static void drawEyeCalculator(TFT_eSprite *s, int cxScreen, int cyScreen,
+                              float pulse, float blinkT, CreatureMood mood) {
+  int cx = cxScreen - FACE_X;
+  int cy = cyScreen - FACE_Y;
+
+  // Base dimensions: a small vertical pill, ~10 wide × ~36 tall, which
+  // matches the proportions in the reference sketch.
+  int halfW = 6;
+  int halfH = 18;
+
+  // Mood tweaks. Happy squints the pill shorter; angry lengthens it and
+  // tilts the top corner slightly inward (we fake that via a horizontal
+  // offset between the two eyes, handled by the gaze system).
+  if (mood == MOOD_HAPPY)  halfH = 10;
+  if (mood == MOOD_LISTEN) halfH = 22;
+  if (mood == MOOD_ANGRY)  halfH = 22;
+
+  // Subtle breathing swell — ±5% on the tall axis, almost imperceptible
+  // but gives the pills a hint of "alive".
+  halfH = (int)(halfH * (1.0f + 0.05f * pulse));
+
+  // Blink transitions the vertical pill into a short horizontal dash and
+  // back. cos-interp makes the mid-point a flat line, which is the
+  // classic `-` closed-eye look.
+  if (blinkT >= 0.0f) {
+    float c = 0.5f * (1.0f - cosf(blinkT * 2.0f * (float)PI));
+    halfH = max(3, (int)(halfH * (1.0f - 0.9f * c)));
+    // Swap to a horizontal dash when fully closed — just widen slightly so
+    // the closed state reads as `—` rather than a dot.
+    if (c > 0.7f) {
+      int dashW = 10;
+      int dashH = 3;
+      uint16_t col = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_CORE;
+      drawCalcPill(s, cx, cy, dashW, dashH, col);
+      return;
+    }
+  }
+
+  uint16_t col = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_CORE;
+  drawCalcPill(s, cx, cy, halfW, halfH, col);
+}
+
+static void drawMouthCalculator(TFT_eSprite *s, float openness,
+                                CreatureMood mood, int yOffset) {
+  int cx = MOUTH_CX - FACE_X;
+  int cy = MOUTH_CY - FACE_Y + yOffset;
+
+  if (openness < 0.0f) openness = 0.0f;
+  if (openness > 1.0f) openness = 1.0f;
+
+  uint16_t col = (mood == MOOD_ANGRY) ? C_CORE_ANG : C_CORE;
+
+  if (mood == MOOD_HAPPY) {
+    // Tiny upward arc for a content smile.
+    for (int dx = -18; dx <= 18; ++dx) {
+      int yy = cy + (int)(6.0f - (dx * dx) / 60.0f);
+      s->drawPixel(cx + dx,     yy,     col);
+      s->drawPixel(cx + dx,     yy + 1, col);
+      s->drawPixel(cx + dx,     yy - 1, col);
+    }
+    return;
+  }
+
+  // Thin horizontal line mouth. Base is 2 px tall; talking grows it up to
+  // ~6 px so the line "fattens" rhythmically as Daemon speaks.
+  int halfW = 18;
+  int halfH = 1 + (int)(openness * 3.0f);
+  drawCalcPill(s, cx, cy, halfW, halfH, col);
+}
+
+static void drawMouthPixel(TFT_eSprite *s, float openness, CreatureMood mood,
+                           int yOffset) {
+  int cx = MOUTH_CX - FACE_X;
+  int cy = MOUTH_CY - FACE_Y + yOffset;
+  const int PIX = 6;
+
+  if (openness < 0.0f) openness = 0.0f;
+  if (openness > 1.0f) openness = 1.0f;
+
+  if (mood == MOOD_HAPPY) {
+    // 5-block grin with curled ends.
+    int ys[] = { 1, 0, -1, 0, 1 };
+    for (int i = 0; i < 5; ++i) {
+      int px = cx + (i - 2) * PIX;
+      int py = cy + ys[i] * PIX;
+      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, C_ACCENT);
+    }
+    return;
+  }
+
+  // Mouth is a rectangular grid, 7 wide × (1..4) tall depending on open.
+  int rows = 1 + (int)(openness * 3.5f);
+  int cols = 7;
+  for (int ry = 0; ry < rows; ++ry) {
+    for (int rx = 0; rx < cols; ++rx) {
+      int px = cx + (rx - cols / 2) * PIX;
+      int py = cy + ry * PIX - (rows - 1) * PIX / 2;
+      uint16_t c = (ry == 0 || ry == rows - 1 || rx == 0 || rx == cols - 1)
+                       ? C_ACCENT : C_HALO_3;
+      s->fillRect(px - PIX / 2, py - PIX / 2, PIX, PIX, c);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +651,17 @@ void creatureSetSubtitle(const String &text) {
   rewrapSubtitle();
 }
 
+void creatureSetFaceStyle(uint8_t style) {
+  if (style > 3) style = 0;
+  if (style == s_faceStyle) return;
+  s_faceStyle = style;
+  // Face geometry is identical across styles, so a cheap sprite repaint
+  // on the next tick is enough — no full-screen redraw needed.
+  if (s_faceBuf) s_faceBuf->fillSprite(0x0000);
+}
+
+uint8_t creatureFaceStyle() { return s_faceStyle; }
+
 void creatureTick() {
   if (!s_faceBuf) return;
 
@@ -471,9 +755,28 @@ void creatureTick() {
   int16_t leftX  = LEFT_EYE_CX  + (int16_t)s_gazeX;
   int16_t rightX = RIGHT_EYE_CX + (int16_t)s_gazeX;
   int16_t eyeY   = LEFT_EYE_CY  + (int16_t)s_gazeY + bobDY;
-  drawEye(s_faceBuf, leftX,  eyeY, LEFT_EYE_ANGLE,  pulse, blinkL, s_mood);
-  drawEye(s_faceBuf, rightX, eyeY, RIGHT_EYE_ANGLE, pulse, blinkR, s_mood);
-  drawMouth(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+  switch (s_faceStyle) {
+    case 1:   // Robot
+      drawEyeRobot(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
+      drawEyeRobot(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
+      drawMouthRobot(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      break;
+    case 2:   // Pixel
+      drawEyePixel(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
+      drawEyePixel(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
+      drawMouthPixel(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      break;
+    case 3:   // Calculator — =  |  analog LCD
+      drawEyeCalculator(s_faceBuf, leftX,  eyeY, pulse, blinkL, s_mood);
+      drawEyeCalculator(s_faceBuf, rightX, eyeY, pulse, blinkR, s_mood);
+      drawMouthCalculator(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      break;
+    default:  // 0 = Daemon
+      drawEye(s_faceBuf, leftX,  eyeY, LEFT_EYE_ANGLE,  pulse, blinkL, s_mood);
+      drawEye(s_faceBuf, rightX, eyeY, RIGHT_EYE_ANGLE, pulse, blinkR, s_mood);
+      drawMouth(s_faceBuf, s_mouthEnv, s_mood, bobDY);
+      break;
+  }
   s_faceBuf->pushSprite(FACE_X, FACE_Y);
 
   drawStatusIfChanged(false);
