@@ -1,5 +1,6 @@
 #include "creature.h"
 #include <math.h>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Screen geometry
@@ -79,8 +80,17 @@ static String       s_status;
 static String       s_lastStatusDrawn = "\x01invalid\x01";
 static String       s_price;
 static String       s_lastPriceDrawn  = "\x01invalid\x01";
-static String       s_subText;
-static String       s_lastSubDrawn    = "\x01invalid\x01";
+
+// Subtitle state. The full string is word-wrapped into `s_subLines` when
+// creatureSetSubtitle() is called; the subtitle panel shows 3 of those
+// lines at a time and auto-advances while Daemon is talking so the user
+// doesn't get stuck on just the first paragraph of a long reply.
+static String               s_subText;
+static std::vector<String>  s_subLines;
+static uint32_t             s_subSetMs       = 0;
+static int                  s_subScroll      = 0;  // index of first visible line
+static int                  s_subScrollDrawn = -1; // last-drawn scroll pos
+static String               s_lastSubKey     = "\x01invalid\x01";
 
 // Subtitle panel layout (bottom of the screen).
 static constexpr int16_t SUB_X = 0;
@@ -222,30 +232,25 @@ static void drawStatusIfChanged(bool force) {
 }
 
 // ---------------------------------------------------------------------------
-// Subtitle — bottom-of-screen word-wrap panel. No prefix; every line is
-// center-aligned so longer replies look deliberately formatted instead of
-// ragged-left.
+// Subtitle — bottom-of-screen word-wrap panel. Full text is word-wrapped
+// ahead of time into s_subLines; the panel shows a sliding window of
+// MAX_SUB_LINES lines and advances while Daemon is talking so long
+// replies get fully read out on screen rather than stuck at the top.
 // ---------------------------------------------------------------------------
-static void drawSubtitleIfChanged(bool force) {
-  if (!force && s_subText == s_lastSubDrawn) return;
-  s_lastSubDrawn = s_subText;
+static constexpr int SUB_LINE_H  = 16;
+static constexpr int MAX_SUB_LINES = SUB_H / SUB_LINE_H;     // 3
 
-  s_tft->fillRect(SUB_X, SUB_Y, SUB_W, SUB_H, C_BG);
-  if (s_subText.length() == 0) return;
+// Wrap text into lines that fit within the subtitle panel width. Text is
+// split greedily at spaces, with hard breaks for single oversized words.
+static void rewrapSubtitle() {
+  s_subLines.clear();
+  if (!s_tft || s_subText.length() == 0) return;
 
   s_tft->setTextFont(2);
-  s_tft->setTextDatum(TC_DATUM);                 // top-centered
-  s_tft->setTextColor(C_SUB_TEXT, C_BG);
-
-  const int lineH    = 16;
-  const int maxLines = SUB_H / lineH;             // 3
-  const int maxW     = SUB_W - 8;                 // 4 px margin each side
-  const int cx       = SUB_X + SUB_W / 2;
+  const int maxW = SUB_W - 8;
 
   String remaining = s_subText;
-  int y = SUB_Y + 2;
-  int line = 0;
-  while (remaining.length() > 0 && line < maxLines) {
+  while (remaining.length() > 0) {
     String current = "";
     while (remaining.length() > 0) {
       int sp = remaining.indexOf(' ');
@@ -253,29 +258,68 @@ static void drawSubtitleIfChanged(bool force) {
       String tryLine = current.length() ? current + " " + word : word;
       if (s_tft->textWidth(tryLine) > maxW) {
         if (current.length() == 0) {
+          // Word wider than the panel — chop it.
           while (word.length() > 0 &&
                  s_tft->textWidth(word) > maxW) {
             word.remove(word.length() - 1);
           }
-          current = word;
+          current  = word;
           remaining = (sp < 0) ? "" : remaining.substring(sp + 1);
         }
         break;
       }
-      current = tryLine;
+      current  = tryLine;
       remaining = (sp < 0) ? "" : remaining.substring(sp + 1);
     }
-    if (line == maxLines - 1 && remaining.length() > 0) {
-      while (current.length() > 0 &&
-             s_tft->textWidth(current + "...") > maxW) {
-        current.remove(current.length() - 1);
-      }
-      current += "...";
-    }
-    s_tft->drawString(current, cx, y);
-    y += lineH;
-    line++;
+    if (current.length() == 0) break;   // safety guard
+    s_subLines.push_back(current);
   }
+}
+
+static void drawSubtitleIfChanged(bool force) {
+  // Cheap key so we only repaint when either the text or the visible
+  // window actually changed.
+  String key = s_subText + "\x01" + String(s_subScroll);
+  if (!force && key == s_lastSubKey) return;
+  s_lastSubKey = key;
+
+  s_tft->fillRect(SUB_X, SUB_Y, SUB_W, SUB_H, C_BG);
+  if (s_subLines.empty()) return;
+
+  s_tft->setTextFont(2);
+  s_tft->setTextDatum(TC_DATUM);
+  s_tft->setTextColor(C_SUB_TEXT, C_BG);
+  const int cx = SUB_X + SUB_W / 2;
+
+  int start = s_subScroll;
+  int end   = min((int)s_subLines.size(), start + MAX_SUB_LINES);
+  int y = SUB_Y + 2;
+  for (int i = start; i < end; ++i) {
+    s_tft->drawString(s_subLines[i], cx, y);
+    y += SUB_LINE_H;
+  }
+  s_subScrollDrawn = s_subScroll;
+}
+
+// Advance the scroll window while Daemon is talking. Scrolling starts
+// shortly after the subtitle is set (so the user can read the first page)
+// and then moves one line at a time at a reading pace that roughly tracks
+// the speech rate. Stops once we've reached the final page.
+static void tickSubtitleScroll(uint32_t now) {
+  if (s_subLines.size() <= MAX_SUB_LINES) {
+    s_subScroll = 0;
+    return;
+  }
+  const int  maxScroll   = (int)s_subLines.size() - MAX_SUB_LINES;
+  const uint32_t LEAD_IN = 1400;   // ms before we start scrolling
+  const uint32_t PER_LINE =
+      (s_talking || s_mood == MOOD_TALK) ? 1800 : 2400;  // faster while speaking
+
+  uint32_t elapsed = now - s_subSetMs;
+  if (elapsed < LEAD_IN) { s_subScroll = 0; return; }
+  int target = (int)((elapsed - LEAD_IN) / PER_LINE);
+  if (target > maxScroll) target = maxScroll;
+  s_subScroll = target;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +352,7 @@ void creatureRepaint() {
   s_tft->fillScreen(C_BG);
   s_lastStatusDrawn = "\x01invalid\x01";
   s_lastPriceDrawn  = "\x01invalid\x01";
-  s_lastSubDrawn    = "\x01invalid\x01";
+  s_lastSubKey      = "\x01invalid\x01";
   drawStatusIfChanged(true);
   drawSubtitleIfChanged(true);
 }
@@ -319,7 +363,11 @@ void creatureForceBlink()               { s_forceBlink = true; }
 void creatureSetStatus(const String &s) { s_status = s; }
 void creatureSetPrice (const String &s) { s_price  = s; }
 void creatureSetSubtitle(const String &text) {
-  s_subText = text;
+  if (text == s_subText) return;        // no change → keep scroll state
+  s_subText   = text;
+  s_subScroll = 0;
+  s_subSetMs  = millis();
+  rewrapSubtitle();
 }
 
 void creatureTick() {
@@ -421,5 +469,6 @@ void creatureTick() {
   s_faceBuf->pushSprite(FACE_X, FACE_Y);
 
   drawStatusIfChanged(false);
+  tickSubtitleScroll(now);
   drawSubtitleIfChanged(false);
 }

@@ -233,23 +233,25 @@ static String buildPaymentPayload(const JsonDocument &paymentRequired,
 // ---------------------------------------------------------------------------
 // Public API (shared GET/POST handler)
 // ---------------------------------------------------------------------------
-static X402Result x402Request(const char  *method,
-                              const String &url,
-                              const String &jsonBody,
-                              const String &authBearer) {
-  X402Result r;
-  if (WiFi.status() != WL_CONNECTED) {
-    r.error = "no wifi";
-    return r;
-  }
-
+// Run one HTTPS request to `url` and return (status, body, payment-required
+// descriptor). Owns its own TLS client + HTTPClient in a tight scope so
+// both are torn down before the next sub-request.
+static void doOneRequest(const char *method,
+                         const String &url,
+                         const String &jsonBody,
+                         const String &authBearer,
+                         const String &paymentSigHeader,
+                         int    &outStatus,
+                         String &outBody,
+                         String &outPayReq) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(60000);
   if (!http.begin(client, url)) {
-    r.error = "http.begin failed";
-    return r;
+    outStatus = -1;
+    outBody   = String();
+    return;
   }
   if (strcmp(method, "POST") == 0) {
     http.addHeader("Content-Type", "application/json");
@@ -257,11 +259,10 @@ static X402Result x402Request(const char  *method,
   if (authBearer.length() > 0) {
     http.addHeader("Authorization", "Bearer " + authBearer);
   }
+  if (paymentSigHeader.length() > 0) {
+    http.addHeader("PAYMENT-SIGNATURE", paymentSigHeader);
+  }
 
-  // Accept the various spellings of the payment-required header. sol.
-  // blockrun.ai uses lowercase `payment-required`; other facilitators
-  // sometimes publish `x-payment-required` or the standards-track
-  // `WWW-Authenticate: X402 requirements="..."` header.
   static const char *kPaymentHeaders[] = {
     "payment-required",
     "x-payment-required",
@@ -273,103 +274,104 @@ static X402Result x402Request(const char  *method,
   int code = (strcmp(method, "POST") == 0)
              ? http.POST(jsonBody)
              : http.GET();
-  Serial.printf("x402: %s %s -> %d in %lu ms\n",
-                method, url.c_str(), code, (unsigned long)(millis() - t0));
+  Serial.printf("x402: %s %s -> %d in %lu ms (heap=%u)\n",
+                method, url.c_str(), code,
+                (unsigned long)(millis() - t0),
+                (unsigned)ESP.getFreeHeap());
 
+  // Pull the body first.
+  outStatus = code;
+  outBody   = http.getString();
+
+  // If this is a 402, also extract the payment-required descriptor from
+  // whichever of the known headers is present.
   if (code == 402) {
-    // Try every known place the facilitator might have put the payment
-    // description: a couple of custom headers, the WWW-Authenticate
-    // header (with its `requirements="..."` quoted-value), then finally
-    // fall back to the response body.
-    String rawDescJson;
+    String rawB64;
     auto tryDecode = [&](const String &b64) {
-      if (b64.length() == 0 || rawDescJson.length() > 0) return;
+      if (b64.length() == 0 || outPayReq.length() > 0) return;
       size_t olen = 0;
       std::vector<uint8_t> dec(b64.length() + 4, 0);
       if (mbedtls_base64_decode(dec.data(), dec.size(), &olen,
             (const uint8_t *)b64.c_str(), b64.length()) == 0 && olen > 0) {
-        rawDescJson = String((const char *)dec.data()).substring(0, olen);
+        outPayReq = String((const char *)dec.data()).substring(0, olen);
       }
     };
     tryDecode(http.header("payment-required"));
     tryDecode(http.header("x-payment-required"));
-
-    // WWW-Authenticate: X402 requirements="<base64>"
     String wa = http.header("www-authenticate");
     int q1 = wa.indexOf('"');
     int q2 = wa.lastIndexOf('"');
     if (q1 >= 0 && q2 > q1) tryDecode(wa.substring(q1 + 1, q2));
+    if (outPayReq.length() == 0) outPayReq = outBody;   // fallback: body IS the JSON
+  }
 
-    // Always pull the body too — gives us a fallback and useful log text.
-    String body = http.getString();
-    http.end();
-    if (rawDescJson.length() == 0) rawDescJson = body;
+  http.end();
+  // `client` destructor here frees its mbedTLS context before we return.
+}
 
-    // The x402 payment-required body includes a deep `extensions.bazaar`
-    // schema (>10 nesting levels) which blows past ArduinoJson's default
-    // nesting limit. Bump it generously; it's a bounded parse, not a
-    // loop, so this is just a safety knob.
-    JsonDocument pr;
-    DeserializationError err = deserializeJson(
-        pr, rawDescJson, DeserializationOption::NestingLimit(32));
-    if (err) {
-      Serial.printf("x402: 402 parse err=%s len=%u last=<%s>\n",
-                    err.c_str(),
-                    (unsigned)rawDescJson.length(),
-                    rawDescJson.c_str() +
-                      (rawDescJson.length() > 60 ? rawDescJson.length() - 60 : 0));
-      r.status = 402;
-      r.error  = String("could not parse 402 payload: ") + err.c_str();
-      return r;
-    }
-
-    String amountStr;
-    String paymentHeader = buildPaymentPayload(pr, url, &amountStr);
-    if (paymentHeader.length() == 0) {
-      r.status = 402;
-      r.error = "failed to build Solana payment";
-      return r;
-    }
-
-    // Retry with the payment header.
-    WiFiClientSecure client2;
-    client2.setInsecure();
-    HTTPClient http2;
-    http2.setTimeout(60000);
-    if (!http2.begin(client2, url)) {
-      r.error = "retry http.begin failed";
-      return r;
-    }
-    if (strcmp(method, "POST") == 0) {
-      http2.addHeader("Content-Type", "application/json");
-    }
-    http2.addHeader("PAYMENT-SIGNATURE", paymentHeader);
-    if (authBearer.length() > 0) {
-      http2.addHeader("Authorization", "Bearer " + authBearer);
-    }
-
-    uint32_t t1 = millis();
-    int code2 = (strcmp(method, "POST") == 0)
-                ? http2.POST(jsonBody)
-                : http2.GET();
-    r.status = code2;
-    r.body   = http2.getString();
-    http2.end();
-    Serial.printf("x402: retry -> %d in %lu ms\n",
-                  code2, (unsigned long)(millis() - t1));
-    if (code2 == 200) {
-      r.costUsd = amountStr.toDouble() / 1e6;
-    } else {
-      r.error = "retry status " + String(code2);
-    }
+static X402Result x402Request(const char  *method,
+                              const String &url,
+                              const String &jsonBody,
+                              const String &authBearer) {
+  X402Result r;
+  if (WiFi.status() != WL_CONNECTED) {
+    r.error = "no wifi";
     return r;
   }
 
-  // No payment required or some other status.
-  r.status = code;
-  r.body   = http.getString();
-  http.end();
-  if (code != 200) r.error = "status " + String(code);
+  // ── Pass 1: send the request. TLS client is scoped to this function
+  //     call so it's fully released before we allocate the RPC client
+  //     (avoids holding two ~30 KB mbedTLS contexts concurrently). ──
+  int    code    = -1;
+  String body;
+  String payReq;
+  doOneRequest(method, url, jsonBody, authBearer, String(),
+               code, body, payReq);
+
+  if (code != 402) {
+    r.status = code;
+    r.body   = body;
+    if (code != 200) r.error = "status " + String(code);
+    return r;
+  }
+
+  // ── Pass 2: parse payment-required, build the signed Solana payment.
+  //     buildPaymentPayload may allocate its own short-lived TLS client
+  //     for the ATA RPC lookup; first-request TLS is already gone. ──
+  JsonDocument pr;
+  DeserializationError err = deserializeJson(
+      pr, payReq, DeserializationOption::NestingLimit(32));
+  if (err) {
+    Serial.printf("x402: 402 parse err=%s len=%u\n",
+                  err.c_str(), (unsigned)payReq.length());
+    r.status = 402;
+    r.error  = String("could not parse 402 payload: ") + err.c_str();
+    return r;
+  }
+
+  String amountStr;
+  String paymentHeader = buildPaymentPayload(pr, url, &amountStr);
+  if (paymentHeader.length() == 0) {
+    r.status = 402;
+    r.error  = "failed to build Solana payment";
+    return r;
+  }
+
+  // ── Pass 3: retry with the PAYMENT-SIGNATURE header. Fresh TLS client,
+  //     previous payment-build clients already gone. ──
+  int    code2 = -1;
+  String body2;
+  String payReq2;
+  doOneRequest(method, url, jsonBody, authBearer, paymentHeader,
+               code2, body2, payReq2);
+
+  r.status = code2;
+  r.body   = body2;
+  if (code2 == 200) {
+    r.costUsd = amountStr.toDouble() / 1e6;
+  } else {
+    r.error = "retry status " + String(code2);
+  }
   return r;
 }
 
