@@ -81,33 +81,46 @@ static String ago(uint32_t sinceMs) {
 }
 
 // Wrap a string into lines that fit within `maxPx` using the current font.
-// Greedy word-boundary wrapping; falls back to mid-word cuts for super
-// long runs (e.g. URLs with no spaces).
+//
+// Previous implementation allocated a fresh Arduino `String` on every
+// character-fit probe and called textWidth() with an O(n²) explosion that
+// fragmented the heap over time on long tweets (280 chars × 6 cards × 2 Hz
+// repaint = ~3400 allocs/s while sitting on the screen). This version
+// writes into a single caller-owned `char` scratch buffer and uses the
+// incremental width of characters one at a time, so wrap runs in O(n).
 static void wrapText(const String &text, int maxPx,
                      String *out, int cap, int *countOut) {
+  int n = text.length();
   int line = 0;
   int i = 0;
-  int n = text.length();
+  // Rolling scratch sized for a full tweet. 288 = 280 + pad; local stack
+  // use, nothing on the heap.
+  char scratch[288];
+
   while (i < n && line < cap) {
     // Skip leading spaces on a new line.
     while (i < n && text[i] == ' ') ++i;
     if (i >= n) break;
+
     int lineStart = i;
     int lastSpace = -1;
-    int fitted = i;
-    while (fitted <= n) {
-      String candidate = text.substring(lineStart, fitted);
-      int w = s_tft->textWidth(candidate.c_str());
+    int scratchLen = 0;
+    int fitted     = i;
+
+    while (fitted < n && scratchLen < (int)sizeof(scratch) - 1) {
+      scratch[scratchLen] = text[fitted];
+      scratch[scratchLen + 1] = '\0';
+      int w = s_tft->textWidth(scratch);
       if (w > maxPx) break;
+      scratchLen++;
+      if (text[fitted] == ' ') lastSpace = fitted;
       fitted++;
-      if (fitted - 1 < n && text[fitted - 1] == ' ') lastSpace = fitted - 1;
     }
-    int end = fitted - 1;
-    if (end <= lineStart) end = lineStart + 1;          // force progress
-    if (end < n) {
-      // Prefer the last space we saw so we don't mid-word break.
-      if (lastSpace > lineStart) end = lastSpace;
-    }
+
+    int end = fitted;
+    if (end <= lineStart) end = lineStart + 1;  // force progress on huge single-word runs
+    // Prefer a clean word boundary when we're not at the end of the text.
+    if (end < n && lastSpace > lineStart) end = lastSpace;
     out[line++] = text.substring(lineStart, end);
     i = end;
   }
@@ -305,33 +318,43 @@ void xpostScreenTick() {
   if (!s_tft) return;
   handleInput();
 
-  // Throttle to ~2 Hz — the status band needs to tick the "last: 12m ago"
-  // clock forward and the list grows asynchronously when posts succeed.
+  // Throttle to ~0.5 Hz baseline. We only redraw when real state changes
+  // (count bump, error change, scheduler flipped). The "Xm ago" clock
+  // only ticks once per minute anyway, so forcing a full repaint every
+  // 500 ms was pure waste — and the wrapText + String churn it produced
+  // is suspected of contributing to the spontaneous resets under long
+  // sessions.
   uint32_t now = millis();
-  if (now - s_lastTickMs < 500) return;
+  if (now - s_lastTickMs < 2000) return;
   s_lastTickMs = now;
 
   if (statusIconsNeedRedraw()) paintTitle();
 
-  // Repaint status band when enabled flag, error, or last-post timestamp
-  // changes — otherwise the "last: Xm ago" string would be stale.
-  bool   en   = devcfgXPostEnabled();
-  String err  = xpostLastError();
-  uint32_t lm = xpostLastSuccessMs();
-  if (en != s_lastDrawnEnabled || err != s_lastDrawnErr || lm != s_lastDrawnLastMs) {
+  bool     en   = devcfgXPostEnabled();
+  String   err  = xpostLastError();
+  uint32_t lm   = xpostLastSuccessMs();
+  size_t   cnt  = xpostRecentCount();
+
+  bool stateChanged = (en != s_lastDrawnEnabled) ||
+                      (err != s_lastDrawnErr)    ||
+                      (lm  != s_lastDrawnLastMs);
+
+  // Update the "12s ago" band at most once per 10 s once the last post
+  // is older than a minute — after that the label only ticks in "Nm"
+  // increments so we don't need sub-minute refreshes.
+  static uint32_t s_agoLastPaint = 0;
+  bool agoStale = (now - s_agoLastPaint) > 10000;
+
+  if (stateChanged || agoStale) {
     paintStatusBand();
-  } else {
-    // Still needs to retick the "Xm ago" clock even if nothing structural
-    // changed. Cheap — the band is small.
-    paintStatusBand();
+    s_agoLastPaint = now;
   }
 
-  // Repaint the list when a new tweet arrives (count changed) or on
-  // every tick when there are entries, so the relative-time labels
-  // ("12s ago") stay roughly fresh.
-  size_t cnt = xpostRecentCount();
-  if ((uint32_t)cnt != s_lastDrawnCount || cnt > 0) {
+  // Repaint the list only when the number of entries changed (new tweet
+  // landed) or when we haven't drawn it yet this session.
+  if ((uint32_t)cnt != s_lastDrawnCount) {
     paintList();
+    s_lastDrawnCount = (uint32_t)cnt;
   }
 }
 

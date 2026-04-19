@@ -61,8 +61,17 @@ static uint32_t s_backoffMs      = 0;   // extra delay after a failure
 static String   s_lastError;
 static bool     s_firstTickDone  = false;
 
+// Worker task plumbing — offloads the compose+sign+POST pipeline so
+// neither the Arduino loop task nor the WebServer handler task ever
+// blocks on 5-20 s of LLM + HTTPS work (which would trip the Arduino
+// task watchdog and reset the device — exactly the symptom the field
+// report described).
+static QueueHandle_t s_xpQueue = nullptr;
+static volatile bool s_xpBusy  = false;
+
 uint32_t xpostLastSuccessMs() { return s_lastPostMs; }
 String   xpostLastError()     { return s_lastError; }
+bool     xpostBusy()          { return s_xpBusy; }
 
 // ---------------------------------------------------------------------------
 // OAuth 1.0a helpers
@@ -410,8 +419,48 @@ static XPostResult composeAndPost() {
   return r;
 }
 
-XPostResult xpostRunNow() {
-  return composeAndPost();
+// ---------------------------------------------------------------------------
+// Worker task
+// ---------------------------------------------------------------------------
+// Message payload is just a marker byte — the worker pulls the current
+// prompt / credentials out of devcfg when it runs, so there's no race
+// with the user editing them in the web portal between enqueue + run.
+static void xpostWorkerTask(void *) {
+  for (;;) {
+    uint8_t token = 0;
+    if (xQueueReceive(s_xpQueue, &token, portMAX_DELAY) != pdTRUE) continue;
+    s_xpBusy = true;
+    Serial.println("xpost: worker run starting");
+    composeAndPost();
+    Serial.printf("xpost: worker run done (err=\"%s\")\n", s_lastError.c_str());
+    s_xpBusy = false;
+  }
+}
+
+void xpostBegin() {
+  // One-slot queue is enough — if a second trigger arrives while the
+  // worker is still running, we skip it rather than stack up duplicate
+  // posts (X 403s duplicate tweets anyway, and doubling up on a schedule
+  // is never what the user wants).
+  if (!s_xpQueue) s_xpQueue = xQueueCreate(1, sizeof(uint8_t));
+  // 12 KB stack: aiAskOneShot holds a JsonDocument, an HTTPS body string,
+  // and the Gemini response — measured peak ~9 KB. The xpostSubmit path
+  // adds OAuth signing (small) on top.
+  xTaskCreatePinnedToCore(xpostWorkerTask, "xpost", 12288, nullptr,
+                          1, nullptr, 1);
+  Serial.println("xpost: worker task started");
+}
+
+static bool enqueueRun() {
+  if (!s_xpQueue) return false;
+  if (s_xpBusy) return false;
+  if (uxQueueSpacesAvailable(s_xpQueue) == 0) return false;
+  uint8_t tok = 1;
+  return xQueueSend(s_xpQueue, &tok, 0) == pdTRUE;
+}
+
+bool xpostRunNowAsync() {
+  return enqueueRun();
 }
 
 // ---------------------------------------------------------------------------
@@ -422,13 +471,16 @@ void xpostSchedulerTick() {
   if (!devcfgXCredentialsPresent())   return;
   if (WiFi.status() != WL_CONNECTED)  return;
   if (voiceIsSpeaking())              return;   // share rule w/ heartbeat
+  if (s_xpBusy)                       return;   // previous run still in flight
 
   uint32_t intervalMs = devcfgXPostIntervalMin() * 60000UL;
   if (intervalMs < 15UL * 60000UL) intervalMs = 15UL * 60000UL;
 
   // First run after boot waits one full interval so we don't spam on
   // every reset. Subsequent runs fire `interval + backoff` after the
-  // last successful post.
+  // last enqueue. We push s_lastPostMs forward on enqueue (not on
+  // completion) so the interval math stays simple and a slow/failing
+  // run doesn't double-trigger because millis() keeps advancing.
   if (!s_firstTickDone) {
     s_lastPostMs = millis();
     s_firstTickDone = true;
@@ -437,12 +489,8 @@ void xpostSchedulerTick() {
   uint32_t due = s_lastPostMs + intervalMs + s_backoffMs;
   if ((int32_t)(millis() - due) < 0) return;
 
-  Serial.println("xpost: scheduled run firing");
-  composeAndPost();
-  // Whether success or failure, push the next attempt to `now + interval`
-  // via s_lastPostMs (success) or `now + interval + backoff` (failure,
-  // s_backoffMs already bumped inside composeAndPost).
-  if (s_lastError.length() != 0) {
+  if (enqueueRun()) {
+    Serial.println("xpost: scheduled run enqueued");
     s_lastPostMs = millis();
   }
 }

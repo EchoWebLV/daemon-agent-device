@@ -748,16 +748,47 @@ $('#xpTest').onclick = async () => {
   $('#xpResult').textContent = 'composing + posting…';
   $('#xpResult').style.color = 'var(--dim)';
   try{
+    // The worker task runs compose+post in the background so the HTTP
+    // server never blocks on LLM + HTTPS. We get 202 Accepted immediately
+    // and poll /xpost/recent to watch for the new tweet to land (or the
+    // lastError string to show up on failure).
     const r = await fetch('/xpost/test', {method:'POST'});
     const j = await r.json();
-    if (j.ok) {
-      $('#xpResult').style.color = 'var(--green)';
-      $('#xpResult').innerHTML = 'posted ✓  <a href="https://x.com/i/web/status/'+(j.tweetId||'')+'" target="_blank" style="color:var(--accent)">view</a><br>'+
-                                (j.text || '').replace(/</g,'&lt;');
-    } else {
+    if (!r.ok) {
       $('#xpResult').style.color = 'var(--red)';
-      $('#xpResult').textContent = 'failed: ' + (j.error || 'unknown');
+      $('#xpResult').textContent = 'rejected: ' + (j.error || 'unknown');
+      return;
     }
+    // Snapshot the "before" count + last error so we can distinguish
+    // the new tweet (count++) or a new failure (error changed) from
+    // stale state.
+    const beforeSnap = await (await fetch('/xpost/recent')).json();
+    const beforeCount = beforeSnap.count || 0;
+    const beforeErr   = beforeSnap.lastError || '';
+    const deadline    = Date.now() + 30000;
+    const poll = async () => {
+      if (Date.now() > deadline) {
+        $('#xpResult').style.color = 'var(--red)';
+        $('#xpResult').textContent = 'timed out waiting for worker';
+        return;
+      }
+      const jj = await (await fetch('/xpost/recent')).json();
+      if (jj.count > beforeCount && jj.posts && jj.posts.length > 0) {
+        const top = jj.posts[0];
+        $('#xpResult').style.color = 'var(--green)';
+        $('#xpResult').innerHTML =
+          'posted ✓  <a href="https://x.com/i/web/status/'+(top.id||'')+'" target="_blank" style="color:var(--accent)">view</a><br>'+
+          (top.text || '').replace(/</g,'&lt;');
+        return;
+      }
+      if (jj.lastError && jj.lastError !== beforeErr) {
+        $('#xpResult').style.color = 'var(--red)';
+        $('#xpResult').textContent = 'failed: ' + jj.lastError;
+        return;
+      }
+      setTimeout(poll, 1500);
+    };
+    setTimeout(poll, 1500);
   }catch(e){
     $('#xpResult').style.color = 'var(--red)';
     $('#xpResult').textContent = 'network error';
@@ -1082,36 +1113,31 @@ static void handleConfigPost() {
 }
 
 // ---------------------------------------------------------------------------
-// /xpost/test — run one compose + post cycle immediately using current
-// prompt + credentials. Blocks for the LLM + HTTPS round-trip, returns
-// { ok, tweetId?, text?, error? }.
+// /xpost/test — enqueue one compose + post cycle on the xpost worker task
+// and return 202 immediately. Running the compose inline on the HTTP
+// server task would block the Arduino loop (which polls HTTP) for 5-20 s
+// and trigger the Arduino task watchdog reset seen in the field.
+//
+// The browser polls /xpost/recent to watch for the new tweet appearing
+// (or xpostLastError being populated on failure).
 // ---------------------------------------------------------------------------
 static void handleXPostTest() {
-  XPostResult r = xpostRunNow();
-  String esc = r.ok ? r.tweetId : r.error;
-  esc.replace("\\", "\\\\");
-  esc.replace("\"", "\\\"");
-
-  // We don't have the tweet text back from xpostRunNow() directly, but
-  // the most-recent entry in the ring buffer matches.
-  String text;
-  XPostRecent snap[1];
-  if (r.ok && xpostGetRecent(snap, 1) > 0) text = snap[0].text;
-  text.replace("\\", "\\\\");
-  text.replace("\"", "\\\"");
-  text.replace("\n", "\\n");
-  text.replace("\r", "\\r");
-
-  String out = String("{\"ok\":") + (r.ok ? "true" : "false");
-  if (r.ok) {
-    out += ",\"tweetId\":\"" + esc + "\"";
-    out += ",\"text\":\""    + text + "\"";
-  } else {
-    out += ",\"error\":\"" + esc + "\"";
-    if (r.httpStatus) out += ",\"httpStatus\":" + String(r.httpStatus);
+  if (!devcfgXCredentialsPresent()) {
+    s_http.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"no credentials stored\"}");
+    return;
   }
-  out += "}";
-  s_http.send(200, "application/json", out);
+  if (xpostBusy()) {
+    s_http.send(409, "application/json",
+                "{\"ok\":false,\"error\":\"another post is in flight\"}");
+    return;
+  }
+  if (!xpostRunNowAsync()) {
+    s_http.send(500, "application/json",
+                "{\"ok\":false,\"error\":\"failed to enqueue\"}");
+    return;
+  }
+  s_http.send(202, "application/json", "{\"accepted\":true}");
 }
 
 // ---------------------------------------------------------------------------

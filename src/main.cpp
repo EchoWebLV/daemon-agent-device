@@ -23,6 +23,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <TFT_eSPI.h>
+#include <esp_heap_caps.h>
 
 #include "creature.h"
 #include "voice.h"
@@ -216,10 +217,37 @@ enum Screen : uint8_t {
 static Screen s_screen     = SCREEN_CREATURE;
 static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
 
+// Running low-watermark for both the general heap and internal DRAM.
+// The sprite buffer, WiFi/TLS buffers, and task stacks all live in
+// internal DRAM (PSRAM is disabled for those), so internal-free is the
+// real indicator of "about to crash from OOM". Sampled from the main
+// loop and logged on every screen switch so `pio device monitor` gives
+// us a breadcrumb trail right up to the moment of a spontaneous reset.
+static uint32_t s_heapLowWatermark    = UINT32_MAX;
+static uint32_t s_internalLowWatermark = UINT32_MAX;
+
+static void sampleHeap() {
+  uint32_t free = (uint32_t)ESP.getFreeHeap();
+  if (free < s_heapLowWatermark) s_heapLowWatermark = free;
+  uint32_t internalFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  if (internalFree < s_internalLowWatermark) s_internalLowWatermark = internalFree;
+}
+
 static void switchScreen(Screen target) {
   if (target == s_screen) return;
   // Remember the non-settings screen we came from so swipe-up restores it.
   if (target == SCREEN_SETTINGS) s_prevScreen = s_screen;
+
+  sampleHeap();
+  static const char *kNames[] = { "creature", "menu", "wallet", "xpost",
+                                  "info", "settings", "wifi" };
+  Serial.printf("screen: %s -> %s  (heap=%u/%u  dram=%u/%u)\n",
+                kNames[(int)s_screen], kNames[(int)target],
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)s_heapLowWatermark,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)s_internalLowWatermark);
+
   s_screen = target;
   switch (target) {
     case SCREEN_CREATURE: creatureRepaint();     break;
@@ -406,6 +434,15 @@ void setup() {
   s_llmOut = xQueueCreate(4, sizeof(LlmReply));
   xTaskCreatePinnedToCore(llmWorkerTask, "llm", 16384, nullptr,
                           1, nullptr, 1);
+
+  // X-posting worker — same pattern as the LLM worker. Absolutely
+  // necessary: composing a tweet goes through aiAskOneShot (5-15 s
+  // HTTPS) and then an HMAC-SHA1 OAuth 1.0a request to x.com (another
+  // 1-5 s). Running that synchronously from loop() or the HTTP handler
+  // starves touch + animation and triggers the Arduino task watchdog,
+  // which is exactly the spontaneous-reset behaviour reported in
+  // normal use.
+  xpostBegin();
 
   // Device-level settings (volume, brightness, BT). Applies brightness
   // PWM and restores last-known volume from NVS.
@@ -605,11 +642,26 @@ void loop() {
     maybeRefreshPrice();
     maybeRefreshWallet();
     maybeFireHeartbeat();
-    // X auto-poster — composes + signs + POSTs on this task. Cheap when
-    // disabled or the interval hasn't elapsed; blocks for the LLM + HTTPS
-    // round-trip (~3-8 s) when it actually fires, which is fine because
-    // we're already under the "not currently talking" gate.
+    // X auto-poster — now fully non-blocking; just enqueues a run on
+    // the xpost worker task when the interval has elapsed. Safe to call
+    // every loop iteration.
     xpostSchedulerTick();
+  }
+
+  // Periodic heap breadcrumb. Prints once a minute so when the device
+  // spontaneously resets we can look at `pio device monitor` history
+  // and see whether the heap was trending down (leak / fragmentation),
+  // stable (something else — watchdog, brownout), or crashed right
+  // after a specific subsystem's work.
+  static uint32_t s_nextHeapLogMs = 0;
+  if (millis() >= s_nextHeapLogMs) {
+    s_nextHeapLogMs = millis() + 60000;
+    sampleHeap();
+    Serial.printf("heap: free=%u lowmark=%u  dram=%u lowmark=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)s_heapLowWatermark,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)s_internalLowWatermark);
   }
 
   // Keep the top-left status showing the wallet's current USDC balance.

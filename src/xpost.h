@@ -25,6 +25,14 @@ struct XPostResult {
   int    httpStatus = 0;  // X API response status (0 = transport failure)
 };
 
+// One-time setup. Spawns the background worker task that runs the
+// compose + sign + POST pipeline so neither the Arduino loop nor the
+// HTTP server task ever blocks on LLM + HTTPS round-trips.
+void xpostBegin();
+
+// True while a compose+post is in flight on the worker task.
+bool xpostBusy();
+
 // Blocking HTTPS call. Safe to run on any task; not re-entrant (uses a
 // single shared WiFiClientSecure + HTTPClient internally).
 XPostResult xpostSubmit(const String &text);
@@ -54,11 +62,12 @@ uint32_t xpostLastSuccessMs();
 // by both scheduled runs and manual "post now" calls.
 String   xpostLastError();
 
-// Scheduler called from main.cpp loop(). Idempotent; no-ops when the
-// toggle is off or the interval hasn't elapsed.
+// Scheduler called from main.cpp loop(). Cheap and non-blocking:
+// enqueues a worker-task run when due. Safe to call every loop iteration.
 void     xpostSchedulerTick();
 
-// Manual "post now" trigger — composes a tweet from the configured prompt
-// (just like a scheduled run) and submits it. Blocks for the duration of
-// the LLM + HTTPS round-trip.
-XPostResult xpostRunNow();
+// Manual "post now" trigger — enqueues one run on the worker task and
+// returns immediately. Callers watch for a new entry in the recent
+// ring buffer (or a bump in xpostLastError) to know the result.
+// Returns false if the worker is already busy.
+bool     xpostRunNowAsync();
