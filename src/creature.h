@@ -29,6 +29,12 @@ bool creatureBegin(TFT_eSPI *tft);
 // wallet view) so Daemon reappears cleanly.
 void creatureRepaint();
 
+// Re-render the creature view (background + status + subtitle + last
+// face frame) into an off-screen sprite. Used by the slide-transition
+// module to pre-render Daemon into the moving sprite without disturbing
+// the live face buffer's animation state.
+void creatureDrawTo(TFT_eSprite *target);
+
 // Advance animation by one frame. Call as often as you like (~20 Hz is
 // plenty); internal timing handles smoothing.
 void creatureTick();

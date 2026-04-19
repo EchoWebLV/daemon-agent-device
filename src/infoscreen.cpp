@@ -244,6 +244,15 @@ void infoScreenDraw() {
   paintFooter();
 }
 
+void infoScreenDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;
+  infoScreenDraw();
+  s_tft = saved;
+  statusIconsResetCache();
+}
+
 void infoScreenTick() {
   if (!s_tft) return;
   handleInput();

@@ -749,6 +749,43 @@ void creatureRepaint() {
   drawSubtitleIfChanged(true);
 }
 
+void creatureDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;
+
+  // Same paint sequence as creatureRepaint(), but flowing through the
+  // sprite. Background, status bar, and subtitle are all driven via
+  // s_tft so the temporary swap is enough.
+  s_tft->fillScreen(C_BG);
+  s_lastStatusDrawn = "\x01invalid\x01";
+  s_lastPriceDrawn  = "\x01invalid\x01";
+  s_lastSubKey      = "\x01invalid\x01";
+  statusIconsResetCache();
+  drawStatusIfChanged(true);
+  drawSubtitleIfChanged(true);
+
+  // Push the most-recently rendered face frame into the transition
+  // sprite. s_faceBuf is bound to the real TFT (its `_tft` parent was
+  // captured in the constructor and can't be rebound), so we use
+  // pushToSprite to copy its pixels into our target sprite instead.
+  // This means the slide shows whatever face frame was last drawn —
+  // good enough for a 200 ms transition.
+  if (s_faceBuf) {
+    s_faceBuf->pushToSprite(target, FACE_X, FACE_Y);
+  }
+
+  s_tft = saved;
+
+  // Mark caches stale so the *next* live tick on the real TFT also
+  // repaints (otherwise the on-screen versions would be considered
+  // "already drawn" because we set them via the sprite path above).
+  s_lastStatusDrawn = "\x01invalid\x01";
+  s_lastPriceDrawn  = "\x01invalid\x01";
+  s_lastSubKey      = "\x01invalid\x01";
+  statusIconsResetCache();
+}
+
 void creatureSetMood(CreatureMood m)    { s_mood = m; }
 void creatureSetTalking(bool on)        { s_talking = on; if (!on) s_mouthEnv = 0.0f; }
 void creatureForceBlink()               { s_forceBlink = true; }

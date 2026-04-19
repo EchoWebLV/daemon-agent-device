@@ -311,6 +311,20 @@ void walletScreenDraw() {
   s_lastTokenCount = walletTokenCount();
 }
 
+void walletScreenDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;
+  walletScreenDraw();
+  s_tft = saved;
+  // The cached "QR was drawn for this address" sentinel got set against
+  // the sprite paint above; clear it so a follow-up live tick on the
+  // real TFT will repaint the QR rather than thinking it's already
+  // up to date.
+  s_qrAddrDrawn = "";
+  statusIconsResetCache();
+}
+
 void walletScreenTick() {
   if (!s_tft) return;
 

@@ -14,6 +14,12 @@ bool menuScreenBegin(TFT_eSPI *tft);
 void menuScreenDraw();   // full repaint (call on enter)
 void menuScreenTick();   // called each frame while visible
 
+// Re-renders the entire menu into the supplied off-screen sprite.
+// Used by the slide-transition module to pre-render both sides of the
+// animation. Internally this just temporarily binds the screen's
+// painting target to the sprite, runs the existing draw, and restores.
+void menuScreenDrawTo(TFT_eSprite *target);
+
 // Edge-triggered: each of these returns true exactly once after the user
 // taps the corresponding tile / close button. Main consumes the signal
 // and pushes the matching screen.

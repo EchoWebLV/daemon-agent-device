@@ -255,6 +255,18 @@ void menuScreenDraw() {
   s_lastDrawnHeld = s_heldTile;
 }
 
+void menuScreenDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;          // every paint helper writes through s_tft
+  menuScreenDraw();
+  s_tft = saved;
+  // Mark the status-icon cache stale so the next live tick repaints
+  // it on the real TFT instead of skipping (we just painted to the
+  // sprite, which counts as "drew the icons" from its POV).
+  statusIconsResetCache();
+}
+
 void menuScreenTick() {
   if (!s_tft) return;
   handleInput();

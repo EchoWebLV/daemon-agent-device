@@ -13,5 +13,9 @@ bool xpostScreenBegin(TFT_eSPI *tft);
 void xpostScreenDraw();   // full repaint (call on enter)
 void xpostScreenTick();   // called each frame while visible
 
+// Re-render the entire X-posts panel into an off-screen sprite for
+// the slide-transition module.
+void xpostScreenDrawTo(TFT_eSprite *target);
+
 // True exactly once after the user taps the close "x" button.
 bool xpostScreenConsumeClose();

@@ -314,6 +314,15 @@ void xpostScreenDraw() {
   s_lastTickMs = millis();
 }
 
+void xpostScreenDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;
+  xpostScreenDraw();
+  s_tft = saved;
+  statusIconsResetCache();
+}
+
 void xpostScreenTick() {
   if (!s_tft) return;
   handleInput();

@@ -298,6 +298,15 @@ void settingsScreenDraw() {
   Serial.println("settings: shown");
 }
 
+void settingsScreenDrawTo(TFT_eSprite *target) {
+  if (!target) return;
+  TFT_eSPI *saved = s_tft;
+  s_tft = target;
+  settingsScreenDraw();
+  s_tft = saved;
+  statusIconsResetCache();
+}
+
 static bool inRect(int16_t x, int16_t y,
                    int16_t rx, int16_t ry, int16_t rw, int16_t rh) {
   return x >= rx && x < rx + rw && y >= ry && y < ry + rh;

@@ -12,5 +12,9 @@ bool infoScreenBegin(TFT_eSPI *tft);
 void infoScreenDraw();   // full repaint (call on enter)
 void infoScreenTick();   // called each frame while visible
 
+// Re-render the entire info panel into an off-screen sprite for the
+// slide-transition module.
+void infoScreenDrawTo(TFT_eSprite *target);
+
 // True exactly once after the user taps the close button.
 bool infoScreenConsumeClose();

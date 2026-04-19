@@ -41,6 +41,7 @@
 #include "infoscreen.h"
 #include "xpostscreen.h"
 #include "xpost.h"
+#include "transition.h"
 #include "devcfg.h"
 #include "secrets.h"
 
@@ -242,6 +243,50 @@ static void sampleHeap() {
   if (internalFree < s_internalLowWatermark) s_internalLowWatermark = internalFree;
 }
 
+// Map a (from, to) pair to a TransitionDraw callback for each side.
+// A nullptr return means "no DrawTo wrapper exists for this screen" —
+// the transition module handles that as a black fallback.
+static TransitionDraw drawToFor(Screen s) {
+  switch (s) {
+    case SCREEN_CREATURE: return creatureDrawTo;
+    case SCREEN_MENU:     return menuScreenDrawTo;
+    case SCREEN_WALLET:   return walletScreenDrawTo;
+    case SCREEN_XPOST:    return xpostScreenDrawTo;
+    case SCREEN_INFO:     return infoScreenDrawTo;
+    case SCREEN_SETTINGS: return settingsScreenDrawTo;
+    case SCREEN_WIFI:     return nullptr;        // wifi is a sub-flow, no slide for now
+  }
+  return nullptr;
+}
+
+// Decide which way the transition should travel. The "drawer" model is
+//   - Menu / Wallet / X / Info       → live BELOW the creature (rise UP)
+//   - Settings / Wifi                → live ABOVE the creature (drop DOWN)
+// So opening any "below" drawer slides UP; closing it slides DOWN. Same
+// pair, mirrored, for the "above" drawers. Lateral / unknown pairs
+// default to UP — picked because creature→menu (the most common move)
+// is already an UP slide.
+static SlideDir slideDirFor(Screen from, Screen to) {
+  auto isBelow = [](Screen s) {
+    return s == SCREEN_MENU || s == SCREEN_WALLET ||
+           s == SCREEN_XPOST || s == SCREEN_INFO;
+  };
+  auto isAbove = [](Screen s) {
+    return s == SCREEN_SETTINGS || s == SCREEN_WIFI;
+  };
+  // Opening: creature → drawer
+  if (from == SCREEN_CREATURE && isBelow(to)) return SLIDE_UP;
+  if (from == SCREEN_CREATURE && isAbove(to)) return SLIDE_DOWN;
+  // Closing: drawer → creature
+  if (isBelow(from) && to == SCREEN_CREATURE) return SLIDE_DOWN;
+  if (isAbove(from) && to == SCREEN_CREATURE) return SLIDE_UP;
+  // Sub-drawer transitions inside the menu (menu → wallet/x/info).
+  // Treat as "going deeper" — slide UP. Reverse goes DOWN.
+  if (from == SCREEN_MENU && isBelow(to)) return SLIDE_UP;
+  if (isBelow(from) && to == SCREEN_MENU) return SLIDE_DOWN;
+  return SLIDE_UP;
+}
+
 static void switchScreen(Screen target) {
   if (target == s_screen) return;
   // Remember the non-settings screen we came from so swipe-up restores it.
@@ -257,15 +302,38 @@ static void switchScreen(Screen target) {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                 (unsigned)s_internalLowWatermark);
 
+  Screen from = s_screen;
   s_screen = target;
-  switch (target) {
-    case SCREEN_CREATURE: creatureRepaint();     break;
-    case SCREEN_MENU:     menuScreenDraw();      break;
-    case SCREEN_WALLET:   walletScreenDraw();    break;
-    case SCREEN_XPOST:    xpostScreenDraw();     break;
-    case SCREEN_INFO:     infoScreenDraw();      break;
-    case SCREEN_SETTINGS: settingsScreenDraw();  break;
-    case SCREEN_WIFI:     wifiScreenEnter();     break;
+
+  // Animated slide between the old and new screens. Both sides need a
+  // DrawTo wrapper for the slide to look correct; if either side is
+  // missing (e.g. wifi sub-screen), we skip the slide and fall through
+  // to a normal full repaint of the target.
+  TransitionDraw drawOut = drawToFor(from);
+  TransitionDraw drawIn  = drawToFor(target);
+  bool slid = false;
+  if (drawOut && drawIn) {
+    SlideDir dir = slideDirFor(from, target);
+    transitionRunSlide(dir, drawIn, drawOut);
+    slid = true;
+    // The slide already left a fully-painted incoming sprite on the
+    // display. Calling the normal *Draw() right now would fillScreen()
+    // black before re-painting, producing a brief flash — visible to
+    // the user as a flicker right at the end of every transition. The
+    // per-screen tick (or `wifiScreenEnter`) takes over from here and
+    // refreshes any live pixels organically over the next few frames.
+  }
+
+  if (!slid) {
+    switch (target) {
+      case SCREEN_CREATURE: creatureRepaint();     break;
+      case SCREEN_MENU:     menuScreenDraw();      break;
+      case SCREEN_WALLET:   walletScreenDraw();    break;
+      case SCREEN_XPOST:    xpostScreenDraw();     break;
+      case SCREEN_INFO:     infoScreenDraw();      break;
+      case SCREEN_SETTINGS: settingsScreenDraw();  break;
+      case SCREEN_WIFI:     wifiScreenEnter();     break;
+    }
   }
 }
 
@@ -430,6 +498,10 @@ void setup() {
   menuScreenBegin(&tft);
   infoScreenBegin(&tft);
   xpostScreenBegin(&tft);
+  // Slide-transition sprites live in PSRAM (300 KB total). If allocation
+  // fails (PSRAM disabled / exhausted) the transition module silently
+  // degrades to instant snaps — main flow still works.
+  transitionBegin(&tft);
   touchBegin();
   creatureSetStatus("WAKING UP");
   creatureTick();   // first frame
