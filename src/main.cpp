@@ -43,6 +43,8 @@
 #include "infoscreen.h"
 #include "xpostscreen.h"
 #include "xpost.h"
+#include "moltbookscreen.h"
+#include "moltbook.h"
 #include "transition.h"
 #include "devcfg.h"
 #include "secrets.h"
@@ -76,7 +78,7 @@ static bool     s_heartbeatPrimed = false;
 // creature animation, touch, and HTTP polling stay live during the 10-30 s
 // round-trip (LLM + tool x402 payments + follow-up LLM rounds).
 // ---------------------------------------------------------------------------
-struct LlmReq { char text[1024]; };
+struct LlmReq { char text[1024]; bool lite; };
 struct LlmReply {
   char user[1024];
   char reply[1600];
@@ -98,7 +100,8 @@ static void llmWorkerTask(void *) {
 
     String user = String(req.text);
     String reply;
-    bool ok = aiAsk(user, reply);
+    bool ok = req.lite ? aiAskOneShotLite(user, reply)
+                       : aiAsk(user, reply);
 
     Serial.printf("llm: worker done   dram=%u stack=%u reply=%u\n",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -242,13 +245,14 @@ static void drainLlmReplies() {
 // (sub-screens reachable from the menu), settings (pull-down from top),
 // wifi (sub-screen of settings).
 enum Screen : uint8_t {
-  SCREEN_CREATURE = 0,
-  SCREEN_MENU     = 1,
-  SCREEN_WALLET   = 2,
-  SCREEN_XPOST    = 3,   // recent X posts, reached from Menu
-  SCREEN_INFO     = 4,
-  SCREEN_SETTINGS = 5,
-  SCREEN_WIFI     = 6,   // sub-screen reached from Settings
+  SCREEN_CREATURE  = 0,
+  SCREEN_MENU      = 1,
+  SCREEN_WALLET    = 2,
+  SCREEN_XPOST     = 3,   // recent X posts, reached from Menu
+  SCREEN_MOLTBOOK  = 4,   // Moltbook posts, reached from Menu
+  SCREEN_INFO      = 5,
+  SCREEN_SETTINGS  = 6,
+  SCREEN_WIFI      = 7,   // sub-screen reached from Settings
 };
 static Screen s_screen     = SCREEN_CREATURE;
 static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
@@ -278,6 +282,7 @@ static TransitionDraw drawToFor(Screen s) {
     case SCREEN_MENU:     return menuScreenDrawTo;
     case SCREEN_WALLET:   return walletScreenDrawTo;
     case SCREEN_XPOST:    return xpostScreenDrawTo;
+    case SCREEN_MOLTBOOK: return moltbookScreenDrawTo;
     case SCREEN_INFO:     return infoScreenDrawTo;
     case SCREEN_SETTINGS: return settingsScreenDrawTo;
     case SCREEN_WIFI:     return nullptr;        // wifi is a sub-flow, no slide for now
@@ -295,7 +300,7 @@ static TransitionDraw drawToFor(Screen s) {
 static SlideDir slideDirFor(Screen from, Screen to) {
   auto isBelow = [](Screen s) {
     return s == SCREEN_MENU || s == SCREEN_WALLET ||
-           s == SCREEN_XPOST || s == SCREEN_INFO;
+           s == SCREEN_XPOST || s == SCREEN_MOLTBOOK || s == SCREEN_INFO;
   };
   auto isAbove = [](Screen s) {
     return s == SCREEN_SETTINGS || s == SCREEN_WIFI;
@@ -320,7 +325,7 @@ static void switchScreen(Screen target) {
 
   sampleHeap();
   static const char *kNames[] = { "creature", "menu", "wallet", "xpost",
-                                  "info", "settings", "wifi" };
+                                  "moltbook", "info", "settings", "wifi" };
   Serial.printf("screen: %s -> %s  (heap=%u/%u  dram=%u/%u)\n",
                 kNames[(int)s_screen], kNames[(int)target],
                 (unsigned)ESP.getFreeHeap(),
@@ -352,13 +357,14 @@ static void switchScreen(Screen target) {
 
   if (!slid) {
     switch (target) {
-      case SCREEN_CREATURE: creatureRepaint();     break;
-      case SCREEN_MENU:     menuScreenDraw();      break;
-      case SCREEN_WALLET:   walletScreenDraw();    break;
-      case SCREEN_XPOST:    xpostScreenDraw();     break;
-      case SCREEN_INFO:     infoScreenDraw();      break;
-      case SCREEN_SETTINGS: settingsScreenDraw();  break;
-      case SCREEN_WIFI:     wifiScreenEnter();     break;
+      case SCREEN_CREATURE:  creatureRepaint();       break;
+      case SCREEN_MENU:      menuScreenDraw();       break;
+      case SCREEN_WALLET:    walletScreenDraw();     break;
+      case SCREEN_XPOST:     xpostScreenDraw();      break;
+      case SCREEN_MOLTBOOK:  moltbookScreenDraw();   break;
+      case SCREEN_INFO:      infoScreenDraw();       break;
+      case SCREEN_SETTINGS:  settingsScreenDraw();   break;
+      case SCREEN_WIFI:      wifiScreenEnter();      break;
     }
   }
 }
@@ -366,7 +372,7 @@ static void switchScreen(Screen target) {
 // ---------------------------------------------------------------------------
 // The core "ask Gemini + speak" pipeline.
 // ---------------------------------------------------------------------------
-static void handleUtterance(const String &user) {
+static void handleUtterance(const String &user, bool lite = false) {
   Serial.print(">> you:    "); Serial.println(user);
 
   // NOTE: we don't touch the mood silence-counter here because
@@ -393,6 +399,7 @@ static void handleUtterance(const String &user) {
   size_t n = user.length();
   if (n >= sizeof(req.text)) n = sizeof(req.text) - 1;
   memcpy(req.text, user.c_str(), n);
+  req.lite = lite;
 
   // Last-wins: if a previous request is still queued, drop it so the
   // newest utterance takes priority.
@@ -490,9 +497,10 @@ static void maybeFireHeartbeat() {
   // "never fired" and loops.
   s_lastHeartbeatMs = millis() | 1UL;
 
-  // Hand the heartbeat prompt to the LLM worker just like a normal chat
-  // so the main loop keeps animating while Gemini thinks.
-  handleUtterance(prompt);
+  // Hand the heartbeat prompt to the LLM worker in lite mode (no tools,
+  // minimal system prompt) so it uses less heap — critical after a prior
+  // chat + TTS has fragmented memory.
+  handleUtterance(prompt, /*lite=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +597,7 @@ void setup() {
   menuScreenBegin(&tft);
   infoScreenBegin(&tft);
   xpostScreenBegin(&tft);
+  moltbookScreenBegin(&tft);
   // Slide-transition sprites live in PSRAM (300 KB total). If allocation
   // fails (PSRAM disabled / exhausted) the transition module silently
   // degrades to instant snaps — main flow still works.
@@ -604,7 +613,7 @@ void setup() {
   // stays free to animate + service HTTP + touch during processing.
   s_llmIn  = xQueueCreate(2, sizeof(LlmReq));
   s_llmOut = xQueueCreate(4, sizeof(LlmReply));
-  xTaskCreatePinnedToCore(llmWorkerTask, "llm", 16384, nullptr,
+  xTaskCreatePinnedToCore(llmWorkerTask, "llm", 20480, nullptr,
                           1, nullptr, 1);
 
   // X-posting worker — same pattern as the LLM worker. Absolutely
@@ -615,6 +624,7 @@ void setup() {
   // which is exactly the spontaneous-reset behaviour reported in
   // normal use.
   xpostBegin();
+  moltbookBegin();
 
   // Device-level settings (volume, brightness, BT). Applies brightness
   // PWM and restores last-known volume from NVS.
@@ -784,6 +794,7 @@ void loop() {
     if (menuScreenConsumeClose())           switchScreen(SCREEN_CREATURE);
     if (menuScreenConsumeWalletTap())       switchScreen(SCREEN_WALLET);
     if (menuScreenConsumeXTap())            switchScreen(SCREEN_XPOST);
+    if (menuScreenConsumeMoltbookTap())     switchScreen(SCREEN_MOLTBOOK);
     if (menuScreenConsumeInfoTap())         switchScreen(SCREEN_INFO);
   } else if (s_screen == SCREEN_WALLET) {
     // Wallet is a sub-screen. Any swipe-down or close dismisses straight
@@ -792,6 +803,9 @@ void loop() {
   } else if (s_screen == SCREEN_XPOST) {
     if (sw == SWIPE_DOWN)           switchScreen(SCREEN_CREATURE);
     if (xpostScreenConsumeClose())  switchScreen(SCREEN_CREATURE);
+  } else if (s_screen == SCREEN_MOLTBOOK) {
+    if (sw == SWIPE_DOWN)               switchScreen(SCREEN_CREATURE);
+    if (moltbookScreenConsumeClose())   switchScreen(SCREEN_CREATURE);
   } else if (s_screen == SCREEN_INFO) {
     if (sw == SWIPE_DOWN)           switchScreen(SCREEN_CREATURE);
     if (infoScreenConsumeClose())   switchScreen(SCREEN_CREATURE);
@@ -873,6 +887,7 @@ void loop() {
     case SCREEN_MENU:     menuScreenTick();     break;
     case SCREEN_WALLET:   walletScreenTick();   break;
     case SCREEN_XPOST:    xpostScreenTick();    break;
+    case SCREEN_MOLTBOOK: moltbookScreenTick(); break;
     case SCREEN_INFO:     infoScreenTick();     break;
     case SCREEN_SETTINGS: settingsScreenTick(); break;
     case SCREEN_WIFI:     wifiScreenTick();     break;
@@ -903,6 +918,7 @@ void loop() {
     // the xpost worker task when the interval has elapsed. Safe to call
     // every loop iteration.
     xpostSchedulerTick();
+    moltbookSchedulerTick();
   }
 
   // Periodic heap breadcrumb. Prints once a minute so when the device

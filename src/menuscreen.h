@@ -25,5 +25,6 @@ void menuScreenDrawTo(TFT_eSprite *target);
 // and pushes the matching screen.
 bool menuScreenConsumeWalletTap();
 bool menuScreenConsumeXTap();
+bool menuScreenConsumeMoltbookTap();
 bool menuScreenConsumeInfoTap();
 bool menuScreenConsumeClose();

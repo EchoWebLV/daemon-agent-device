@@ -17,6 +17,11 @@ bool  aiAsk(const String &userText, String &outReply);   // blocking HTTPS call
 // "say something random" chatter like the Solana ticker.
 bool  aiAskOneShot(const String &prompt, String &outReply);
 
+// Lightweight one-shot: minimal system prompt (personality only, no wallet
+// state / mood / anti-repeat context). Uses far less heap, which matters on
+// the Moltbook worker where the full prompt + x402 flow can exhaust DRAM.
+bool  aiAskOneShotLite(const String &prompt, String &outReply);
+
 // Seed the in-memory chat history directly (e.g. from the on-chain
 // memory module at boot). Each turn is a {role, text} pair where role is
 // "user" or "model". Replaces whatever was in history before.

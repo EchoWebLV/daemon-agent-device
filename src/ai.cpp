@@ -72,7 +72,7 @@ struct Turn {
   String text;
 };
 
-static constexpr int MAX_TURNS = 10;
+static constexpr int MAX_TURNS = 6;
 static Turn s_history[MAX_TURNS];
 static int  s_histLen = 0;
 
@@ -140,7 +140,8 @@ static bool chatRoundThroughX402(const String &model,
   X402Result r = x402Post(String(LLM_ENDPOINT), payload);
   if (r.status != 200) {
     Serial.printf("ai: x402 %d (err=%s)\n", r.status, r.error.c_str());
-    outReply = (r.status == 402) ? "Couldn't complete USDC payment for this reply."
+    outReply = (r.status == 402)
+             ? String("x402 payment failed: ") + r.error
              : (r.error.length() > 0 ? r.error : String("HTTP ") + r.status);
     return false;
   }
@@ -307,4 +308,48 @@ bool aiAskOneShot(const String &prompt, String &outReply) {
   bool ok = runChatLoop(working, maxTok, temp, outReply);
   if (ok) moodNoteDaemonReply(outReply);
   return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight one-shot — minimal system prompt to save heap.
+// The full buildSystemPrompt() includes wallet context, mood state, and
+// anti-repeat history which can add ~2 KB of text. On the Moltbook worker
+// task, that extra payload pushes heap below the NetGate DRAM floor after
+// the first 402 response, making the RPC calls for the payment impossible.
+// This variant uses only the personality string.
+// ---------------------------------------------------------------------------
+bool aiAskOneShotLite(const String &prompt, String &outReply) {
+  if (prompt.length() == 0) return false;
+
+  String personality = devcfgPersonality();
+  if (personality.length() == 0) personality = String(PERSONA);
+
+  JsonDocument msgsDoc;
+  JsonArray working = msgsDoc.to<JsonArray>();
+  JsonObject sys = working.add<JsonObject>();
+  sys["role"]    = "system";
+  sys["content"] = personality;
+  JsonObject usr = working.add<JsonObject>();
+  usr["role"]    = "user";
+  usr["content"] = prompt;
+
+  // Single round, no tools — saves heap by skipping tool definitions and
+  // the tool-calling loop. Critical for the Moltbook worker where every
+  // KB counts to stay above the NetGate DRAM floor.
+  JsonDocument resp;
+  JsonArrayConst noTools;   // null → no tools sent
+  if (!chatRoundThroughX402(devcfgLlmModel(), working, noTools,
+                            256, 0.9f, resp, outReply)) {
+    return false;
+  }
+  const char *txt = resp["choices"][0]["message"]["content"] | "";
+  String reply = String(txt);
+  reply.trim();
+  if (reply.length() == 0) {
+    outReply = "I forgot what I was going to say.";
+    return false;
+  }
+  outReply = reply;
+  moodNoteDaemonReply(outReply);
+  return true;
 }

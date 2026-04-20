@@ -68,6 +68,9 @@ static String   s_xAccessToken;
 static String   s_xAccessTokenSecret;
 static bool     s_xCredsPresent = false;
 
+// Moltbook API key — cached in RAM like X credentials.
+static String s_moltbookApiKey;
+
 static void recomputeXCredsPresent() {
   s_xCredsPresent = s_xApiKey.length()            > 0 &&
                     s_xApiSecret.length()         > 0 &&
@@ -106,6 +109,18 @@ void devcfgBegin() {
     s_xAccessToken       = s_nvs.isKey("xo_tk") ? s_nvs.getString("xo_tk", "") : String();
     s_xAccessTokenSecret = s_nvs.isKey("xo_ts") ? s_nvs.getString("xo_ts", "") : String();
     recomputeXCredsPresent();
+
+    // Moltbook API key — seed from compile-time define if NVS is empty.
+    s_moltbookApiKey = s_nvs.isKey("mb_key") ? s_nvs.getString("mb_key", "") : String();
+#ifdef MOLTBOOK_API_KEY
+    if (s_moltbookApiKey.length() == 0) {
+      String compiled = String(MOLTBOOK_API_KEY);
+      if (compiled.length() > 0 && compiled != "your-moltbook-api-key") {
+        s_moltbookApiKey = compiled;
+        s_nvs.putString("mb_key", compiled);
+      }
+    }
+#endif
 
     s_nvs.end();
   }
@@ -435,3 +450,66 @@ void devcfgSetXAccessTokenSecret(const String &v) {
 }
 
 bool devcfgXCredentialsPresent() { return s_xCredsPresent; }
+
+// ---- Moltbook (moltbook.com) auto-poster --------------------------------
+// NVS keys use "mb_" prefix.
+
+bool devcfgMoltbookEnabled() {
+  NvsLock lk;
+  s_nvs.begin("daemon", true);
+  bool v = s_nvs.getBool("mb_on", false);
+  s_nvs.end();
+  return v;
+}
+void devcfgSetMoltbookEnabled(bool on) {
+  NvsLock lk;
+  s_nvs.begin("daemon", false);
+  s_nvs.putBool("mb_on", on);
+  s_nvs.end();
+}
+
+String devcfgMoltbookPrompt() {
+  NvsLock lk;
+  s_nvs.begin("daemon", true);
+  String v = s_nvs.getString("mb_prompt", "");
+  s_nvs.end();
+  return v;
+}
+void devcfgSetMoltbookPrompt(const String &p) {
+  String clamped = p;
+  if (clamped.length() > 1200) clamped.remove(1200);
+  NvsLock lk;
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("mb_prompt", clamped);
+  s_nvs.end();
+}
+
+uint32_t devcfgMoltbookIntervalMin() {
+  uint32_t v;
+  {
+    NvsLock lk;
+    s_nvs.begin("daemon", true);
+    v = s_nvs.getUInt("mb_min", 60);
+    s_nvs.end();
+  }
+  if (v < 30)   v = 30;    // Moltbook rate limit: 1 post per 30 min
+  if (v > 1440) v = 1440;
+  return v;
+}
+void devcfgSetMoltbookIntervalMin(uint32_t minutes) {
+  if (minutes < 30)   minutes = 30;
+  if (minutes > 1440) minutes = 1440;
+  NvsLock lk;
+  s_nvs.begin("daemon", false);
+  s_nvs.putUInt("mb_min", minutes);
+  s_nvs.end();
+}
+
+String devcfgMoltbookApiKey() { return s_moltbookApiKey; }
+void devcfgSetMoltbookApiKey(const String &v) {
+  s_moltbookApiKey = v;
+  NvsLock lk;
+  s_nvs.begin("daemon", false);
+  s_nvs.putString("mb_key", v);
+  s_nvs.end();
+}

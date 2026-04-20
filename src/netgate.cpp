@@ -20,7 +20,8 @@ static constexpr int MAX_CONCURRENT_TLS = 2;
 // handshake plus the HTTPClient response buffer. Below this we make
 // the caller wait rather than risk a malloc failure inside the TLS
 // stack (which asserts/aborts on the ESP32).
-static constexpr uint32_t MIN_FREE_INTERNAL_DRAM = 60 * 1024;
+static constexpr uint32_t MIN_FREE_INTERNAL_DRAM          = 50 * 1024;
+static constexpr uint32_t MIN_FREE_INTERNAL_DRAM_CRITICAL = 30 * 1024;
 
 // Low-priority callers give up earlier so they don't pile up while
 // Critical callers (voice, LLM) are holding both slots.
@@ -41,8 +42,11 @@ static void ensureGate() {
   }
 }
 
-static bool heapOk() {
-  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= MIN_FREE_INTERNAL_DRAM;
+static bool heapOk(NetGate::Priority prio) {
+  uint32_t floor = (prio == NetGate::Priority::Critical)
+                   ? MIN_FREE_INTERNAL_DRAM_CRITICAL
+                   : MIN_FREE_INTERNAL_DRAM;
+  return heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= floor;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,12 +74,15 @@ NetGate::NetGate(const char *tag, Priority prio, uint32_t waitTimeoutMs)
   // Then wait for DRAM. Poll every 100 ms up to the same timeout so a
   // transient allocation spike doesn't force us to give up immediately.
   uint32_t deadline = millis() + timeoutMs;
-  while (!heapOk()) {
+  while (!heapOk(prio_)) {
     if (millis() > deadline) {
+      uint32_t need = (prio_ == Priority::Critical)
+                      ? MIN_FREE_INTERNAL_DRAM_CRITICAL
+                      : MIN_FREE_INTERNAL_DRAM;
       Serial.printf("netgate[%s]: dram floor (free=%u need=%u prio=%u)\n",
                     tag_,
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                    (unsigned)MIN_FREE_INTERNAL_DRAM,
+                    (unsigned)need,
                     (unsigned)prio_);
       xSemaphoreGive(s_slots);
       return;

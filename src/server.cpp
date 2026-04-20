@@ -3,6 +3,7 @@
 #include "devcfg.h"
 #include "memory.h"
 #include "xpost.h"
+#include "moltbook.h"
 #include "wallet.h"
 
 #include <WiFi.h>
@@ -214,6 +215,26 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
       <button class="btn" id="saveXPost">save x post</button>
     </div>
     <p class="hint" id="xpResult" style="margin:8px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
+  </div>
+  <div class="card">
+    <h3>MOLTBOOK</h3>
+    <p class="hint">Auto-post to <a href="https://www.moltbook.com" target="_blank" style="color:var(--accent)">Moltbook</a> — a social network for AI agents. Register your agent to get an API key (starts with <code>moltbook_sk_</code>).</p>
+    <label>API KEY</label>
+    <input id="mbApiKey" type="password" autocomplete="off" placeholder="moltbook_sk_…"/>
+    <p class="hint" id="mbKeyStatus" style="margin:4px 0 8px;font-family:ui-monospace,monospace;font-size:11px"></p>
+    <label>TOPIC PROMPT</label>
+    <textarea id="mbPrompt" rows="3" placeholder="e.g. Write a bullish post about embodied AI agents on Solana"></textarea>
+    <label>INTERVAL (minutes, min 30)</label>
+    <input id="mbInterval" type="number" min="30" max="1440" placeholder="60"/>
+    <div class="row" style="align-items:center;gap:10px;margin-top:10px;margin-bottom:6px">
+      <button class="toggle" id="mbToggle" aria-label="moltbook on/off"></button>
+      <span id="mbStatus" style="font-size:12px;color:var(--dim)">off</span>
+    </div>
+    <div class="row" style="margin-top:10px;gap:6px;justify-content:flex-end">
+      <button class="btn ghost" id="mbTest">post now</button>
+      <button class="btn" id="saveMoltbook">save moltbook</button>
+    </div>
+    <p class="hint" id="mbResult" style="margin:8px 0 0;font-family:ui-monospace,monospace;font-size:11px"></p>
   </div>
 </div>
 
@@ -585,6 +606,7 @@ async function loadCfg(){
   if(cfg.memoryEnabled) refreshMemoryStats();
   renderHeartbeat();
   renderXPost();
+  renderMoltbook();
   renderServices();
   refreshWalletCard();
 }
@@ -792,6 +814,82 @@ $('#xpTest').onclick = async () => {
   }catch(e){
     $('#xpResult').style.color = 'var(--red)';
     $('#xpResult').textContent = 'network error';
+  }
+};
+
+// ────────── moltbook ──────────
+function renderMoltbook(){
+  const on = !!cfg.moltbookEnabled;
+  $('#mbToggle').classList.toggle('on', on);
+  $('#mbStatus').textContent = on ? 'on' : 'off';
+  $('#mbPrompt').value = cfg.moltbookPrompt || '';
+  $('#mbInterval').value = cfg.moltbookIntervalMin || 60;
+  const msg = cfg.moltbookApiKeySet ? 'API key stored ✓ (leave blank to keep it)' : 'no API key set';
+  $('#mbKeyStatus').textContent = msg;
+  $('#mbKeyStatus').style.color = cfg.moltbookApiKeySet ? 'var(--green)' : 'var(--dim)';
+}
+
+$('#mbToggle').onclick = async () => {
+  cfg.moltbookEnabled = !cfg.moltbookEnabled;
+  renderMoltbook();
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({moltbookEnabled: cfg.moltbookEnabled})});
+};
+
+$('#saveMoltbook').onclick = async () => {
+  const body = {};
+  const key = $('#mbApiKey').value.trim();
+  if (key) body.moltbookApiKey = key;
+  const prompt = $('#mbPrompt').value.trim();
+  const interval = Math.max(30, Math.min(1440, parseInt($('#mbInterval').value) || 60));
+  body.moltbookPrompt = prompt;
+  body.moltbookIntervalMin = interval;
+  await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)});
+  if (key) $('#mbApiKey').value = '';
+  $('#status').textContent = 'moltbook saved';
+  await loadCfg();
+};
+
+$('#mbTest').onclick = async () => {
+  $('#mbResult').textContent = 'composing + posting…';
+  $('#mbResult').style.color = 'var(--dim)';
+  try{
+    const r = await fetch('/moltbook/test', {method:'POST'});
+    const j = await r.json();
+    if (!r.ok) {
+      $('#mbResult').style.color = 'var(--red)';
+      $('#mbResult').textContent = 'rejected: ' + (j.error || 'unknown');
+      return;
+    }
+    const beforeSnap = await (await fetch('/moltbook/recent')).json();
+    const beforeCount = beforeSnap.count || 0;
+    const beforeErr   = beforeSnap.lastError || '';
+    const deadline    = Date.now() + 30000;
+    const poll = async () => {
+      if (Date.now() > deadline) {
+        $('#mbResult').style.color = 'var(--red)';
+        $('#mbResult').textContent = 'timed out waiting for worker';
+        return;
+      }
+      const jj = await (await fetch('/moltbook/recent')).json();
+      if (jj.count > beforeCount && jj.posts && jj.posts.length > 0) {
+        const top = jj.posts[0];
+        $('#mbResult').style.color = 'var(--green)';
+        $('#mbResult').textContent = 'posted ✓  ' + (top.text || '').substring(0, 80);
+        return;
+      }
+      if (jj.lastError && jj.lastError !== beforeErr) {
+        $('#mbResult').style.color = 'var(--red)';
+        $('#mbResult').textContent = 'failed: ' + jj.lastError;
+        return;
+      }
+      setTimeout(poll, 1500);
+    };
+    setTimeout(poll, 1500);
+  }catch(e){
+    $('#mbResult').style.color = 'var(--red)';
+    $('#mbResult').textContent = 'network error';
   }
 };
 
@@ -1028,6 +1126,14 @@ static void handleConfigGet() {
   bool haveXT  = devcfgXAccessToken().length()       > 0;
   bool haveXTS = devcfgXAccessTokenSecret().length() > 0;
 
+  // Moltbook prompt (escaped the same way as the others).
+  String mbp = devcfgMoltbookPrompt();
+  mbp.replace("\\", "\\\\");
+  mbp.replace("\"", "\\\"");
+  mbp.replace("\n", "\\n");
+  mbp.replace("\r", "\\r");
+  mbp.replace("\t", "\\t");
+
   String out = "{";
   out += "\"model\":\""         + devcfgLlmModel()         + "\",";
   out += "\"personality\":\""   + p                         + "\",";
@@ -1044,7 +1150,11 @@ static void handleConfigGet() {
   out += "\"xApiKeySet\":"            + String(haveXK  ? "true" : "false") + ",";
   out += "\"xApiSecretSet\":"         + String(haveXKS ? "true" : "false") + ",";
   out += "\"xAccessTokenSet\":"       + String(haveXT  ? "true" : "false") + ",";
-  out += "\"xAccessTokenSecretSet\":" + String(haveXTS ? "true" : "false");
+  out += "\"xAccessTokenSecretSet\":" + String(haveXTS ? "true" : "false") + ",";
+  out += "\"moltbookEnabled\":"       + String(devcfgMoltbookEnabled() ? "true" : "false") + ",";
+  out += "\"moltbookApiKeySet\":"     + String(devcfgMoltbookApiKey().length() > 0 ? "true" : "false") + ",";
+  out += "\"moltbookPrompt\":\""      + mbp + "\",";
+  out += "\"moltbookIntervalMin\":"   + String(devcfgMoltbookIntervalMin());
   out += "}";
   s_http.send(200, "application/json", out);
 }
@@ -1109,6 +1219,15 @@ static void handleConfigPost() {
     devcfgSetXAccessToken(doc["xAccessToken"].as<String>());
   if (doc["xAccessTokenSecret"].is<const char*>())
     devcfgSetXAccessTokenSecret(doc["xAccessTokenSecret"].as<String>());
+  // Moltbook settings
+  if (doc["moltbookEnabled"].is<bool>())
+    devcfgSetMoltbookEnabled(doc["moltbookEnabled"].as<bool>());
+  if (doc["moltbookApiKey"].is<const char*>())
+    devcfgSetMoltbookApiKey(doc["moltbookApiKey"].as<String>());
+  if (doc["moltbookPrompt"].is<const char*>())
+    devcfgSetMoltbookPrompt(doc["moltbookPrompt"].as<String>());
+  if (doc["moltbookIntervalMin"].is<int>())
+    devcfgSetMoltbookIntervalMin((uint32_t)doc["moltbookIntervalMin"].as<int>());
   s_http.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1166,6 +1285,56 @@ static void handleXPostRecent() {
   out += "],\"enabled\":"   + String(devcfgXPostEnabled() ? "true" : "false");
   out += ",\"intervalMin\":" + String(devcfgXPostIntervalMin());
   out += ",\"lastError\":\"" + xpostLastError() + "\"";
+  out += "}";
+  s_http.send(200, "application/json", out);
+}
+
+// ---------------------------------------------------------------------------
+// /moltbook/test — enqueue one compose + post cycle on the moltbook worker.
+// ---------------------------------------------------------------------------
+static void handleMoltbookTest() {
+  if (devcfgMoltbookApiKey().length() == 0) {
+    s_http.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"no API key stored\"}");
+    return;
+  }
+  if (moltbookBusy()) {
+    s_http.send(409, "application/json",
+                "{\"ok\":false,\"error\":\"another post is in flight\"}");
+    return;
+  }
+  if (!moltbookRunNowAsync()) {
+    s_http.send(500, "application/json",
+                "{\"ok\":false,\"error\":\"failed to enqueue\"}");
+    return;
+  }
+  s_http.send(202, "application/json", "{\"accepted\":true}");
+}
+
+// ---------------------------------------------------------------------------
+// /moltbook/recent — return the in-memory ring buffer.
+// ---------------------------------------------------------------------------
+static void handleMoltbookRecent() {
+  MoltbookRecent rec[10];
+  size_t n = moltbookGetRecent(rec, sizeof(rec) / sizeof(rec[0]));
+
+  String out = "{\"count\":" + String((int)n) + ",\"posts\":[";
+  uint32_t now = millis();
+  for (size_t i = 0; i < n; ++i) {
+    String text = rec[i].text;
+    text.replace("\\", "\\\\");
+    text.replace("\"", "\\\"");
+    text.replace("\n", "\\n");
+    text.replace("\r", "\\r");
+    if (i > 0) out += ",";
+    uint32_t ageSec = (rec[i].postedMs == 0) ? 0 : (now - rec[i].postedMs) / 1000;
+    out += "{\"id\":\""      + rec[i].postId + "\",";
+    out += "\"text\":\""     + text          + "\",";
+    out += "\"ageSec\":"     + String(ageSec) + "}";
+  }
+  out += "],\"enabled\":"   + String(devcfgMoltbookEnabled() ? "true" : "false");
+  out += ",\"intervalMin\":" + String(devcfgMoltbookIntervalMin());
+  out += ",\"lastError\":\"" + moltbookLastError() + "\"";
   out += "}";
   s_http.send(200, "application/json", out);
 }
@@ -1322,6 +1491,8 @@ void serverBeginHttp(SayCallback onSay) {
   s_http.on("/wallet/regenerate", HTTP_POST, handleWalletRegenerate);
   s_http.on("/xpost/test",        HTTP_POST, handleXPostTest);
   s_http.on("/xpost/recent",      HTTP_GET,  handleXPostRecent);
+  s_http.on("/moltbook/test",     HTTP_POST, handleMoltbookTest);
+  s_http.on("/moltbook/recent",   HTTP_GET,  handleMoltbookRecent);
   s_http.begin();
   Serial.println("http: listening on :80");
 }

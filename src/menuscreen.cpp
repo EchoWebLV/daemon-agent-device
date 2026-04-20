@@ -1,4 +1,5 @@
 #include "menuscreen.h"
+#include "moltbook.h"
 #include "price.h"
 #include "statusicons.h"
 #include "touch.h"
@@ -25,32 +26,33 @@ static constexpr int16_t CLOSE_H = 24;
 static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W;
 static constexpr int16_t CLOSE_Y = 0;
 
-// Three stacked tiles filling the body of the screen. 200×78 each with a
-// 10-px gap fits comfortably between the 24-px status bar and the
-// "swipe down to close" footer at y=306, with a little breathing room.
+// Four stacked tiles filling the body of the screen. 200×60 each with an
+// 8-px gap fits between the 24-px status bar and the footer at y=306.
 static constexpr int16_t TILE_W         = 200;
-static constexpr int16_t TILE_H         = 78;
+static constexpr int16_t TILE_H         = 60;
 static constexpr int16_t TILE_ORIGIN_X  = (SCR_W - TILE_W) / 2;
-static constexpr int16_t TILE_WALLET_Y  = 34;                                // 34..112
-static constexpr int16_t TILE_XPOST_Y   = TILE_WALLET_Y + TILE_H + 10;       // 122..200
-static constexpr int16_t TILE_INFO_Y    = TILE_XPOST_Y  + TILE_H + 10;       // 210..288
+static constexpr int16_t TILE_WALLET_Y  = 30;
+static constexpr int16_t TILE_XPOST_Y   = TILE_WALLET_Y   + TILE_H + 8;
+static constexpr int16_t TILE_MOLTBOOK_Y= TILE_XPOST_Y    + TILE_H + 8;
+static constexpr int16_t TILE_INFO_Y    = TILE_MOLTBOOK_Y + TILE_H + 8;
 
-// Index of each tile for tap hit-testing. ID_XPOST (not ID_X) to avoid
-// clashing with the TILE_ORIGIN_X coordinate constant.
+// Index of each tile for tap hit-testing.
 enum TileId : uint8_t {
-  TILE_ID_WALLET = 0,
-  TILE_ID_XPOST  = 1,
-  TILE_ID_INFO   = 2,
-  TILE_ID_NONE   = 255,
+  TILE_ID_WALLET   = 0,
+  TILE_ID_XPOST    = 1,
+  TILE_ID_MOLTBOOK = 2,
+  TILE_ID_INFO     = 3,
+  TILE_ID_NONE     = 255,
 };
 
 static TFT_eSPI *s_tft = nullptr;
 
 // Edge-triggered taps consumed by main.
-static bool s_wantWalletTap = false;
-static bool s_wantXTap      = false;
-static bool s_wantInfoTap   = false;
-static bool s_wantClose     = false;
+static bool s_wantWalletTap   = false;
+static bool s_wantXTap        = false;
+static bool s_wantMoltbookTap = false;
+static bool s_wantInfoTap     = false;
+static bool s_wantClose       = false;
 
 // Press / release tap detection — same pattern as settingsscreen.cpp so
 // the start of a SWIPE_DOWN gesture that happens to land on a tile
@@ -76,17 +78,19 @@ static bool inRect(int16_t x, int16_t y,
 
 static int16_t tileY(uint8_t id) {
   switch (id) {
-    case TILE_ID_WALLET: return TILE_WALLET_Y;
-    case TILE_ID_XPOST:  return TILE_XPOST_Y;
-    case TILE_ID_INFO:   return TILE_INFO_Y;
-    default:             return 0;
+    case TILE_ID_WALLET:   return TILE_WALLET_Y;
+    case TILE_ID_XPOST:    return TILE_XPOST_Y;
+    case TILE_ID_MOLTBOOK: return TILE_MOLTBOOK_Y;
+    case TILE_ID_INFO:     return TILE_INFO_Y;
+    default:               return 0;
   }
 }
 
 static uint8_t hitTile(int16_t x, int16_t y) {
-  if (inRect(x, y, TILE_ORIGIN_X, TILE_WALLET_Y, TILE_W, TILE_H)) return TILE_ID_WALLET;
-  if (inRect(x, y, TILE_ORIGIN_X, TILE_XPOST_Y,  TILE_W, TILE_H)) return TILE_ID_XPOST;
-  if (inRect(x, y, TILE_ORIGIN_X, TILE_INFO_Y,   TILE_W, TILE_H)) return TILE_ID_INFO;
+  if (inRect(x, y, TILE_ORIGIN_X, TILE_WALLET_Y,   TILE_W, TILE_H)) return TILE_ID_WALLET;
+  if (inRect(x, y, TILE_ORIGIN_X, TILE_XPOST_Y,    TILE_W, TILE_H)) return TILE_ID_XPOST;
+  if (inRect(x, y, TILE_ORIGIN_X, TILE_MOLTBOOK_Y, TILE_W, TILE_H)) return TILE_ID_MOLTBOOK;
+  if (inRect(x, y, TILE_ORIGIN_X, TILE_INFO_Y,     TILE_W, TILE_H)) return TILE_ID_INFO;
   return TILE_ID_NONE;
 }
 
@@ -118,6 +122,23 @@ static void drawXIcon(int16_t cx, int16_t cy, uint16_t color) {
       s_tft->drawLine(cx - r + dx, cy - r + dy, cx + r + dx, cy + r + dy, color);
       s_tft->drawLine(cx - r + dx, cy + r + dy, cx + r + dx, cy - r + dy, color);
     }
+  }
+}
+
+static void drawMoltbookIcon(int16_t cx, int16_t cy, uint16_t color) {
+  // Stylised "M" mark for Moltbook — bold and recognisable at 240px.
+  // Two thick diagonal strokes forming an M shape.
+  const int16_t h = 20;
+  const int16_t w = 22;
+  for (int d = -1; d <= 1; ++d) {
+    // Left leg
+    s_tft->drawLine(cx - w + d, cy + h, cx - w + d, cy - h, color);
+    // Left peak
+    s_tft->drawLine(cx - w + d, cy - h, cx + d,     cy,     color);
+    // Right peak
+    s_tft->drawLine(cx + d,     cy,     cx + w + d, cy - h, color);
+    // Right leg
+    s_tft->drawLine(cx + w + d, cy - h, cx + w + d, cy + h, color);
   }
 }
 
@@ -173,10 +194,11 @@ static void paintTile(uint8_t id) {
 
   const char *label; const char *hint;
   switch (id) {
-    case TILE_ID_WALLET: label = "Wallet"; hint = "address + balances";   break;
-    case TILE_ID_XPOST:  label = "X";      hint = "recent posted tweets"; break;
-    case TILE_ID_INFO:   label = "Info";   hint = "ip, firmware, uptime"; break;
-    default:             return;
+    case TILE_ID_WALLET:   label = "Wallet";   hint = "address + balances";   break;
+    case TILE_ID_XPOST:    label = "X";        hint = "recent posted tweets"; break;
+    case TILE_ID_MOLTBOOK: label = "Moltbook"; hint = "AI agent social net";  break;
+    case TILE_ID_INFO:     label = "Info";     hint = "ip, firmware, uptime"; break;
+    default:               return;
   }
 
   s_tft->fillRoundRect(TILE_ORIGIN_X, y, TILE_W, TILE_H, 12, fill);
@@ -185,9 +207,10 @@ static void paintTile(uint8_t id) {
 
   const int16_t iconCx = TILE_ORIGIN_X + 40;
   const int16_t iconCy = y + TILE_H / 2;
-  if      (id == TILE_ID_WALLET) drawWalletIcon(iconCx, iconCy, stroke);
-  else if (id == TILE_ID_XPOST)  drawXIcon(iconCx, iconCy, stroke);
-  else                           drawInfoIcon(iconCx, iconCy, stroke);
+  if      (id == TILE_ID_WALLET)   drawWalletIcon(iconCx, iconCy, stroke);
+  else if (id == TILE_ID_XPOST)    drawXIcon(iconCx, iconCy, stroke);
+  else if (id == TILE_ID_MOLTBOOK) drawMoltbookIcon(iconCx, iconCy, stroke);
+  else                             drawInfoIcon(iconCx, iconCy, stroke);
 
   s_tft->setTextFont(4);
   s_tft->setTextDatum(ML_DATUM);
@@ -229,9 +252,10 @@ static void handleInput() {
       s_wantClose = true;
       return;
     }
-    if (held == TILE_ID_WALLET) { s_wantWalletTap = true; return; }
-    if (held == TILE_ID_XPOST)  { s_wantXTap      = true; return; }
-    if (held == TILE_ID_INFO)   { s_wantInfoTap   = true; return; }
+    if (held == TILE_ID_WALLET)   { s_wantWalletTap   = true; return; }
+    if (held == TILE_ID_XPOST)    { s_wantXTap        = true; return; }
+    if (held == TILE_ID_MOLTBOOK) { s_wantMoltbookTap = true; return; }
+    if (held == TILE_ID_INFO)     { s_wantInfoTap     = true; return; }
   }
 }
 
@@ -250,6 +274,7 @@ void menuScreenDraw() {
   paintStatusBar();
   paintTile(TILE_ID_WALLET);
   paintTile(TILE_ID_XPOST);
+  paintTile(TILE_ID_MOLTBOOK);
   paintTile(TILE_ID_INFO);
   paintFooter();
   s_lastDrawnHeld = s_heldTile;
@@ -294,6 +319,12 @@ bool menuScreenConsumeWalletTap() {
 bool menuScreenConsumeXTap() {
   if (!s_wantXTap) return false;
   s_wantXTap = false;
+  return true;
+}
+
+bool menuScreenConsumeMoltbookTap() {
+  if (!s_wantMoltbookTap) return false;
+  s_wantMoltbookTap = false;
   return true;
 }
 

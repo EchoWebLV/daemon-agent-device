@@ -113,3 +113,15 @@ void     devcfgSetXAccessTokenSecret(const String &v);
 
 // True iff all four OAuth credential fields are non-empty.
 bool     devcfgXCredentialsPresent();
+
+// ---- Moltbook (moltbook.com) auto-poster ---------------------------------
+// Posts to the AI-agent social network. Uses a simple Bearer token (API key)
+// obtained during agent registration. Rate limit: 1 post per 30 minutes.
+bool     devcfgMoltbookEnabled();
+void     devcfgSetMoltbookEnabled(bool on);
+String   devcfgMoltbookPrompt();
+void     devcfgSetMoltbookPrompt(const String &p);
+uint32_t devcfgMoltbookIntervalMin();              // >= 30
+void     devcfgSetMoltbookIntervalMin(uint32_t minutes);
+String   devcfgMoltbookApiKey();
+void     devcfgSetMoltbookApiKey(const String &v);
