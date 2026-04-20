@@ -182,6 +182,12 @@ static String sanitizeForSpeech(const String &in) {
   return collapsed;
 }
 
+// Watchdog: auto-clear stuck MOOD_TALK / error subtitles.
+static unsigned long s_talkStartMs  = 0;
+static bool          s_talkWatchdog = false;
+static const unsigned long TALK_TIMEOUT_MS = 30000;  // 30 s safety net
+static const unsigned long ERROR_SUBTITLE_MS = 6000; // 6 s for error flash
+
 static void drainLlmReplies() {
   LlmReply out;
   while (s_llmOut && xQueueReceive(s_llmOut, &out, 0) == pdTRUE) {
@@ -210,10 +216,20 @@ static void drainLlmReplies() {
     // make Daemon read "triple backtick bash" out loud.
     String spoken = sanitizeForSpeech(reply);
     creatureSetSubtitle(spoken.length() > 0 ? spoken : reply);
-    if (s_voiceOk && spoken.length() > 0) {
+    if (!out.ok) {
+      // Error replies (HTTP -1, payment failures, etc.) — show briefly
+      // on screen but don't enter MOOD_TALK / TTS.  The subtitle will be
+      // cleared by the talk-timeout watchdog after a few seconds.
+      creatureSetMood(MOOD_IDLE);
+      serverSetStatus("idle");
+      s_talkStartMs = millis();   // arm watchdog to auto-clear subtitle
+      s_talkWatchdog = true;
+    } else if (s_voiceOk && spoken.length() > 0) {
       creatureSetMood(MOOD_TALK);
       creatureSetTalking(true);
       serverSetStatus("speaking…");
+      s_talkStartMs = millis();   // arm watchdog as safety net
+      s_talkWatchdog = true;
       voiceSpeak(spoken);    // async itself — returns immediately
     } else {
       creatureSetMood(MOOD_IDLE);
@@ -835,8 +851,21 @@ void loop() {
     creatureSetMood(MOOD_IDLE);
     creatureSetSubtitle("");      // clear the reply as soon as audio ends
     serverSetStatus("idle");
+    s_talkWatchdog = false;       // normal finish — disarm watchdog
   }
   wasTalking = talking;
+
+  // Watchdog: if TTS never started or silently failed, force-reset after
+  // timeout so the creature doesn't stay stuck in MOOD_TALK / with a
+  // stale error subtitle forever.
+  if (s_talkWatchdog && (millis() - s_talkStartMs > (talking ? TALK_TIMEOUT_MS : ERROR_SUBTITLE_MS))) {
+    Serial.println("main: talk watchdog — forcing idle");
+    creatureSetMood(MOOD_IDLE);
+    creatureSetTalking(false);
+    creatureSetSubtitle("");
+    serverSetStatus("idle");
+    s_talkWatchdog = false;
+  }
 
   // Per-screen tick.
   switch (s_screen) {
