@@ -56,6 +56,25 @@ static uint8_t  s_brightness = 255;
 static bool     s_bluetooth  = false;
 static uint8_t  s_faceStyle  = 0;
 
+// X/Twitter OAuth credentials — cached in RAM because several hot paths
+// (statusicons at 60 Hz, settingsscreen at 60 Hz) poll them every frame.
+// Without the cache we hammered NVS 240x/s and Preferences.cpp logs an
+// ERROR on every NOT_FOUND miss — that was enough to heat the board up
+// and trigger occasional watchdog resets. Loaded once in devcfgBegin(),
+// kept in sync by the devcfgSetX*() setters below.
+static String   s_xApiKey;
+static String   s_xApiSecret;
+static String   s_xAccessToken;
+static String   s_xAccessTokenSecret;
+static bool     s_xCredsPresent = false;
+
+static void recomputeXCredsPresent() {
+  s_xCredsPresent = s_xApiKey.length()            > 0 &&
+                    s_xApiSecret.length()         > 0 &&
+                    s_xAccessToken.length()       > 0 &&
+                    s_xAccessTokenSecret.length() > 0;
+}
+
 static void applyBrightness(uint8_t b) {
   if (b < MIN_BRIGHTNESS) b = MIN_BRIGHTNESS;
   ledcWrite(BL_LEDC_CHANNEL, b);
@@ -78,6 +97,16 @@ void devcfgBegin() {
     s_bluetooth  = s_nvs.getBool ("bt",    false);
     s_faceStyle  = s_nvs.getUChar("face",  0);
     if (s_faceStyle >= DEVCFG_FACE_COUNT) s_faceStyle = 0;
+
+    // Pre-cache the 4 X OAuth keys. isKey() gates the getString() so
+    // the NOT_FOUND path doesn't log an ESP error per missing key on
+    // first boot; once present in NVS they just read normally.
+    s_xApiKey            = s_nvs.isKey("xo_ck") ? s_nvs.getString("xo_ck", "") : String();
+    s_xApiSecret         = s_nvs.isKey("xo_cs") ? s_nvs.getString("xo_cs", "") : String();
+    s_xAccessToken       = s_nvs.isKey("xo_tk") ? s_nvs.getString("xo_tk", "") : String();
+    s_xAccessTokenSecret = s_nvs.isKey("xo_ts") ? s_nvs.getString("xo_ts", "") : String();
+    recomputeXCredsPresent();
+
     s_nvs.end();
   }
 
@@ -369,54 +398,40 @@ void devcfgSetXPostIntervalMin(uint32_t minutes) {
   s_nvs.end();
 }
 
-String devcfgXApiKey() {
-  NvsLock lk;
-  s_nvs.begin("daemon", true);
-  String v = s_nvs.getString("xo_ck", "");
-  s_nvs.end();
-  return v;
-}
-String devcfgXApiSecret() {
-  NvsLock lk;
-  s_nvs.begin("daemon", true);
-  String v = s_nvs.getString("xo_cs", "");
-  s_nvs.end();
-  return v;
-}
-String devcfgXAccessToken() {
-  NvsLock lk;
-  s_nvs.begin("daemon", true);
-  String v = s_nvs.getString("xo_tk", "");
-  s_nvs.end();
-  return v;
-}
-String devcfgXAccessTokenSecret() {
-  NvsLock lk;
-  s_nvs.begin("daemon", true);
-  String v = s_nvs.getString("xo_ts", "");
-  s_nvs.end();
-  return v;
-}
+// All four X getters read from the RAM cache populated in devcfgBegin()
+// and kept in sync by the setters below. This used to hit NVS on every
+// call, which was fatal because two hot paths (status-bar icons and the
+// settings screen tick) polled them at 60 Hz — the resulting 240 NVS
+// reads/s + 240 "NOT_FOUND" error prints/s warmed the board and
+// occasionally stalled long enough to trip a watchdog.
+String devcfgXApiKey()            { return s_xApiKey; }
+String devcfgXApiSecret()         { return s_xApiSecret; }
+String devcfgXAccessToken()       { return s_xAccessToken; }
+String devcfgXAccessTokenSecret() { return s_xAccessTokenSecret; }
+
 void devcfgSetXApiKey(const String &v) {
+  s_xApiKey = v;
+  recomputeXCredsPresent();
   NvsLock lk;
   s_nvs.begin("daemon", false); s_nvs.putString("xo_ck", v); s_nvs.end();
 }
 void devcfgSetXApiSecret(const String &v) {
+  s_xApiSecret = v;
+  recomputeXCredsPresent();
   NvsLock lk;
   s_nvs.begin("daemon", false); s_nvs.putString("xo_cs", v); s_nvs.end();
 }
 void devcfgSetXAccessToken(const String &v) {
+  s_xAccessToken = v;
+  recomputeXCredsPresent();
   NvsLock lk;
   s_nvs.begin("daemon", false); s_nvs.putString("xo_tk", v); s_nvs.end();
 }
 void devcfgSetXAccessTokenSecret(const String &v) {
+  s_xAccessTokenSecret = v;
+  recomputeXCredsPresent();
   NvsLock lk;
   s_nvs.begin("daemon", false); s_nvs.putString("xo_ts", v); s_nvs.end();
 }
 
-bool devcfgXCredentialsPresent() {
-  return devcfgXApiKey().length() > 0 &&
-         devcfgXApiSecret().length() > 0 &&
-         devcfgXAccessToken().length() > 0 &&
-         devcfgXAccessTokenSecret().length() > 0;
-}
+bool devcfgXCredentialsPresent() { return s_xCredsPresent; }

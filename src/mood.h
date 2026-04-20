@@ -54,6 +54,14 @@ void moodTick();
 void moodNoteUserUtterance();                 // fires right before handleUtterance
 void moodNoteDaemonReply(const String &text); // fires when a reply lands in drainLlmReplies
 
+// Lightweight "user touched the device" signal. Snaps the creature out
+// of BORED / TIRED / SLEEP back to IDLE with a PERK_UP flash and a
+// small energy bump, but — unlike moodNoteUserUtterance() — does NOT
+// reset the silence timer. A touch or swipe wakes Daemon up visually;
+// only real conversation resets the "how long has it been since my
+// human said something" counter that informs the LLM persona.
+void moodNoteActivity();
+
 // Read-only accessors. Safe to call from any task.
 const DaemonState &moodState();
 

@@ -809,6 +809,7 @@ void creatureDrawTo(TFT_eSprite *target) {
 }
 
 void creatureSetMood(CreatureMood m)    { s_mood = m; }
+CreatureMood creatureMood()             { return s_mood; }
 void creatureSetTalking(bool on)        { s_talking = on; if (!on) s_mouthEnv = 0.0f; }
 void creatureForceBlink()               { s_forceBlink = true; }
 
@@ -1038,9 +1039,45 @@ void creatureTick() {
     blinkR = b;
   }
 
+  // Sleepy-state overrides. BORED / TIRED / SLEEP are idle-class moods
+  // the mood engine paints over plain IDLE when the human has been quiet
+  // for a while; here we dial down bob + pulse and force the eyelids
+  // partway closed so all four face styles look visibly droopy without
+  // per-renderer changes. We deliberately skip this while a reaction is
+  // active so PERK_UP's "snap awake" flash still reads cleanly in the
+  // single frame between mood flip and reaction end.
+  if (!rxActive && (s_mood == MOOD_BORED || s_mood == MOOD_TIRED ||
+                    s_mood == MOOD_SLEEP)) {
+    float lidFloor   = 0.0f;
+    float bobScale   = 1.0f;
+    float pulseScale = 1.0f;
+    if (s_mood == MOOD_BORED) { lidFloor = 0.15f; bobScale = 0.75f; pulseScale = 0.80f; }
+    if (s_mood == MOOD_TIRED) { lidFloor = 0.45f; bobScale = 0.55f; pulseScale = 0.55f; }
+    if (s_mood == MOOD_SLEEP) { lidFloor = 0.85f; bobScale = 0.25f; pulseScale = 0.35f; }
+
+    // Droop both lids to the floor. A real blink still passes through
+    // because standardBlink() returns values >0 during the close; we
+    // simply keep the lids from opening all the way back up in between.
+    if (blinkL < lidFloor) blinkL = lidFloor;
+    if (blinkR < lidFloor) blinkR = lidFloor;
+
+    bobDY  = (int16_t)(bobDY * bobScale);
+    pulse *= pulseScale;
+
+    // Sleeping Daemon keeps his mouth still — no breathing smile.
+    if (s_mood == MOOD_SLEEP) s_mouthEnv *= 0.3f;
+  }
+
   // Effective render-mood: PERK_UP briefly flashes HAPPY, GRUMBLE briefly
   // flashes ANGRY so the per-style eye renderer gets the right tint.
+  // BORED/TIRED/SLEEP fall back to a plain (neutral-palette) render —
+  // their distinct look comes from the lid/bob/pulse overrides above,
+  // not the eye/mouth color shape, so all four face styles inherit the
+  // effect for free.
   CreatureMood renderMood = s_mood;
+  if (s_mood == MOOD_BORED || s_mood == MOOD_TIRED || s_mood == MOOD_SLEEP) {
+    renderMood = MOOD_IDLE;
+  }
   if (rxActive) {
     if (rxKind == REACT_PERK_UP && s_mood == MOOD_IDLE) renderMood = MOOD_HAPPY;
     if (rxKind == REACT_GRUMBLE && s_mood == MOOD_IDLE) renderMood = MOOD_ANGRY;

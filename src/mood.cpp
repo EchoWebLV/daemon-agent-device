@@ -148,6 +148,43 @@ void moodTick() {
     creatureTriggerReaction(REACT_DROOP);
     s_nextSadDroopMs = now + 60UL * 60UL * 1000UL;
   }
+
+  // --- idle-class mood painting -------------------------------------------
+  // Daemon's face cycles IDLE → BORED → TIRED → SLEEP as silence + low
+  // energy pile up, and any of those promotions happens ONLY while the
+  // creature is already in an idle-class mood. Active moods (LISTEN while
+  // the user talks, THINK during LLM round-trips, TALK while Daemon is
+  // speaking, HAPPY / ANGRY during reaction overlays) are left alone so
+  // we never yank the face out of a foreground state mid-interaction.
+  //
+  // We measure silence from boot when the user hasn't spoken yet: without
+  // this, a device that's never been chatted with stays permanently IDLE
+  // because silenceMs is pinned at 0. Using uptime as the fallback gives
+  // a freshly-flashed board the correct "he'll get bored if left alone"
+  // behavior.
+  {
+    CreatureMood cur = creatureMood();
+    bool isIdleClass = (cur == MOOD_IDLE  || cur == MOOD_BORED ||
+                        cur == MOOD_TIRED || cur == MOOD_SLEEP);
+    if (isIdleClass) {
+      uint32_t effSilence = (s_lastUserMs == 0) ? s.uptimeMs : s.silenceMs;
+      float silMin = (float)effSilence / 60000.0f;
+
+      // Deepest state first — the conditions below are INTENTIONALLY
+      // cumulative. Night rules kick in earlier so late-evening Daemon
+      // visibly winds down without waiting 30 minutes.
+      CreatureMood want = MOOD_IDLE;
+      if ((s.energy < 0.22f && silMin > 30.0f) ||
+          (s.isNight && silMin > 10.0f && s.energy < 0.35f)) {
+        want = MOOD_SLEEP;
+      } else if (s.energy < 0.38f || silMin > 15.0f) {
+        want = MOOD_TIRED;
+      } else if (silMin > 2.5f) {
+        want = MOOD_BORED;
+      }
+      if (want != cur) creatureSetMood(want);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +194,18 @@ void moodNoteUserUtterance() {
   uint32_t now  = millis();
   uint32_t prev = s_lastUserMs;
   s_lastUserMs  = now;
+
+  // If Daemon had drifted into a sleepy idle state, snap him back to
+  // plain IDLE immediately. The PERK_UP reaction below (for long-gap
+  // returns) still plays on top; for short-gap returns we at least
+  // reopen the eyelids so his first "reply" frame doesn't look like
+  // he talked with his eyes closed.
+  {
+    CreatureMood cur = creatureMood();
+    if (cur == MOOD_BORED || cur == MOOD_TIRED || cur == MOOD_SLEEP) {
+      creatureSetMood(MOOD_IDLE);
+    }
+  }
 
   // User just spoke — curiosity spent, a small energy bump from engagement,
   // mood nudges slightly positive.
@@ -178,6 +227,21 @@ void moodNoteUserUtterance() {
     creatureTriggerReaction(REACT_PERK_UP);
   } else if ((now - prev) < 30000) {
     creatureTriggerReaction(REACT_GRUMBLE);
+  }
+}
+
+void moodNoteActivity() {
+  // Touch / swipe / long-press / any on-device "the human is fiddling
+  // with the board" signal. Snaps sleepy idle states back to plain IDLE
+  // with a small PERK_UP flash and a mild energy bump, but deliberately
+  // does NOT touch s_lastUserMs — a poke isn't a conversation, and we
+  // don't want one to hide the "alone with your thoughts" signal from
+  // the LLM persona block on the next real reply.
+  CreatureMood cur = creatureMood();
+  if (cur == MOOD_BORED || cur == MOOD_TIRED || cur == MOOD_SLEEP) {
+    creatureSetMood(MOOD_IDLE);
+    s.energy = clamp01(s.energy + 0.10f);
+    creatureTriggerReaction(REACT_PERK_UP);
   }
 }
 

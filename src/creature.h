@@ -17,7 +17,15 @@ enum CreatureMood : uint8_t {
   MOOD_THINK   = 2,   // eyes look up-and-right, slow pulse
   MOOD_TALK    = 3,   // mouth animates open/close
   MOOD_HAPPY   = 4,   // eyes squint upward in a smile arc
-  MOOD_ANGRY   = 5    // sharper eyebrows, redder glow tint
+  MOOD_ANGRY   = 5,   // sharper eyebrows, redder glow tint
+  // Sleepy/low-activity states. Promoted to "first-class" moods so the
+  // mood engine can paint them over idle when the human has been quiet
+  // for a while. Visual treatment is driven centrally in creatureTick()
+  // (droopy lids, slower bob + pulse), so all four face styles inherit
+  // the effect without per-renderer changes.
+  MOOD_BORED   = 6,   // lids at ~15% close, slower bob, eye drifts further
+  MOOD_TIRED   = 7,   // lids at ~45% (half-mast), slower pulse, quieter mouth
+  MOOD_SLEEP   = 8    // lids at ~85% (slits), tiny bob, mouth still
 };
 
 // Initialise internal sprites and draw the static body to `tft`. Must be
@@ -42,6 +50,7 @@ void creatureTick();
 // Mood + talk state. Both are independent: e.g. MOOD_LISTEN + talking=false
 // while the user speaks; MOOD_TALK + talking=true while the creature replies.
 void creatureSetMood(CreatureMood m);
+CreatureMood creatureMood();
 void creatureSetTalking(bool on);
 
 // Tell the creature to blink ASAP (used when it first wakes, etc).

@@ -733,6 +733,10 @@ void loop() {
   //   From settings:
   //     SWIPE_UP          → close settings back to previous screen
   SwipeDir sw = touchPoll();
+  // Any swipe counts as "the human is here" — wake Daemon up if he's
+  // drifted into a sleepy idle state. Harmless no-op when he's already
+  // in IDLE or an active mood (LISTEN/THINK/TALK/HAPPY/ANGRY).
+  if (sw != SWIPE_NONE) moodNoteActivity();
   if (s_screen == SCREEN_SETTINGS) {
     if (sw == SWIPE_UP) {
       Serial.println("settings: swipe-up -> creature");
@@ -793,6 +797,7 @@ void loop() {
         creatureSetZoomTarget(0.55f);      // noticeable but still readable
         touchConsumeRelease();             // no accidental swipe on lift
         s_zoomEngaged = true;
+        moodNoteActivity();                // long press also counts as wake
         Serial.println("creature: long-press → zoom-out");
       } else if (hold == 0 && s_zoomEngaged) {
         creatureSetZoomTarget(1.0f);
