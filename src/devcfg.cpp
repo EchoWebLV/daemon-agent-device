@@ -97,9 +97,17 @@ void devcfgClearWifi() {
 }
 
 // ---- LLM model + personality + services ---------------------------------
+static const char *DEFAULT_LLM_MODEL = "google/gemini-3.1-flash";
+static const char *LEGACY_LLM_MODEL  = "google/gemini-3.1-pro";
+
 String devcfgLlmModel() {
-  s_nvs.begin("daemon", true);
-  String v = s_nvs.getString("llm_model", "google/gemini-3.1-pro");
+  s_nvs.begin("daemon", false);
+  String v = s_nvs.getString("llm_model", DEFAULT_LLM_MODEL);
+  // One-shot migration: bump anyone still on the slow pro default to flash.
+  if (v == LEGACY_LLM_MODEL) {
+    s_nvs.putString("llm_model", DEFAULT_LLM_MODEL);
+    v = DEFAULT_LLM_MODEL;
+  }
   s_nvs.end();
   return v;
 }

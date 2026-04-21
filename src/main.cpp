@@ -177,6 +177,9 @@ void setup() {
 
   s_voiceOk = voiceBegin();
   Serial.printf("voice: %s\n", s_voiceOk ? "OK" : "failed");
+  // TTS disabled for latency testing — replies stay text-only.
+  s_voiceOk = false;
+  Serial.println("voice: FORCED OFF (TTS stripped for testing)");
 
   // Device-level settings (volume, brightness, BT). Applies brightness
   // PWM and restores last-known volume from NVS.
@@ -216,10 +219,8 @@ void setup() {
   s_nextPriceMs  = millis() + PRICE_INTERVAL_MS;
   s_nextWalletMs = millis() + WALLET_INTERVAL_MS;
 
-  // One-shot TTS diagnostic so we can see via serial what ElevenLabs
-  // actually returns when POSTed through HTTPClient, and compare against
-  // what the patched library sees. Helps isolate streaming bugs.
-  if (s_wifiOk) voiceDiagnose();
+  // TTS diagnostic skipped — TTS is disabled for latency testing.
+  // if (s_wifiOk) voiceDiagnose();
 
   // Boot greeting — proves Wi-Fi, Gemini and the speaker are all alive.
   if (s_wifiOk && s_voiceOk) {

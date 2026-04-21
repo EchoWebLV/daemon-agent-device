@@ -47,6 +47,10 @@ static bool rpcCall(const String &payload, String &outBody) {
 }
 
 // Recent blockhash: returns 32 bytes (base58-decoded) or false.
+// Each call fetches a fresh blockhash — reusing one across calls produces
+// byte-identical transactions (same amount/source/dest/mint), which
+// Solana rejects as a duplicate signature, which makes the x402
+// facilitator return 402 on the retry.
 static bool fetchRecentBlockhash(uint8_t out[32]) {
   String payload = R"({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[]})";
   String body;
@@ -65,7 +69,19 @@ static bool fetchRecentBlockhash(uint8_t out[32]) {
 // getTokenAccountsByOwner with mint filter returns the ATA if one exists.
 // Returns empty String if the recipient has no USDC account set up —
 // which means an x402 service is mis-configured, the payment will fail.
+//
+// A tiny 1-entry cache keyed on the owner address saves a full HTTPS round
+// trip on every subsequent request to the same facilitator — which is the
+// common case (sol.blockrun.ai doesn't change its payout address).
+static String   s_cachedAtaOwner;
+static String   s_cachedAtaPubkey;
+
 static String fetchUsdcAta(const String &ownerB58) {
+  if (ownerB58.length() > 0 &&
+      ownerB58 == s_cachedAtaOwner &&
+      s_cachedAtaPubkey.length() > 0) {
+    return s_cachedAtaPubkey;
+  }
   String payload = String(
       "{\"jsonrpc\":\"2.0\",\"id\":1,"
       "\"method\":\"getTokenAccountsByOwner\",\"params\":[\"") +
@@ -78,7 +94,12 @@ static String fetchUsdcAta(const String &ownerB58) {
   JsonArray arr = doc["result"]["value"].as<JsonArray>();
   if (arr.isNull() || arr.size() == 0) return String();
   const char *pk = arr[0]["pubkey"] | (const char*)nullptr;
-  return pk ? String(pk) : String();
+  String result = pk ? String(pk) : String();
+  if (result.length() > 0) {
+    s_cachedAtaOwner  = ownerB58;
+    s_cachedAtaPubkey = result;
+  }
+  return result;
 }
 
 // Base64-encode a UTF-8 string without newlines.
@@ -296,7 +317,8 @@ X402Result x402Post(const String &url,
       return r;
     }
 
-    // Retry with the payment header.
+    // Retry with the payment header on a fresh client. (Reusing the first
+    // HTTPClient turned out flaky across header changes on ESP32 Arduino.)
     WiFiClientSecure client2;
     client2.setInsecure();
     HTTPClient http2;

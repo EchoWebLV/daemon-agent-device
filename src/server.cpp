@@ -5,12 +5,45 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
 static WebServer      s_http(80);
 static SayCallback    s_onSay;
 static String         s_status = "Booting...";
 static String         s_lastUser;
 static String         s_lastReply;
+// Bumped every time a new reply is published so the web UI's poller can
+// tell which state messages are "new" and append them to the chat log.
+static volatile uint32_t s_replySeq = 0;
+
+// Worker-task plumbing: the /say handler enqueues the utterance and returns
+// immediately, so the main loop (creature animation, touch, voice, wifi)
+// never stalls on the 5–20 s AI round trip. The worker task below pulls
+// utterances off the queue and runs the user-provided callback.
+static QueueHandle_t  s_sayQueue = nullptr;
+
+static void sayWorkerTask(void *) {
+  for (;;) {
+    char *buf = nullptr;
+    if (xQueueReceive(s_sayQueue, &buf, portMAX_DELAY) == pdTRUE && buf) {
+      if (s_onSay) s_onSay(String(buf));
+      free(buf);
+    }
+  }
+}
+
+static void ensureSayWorker() {
+  if (s_sayQueue) return;
+  s_sayQueue = xQueueCreate(/*depth=*/4, sizeof(char *));
+  // HTTPS + mbedTLS + Ed25519 need generous stack. 24 KB is roomy.
+  // Pin to core 1 to keep TCP/IP (core 0) and audio-friendly work off
+  // each other.
+  xTaskCreatePinnedToCore(sayWorkerTask, "say-worker",
+                          /*stack=*/ 24576, nullptr,
+                          /*prio=*/ 1, nullptr, /*core=*/ 1);
+}
 
 // ---------------------------------------------------------------------------
 // Static HTML page (served at /)
@@ -299,9 +332,17 @@ $$('.tab').forEach(t => t.onclick = () => {
 });
 
 // ────────── status poll ──────────
+let lastSeq = 0;
 async function refresh(){
   try{ const j = await (await fetch('/state')).json();
-    $('#status').textContent = j.status || ''; }catch(e){}
+    $('#status').textContent = j.status || '';
+    // When the seq bumps the board has a new reply for us. Append it
+    // and remember where we are so we don't re-render the same line.
+    if (typeof j.seq === 'number' && j.seq > lastSeq) {
+      lastSeq = j.seq;
+      if (j.reply) addLog('daemon', j.reply);
+    }
+  }catch(e){}
 }
 setInterval(refresh, 1500); refresh();
 
@@ -316,9 +357,13 @@ async function sendUtterance(text){
   text = (text||'').trim(); if(!text) return;
   addLog('you', text); $('#status').textContent='thinking…';
   try{
-    const r = await fetch('/say', {method:'POST', headers:{'Content-Type':'text/plain'}, body:text});
-    const j = await r.json();
-    if(j.reply) addLog('daemon', j.reply);
+    // Fire and forget — the board acks immediately and runs aiAsk on a
+    // background task. refresh() will pick up the reply via /state when
+    // the seq counter bumps.
+    await fetch('/say', {method:'POST', headers:{'Content-Type':'text/plain'}, body:text});
+    // Kick off a faster poll while we're waiting so the reply appears
+    // sooner than the next 1.5 s tick.
+    refresh();
   }catch(e){ $('#status').textContent='error: '+e; }
 }
 $('#send').onclick = () => { const t = $('#textin').value; $('#textin').value=''; sendUtterance(t); };
@@ -512,8 +557,30 @@ static void handleRoot() {
   s_http.send_P(200, "text/html", PAGE_HTML);
 }
 
+// Minimal JSON-string escaper — handles the characters plain chat text can
+// plausibly contain (quotes, backslashes, control chars).
+static String jsonEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (c == '\\' || c == '"') { out += '\\'; out += c; }
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else if ((uint8_t)c < 0x20) { /* drop other control bytes */ }
+    else out += c;
+  }
+  return out;
+}
+
 static void handleState() {
-  String j = "{\"status\":\"" + s_status + "\"}";
+  String j;
+  j.reserve(128 + s_lastUser.length() + s_lastReply.length());
+  j  = "{\"status\":\"";    j += jsonEscape(s_status);     j += "\",";
+  j += "\"seq\":";          j += String(s_replySeq);        j += ",";
+  j += "\"lastUser\":\"";   j += jsonEscape(s_lastUser);   j += "\",";
+  j += "\"reply\":\"";      j += jsonEscape(s_lastReply);  j += "\"}";
   s_http.send(200, "application/json", j);
 }
 
@@ -528,20 +595,25 @@ static void handleSay() {
     s_http.send(400, "text/plain", "empty");
     return;
   }
-  // Hand off to the main app; it runs synchronously here, then we emit the
-  // reply. Not ideal for true concurrency but fine for a single user.
-  s_lastUser = text;
+  // Dispatch to the worker task and acknowledge immediately. The main
+  // loop keeps animating, touch stays responsive, and the web UI polls
+  // /state for the reply.
+  ensureSayWorker();
+  char *buf = strdup(text.c_str());
+  if (!buf) {
+    s_http.send(503, "application/json", "{\"accepted\":false,\"error\":\"oom\"}");
+    return;
+  }
+  if (xQueueSend(s_sayQueue, &buf, 0) != pdTRUE) {
+    free(buf);
+    s_http.send(503, "application/json", "{\"accepted\":false,\"error\":\"busy\"}");
+    return;
+  }
+  // Record the pending utterance so /state reflects "you said …" right
+  // away, and blank the last reply so the poller waits for the new one.
+  s_lastUser  = text;
   s_lastReply = "";
-  if (s_onSay) s_onSay(text);
-
-  String j = "{\"reply\":";
-  // naive JSON string escape (enough for plain text)
-  String esc = s_lastReply;
-  esc.replace("\\", "\\\\");
-  esc.replace("\"", "\\\"");
-  esc.replace("\n", " ");
-  j += "\"" + esc + "\"}";
-  s_http.send(200, "application/json", j);
+  s_http.send(200, "application/json", "{\"accepted\":true}");
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +746,8 @@ void serverBeginHttp(SayCallback onSay) {
 void serverLoop()                       { s_http.handleClient(); }
 void serverSetStatus(const String &s)   { s_status = s; }
 void serverSetReply(const String &user, const String &reply) {
-  s_lastUser = user;
+  s_lastUser  = user;
   s_lastReply = reply;
+  s_replySeq++;                    // tell /state pollers this is a new reply
 }
 String serverLocalIP()                  { return WiFi.localIP().toString(); }
