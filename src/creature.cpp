@@ -90,7 +90,7 @@ static constexpr int16_t SUB_H = 48;
 static constexpr uint16_t C_SUB_TEXT = 0xFFFF;
 
 // ---------------------------------------------------------------------------
-// Eye pill — tapered almond. Multiple concentric layers produce the glow.
+// Eye pill — tapered almond built from stacked circles along the long axis.
 // ---------------------------------------------------------------------------
 static void drawEyePill(TFT_eSprite *s, int cx, int cy, float angle,
                         float halfLen, float thickness, uint16_t color) {
@@ -151,7 +151,7 @@ static void drawEye(TFT_eSprite *s, int cxScreen, int cyScreen, float angle,
 }
 
 // ---------------------------------------------------------------------------
-// Mouth — an unfilled #0F5DFD capsule, scales vertically when talking.
+// Mouth — an unfilled #0F5FFF capsule, scales vertically when talking.
 // ---------------------------------------------------------------------------
 static void drawMouth(TFT_eSprite *s, float openness, CreatureMood mood,
                       int yOffset = 0) {
