@@ -27,23 +27,39 @@ static String pickRpcUrl() {
   return "https://api.mainnet-beta.solana.com";
 }
 
-static bool rpcCall(const String &payload, String &outBody) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+// One attempt of the RPC call. `code` < 0 means a transport error
+// (WiFiClientSecure can't open a socket, TLS handshake failure, etc.) — those
+// happen intermittently on ESP32 after a few back-to-back HTTPS requests and
+// almost always clear up on a retry with a fresh client.
+static bool rpcCallOnce(const String &payload, String &outBody, int &outCode) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, pickRpcUrl())) return false;
+  if (!http.begin(client, pickRpcUrl())) { outCode = -999; return false; }
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(15000);
-  int code = http.POST(payload);
-  if (code != 200) {
-    Serial.printf("x402: rpc %d\n", code);
+  outCode = http.POST(payload);
+  if (outCode != 200) {
     http.end();
     return false;
   }
   outBody = http.getString();
   http.end();
   return true;
+}
+
+static bool rpcCall(const String &payload, String &outBody) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  int code = 0;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (rpcCallOnce(payload, outBody, code)) return true;
+    Serial.printf("x402: rpc %d (attempt %d/3)\n", code, attempt + 1);
+    // Only retry on transport errors (negative codes); an actual HTTP status
+    // like 400/429/500 won't be fixed by a retry and wastes time.
+    if (code >= 0) return false;
+    delay(200 + attempt * 300);
+  }
+  return false;
 }
 
 // Recent blockhash: returns 32 bytes (base58-decoded) or false.
@@ -70,17 +86,22 @@ static bool fetchRecentBlockhash(uint8_t out[32]) {
 // Returns empty String if the recipient has no USDC account set up —
 // which means an x402 service is mis-configured, the payment will fail.
 //
-// A tiny 1-entry cache keyed on the owner address saves a full HTTPS round
-// trip on every subsequent request to the same facilitator — which is the
-// common case (sol.blockrun.ai doesn't change its payout address).
-static String   s_cachedAtaOwner;
-static String   s_cachedAtaPubkey;
+// Small LRU-ish cache keyed on the owner address. One slot was not enough:
+// a single chat turn alternates between sol.blockrun.ai (the LLM gateway)
+// and one or more x402 service payees, and a 1-slot cache forced a Helius
+// RPC round trip on every hop — which starts failing with intermittent TLS
+// socket errors. 4 slots covers the hot set comfortably.
+static constexpr size_t ATA_CACHE_SLOTS = 4;
+static String s_ataCacheOwner [ATA_CACHE_SLOTS];
+static String s_ataCachePubkey[ATA_CACHE_SLOTS];
+static size_t s_ataCacheNext = 0;
 
 static String fetchUsdcAta(const String &ownerB58) {
-  if (ownerB58.length() > 0 &&
-      ownerB58 == s_cachedAtaOwner &&
-      s_cachedAtaPubkey.length() > 0) {
-    return s_cachedAtaPubkey;
+  if (ownerB58.length() == 0) return String();
+  for (size_t i = 0; i < ATA_CACHE_SLOTS; i++) {
+    if (s_ataCacheOwner[i] == ownerB58 && s_ataCachePubkey[i].length() > 0) {
+      return s_ataCachePubkey[i];
+    }
   }
   String payload = String(
       "{\"jsonrpc\":\"2.0\",\"id\":1,"
@@ -96,8 +117,9 @@ static String fetchUsdcAta(const String &ownerB58) {
   const char *pk = arr[0]["pubkey"] | (const char*)nullptr;
   String result = pk ? String(pk) : String();
   if (result.length() > 0) {
-    s_cachedAtaOwner  = ownerB58;
-    s_cachedAtaPubkey = result;
+    s_ataCacheOwner [s_ataCacheNext] = ownerB58;
+    s_ataCachePubkey[s_ataCacheNext] = result;
+    s_ataCacheNext = (s_ataCacheNext + 1) % ATA_CACHE_SLOTS;
   }
   return result;
 }
@@ -224,9 +246,14 @@ static String buildPaymentPayload(const JsonDocument &paymentRequired,
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-X402Result x402Post(const String &url,
-                    const String &jsonBody,
-                    const String &authBearer) {
+//
+// Single request path shared by x402Post / x402Get. `method` is "POST" or
+// "GET". For GET, `jsonBody` is ignored and no Content-Type header is sent.
+static X402Result x402Request(const char   *method,
+                              const String &url,
+                              const String &jsonBody,
+                              const String &authBearer) {
+  const bool isPost = (strcmp(method, "POST") == 0);
   X402Result r;
   if (WiFi.status() != WL_CONNECTED) {
     r.error = "no wifi";
@@ -241,7 +268,7 @@ X402Result x402Post(const String &url,
     r.error = "http.begin failed";
     return r;
   }
-  http.addHeader("Content-Type", "application/json");
+  if (isPost) http.addHeader("Content-Type", "application/json");
   if (authBearer.length() > 0) {
     http.addHeader("Authorization", "Bearer " + authBearer);
   }
@@ -258,9 +285,9 @@ X402Result x402Post(const String &url,
   http.collectHeaders(kPaymentHeaders, 3);
 
   uint32_t t0 = millis();
-  int code = http.POST(jsonBody);
-  Serial.printf("x402: POST %s -> %d in %lu ms\n",
-                url.c_str(), code, (unsigned long)(millis() - t0));
+  int code = isPost ? http.POST(jsonBody) : http.GET();
+  Serial.printf("x402: %s %s -> %d in %lu ms\n",
+                method, url.c_str(), code, (unsigned long)(millis() - t0));
 
   if (code == 402) {
     // Try every known place the facilitator might have put the payment
@@ -317,29 +344,41 @@ X402Result x402Post(const String &url,
       return r;
     }
 
-    // Retry with the payment header on a fresh client. (Reusing the first
-    // HTTPClient turned out flaky across header changes on ESP32 Arduino.)
-    WiFiClientSecure client2;
-    client2.setInsecure();
-    HTTPClient http2;
-    http2.setTimeout(60000);
-    if (!http2.begin(client2, url)) {
-      r.error = "retry http.begin failed";
-      return r;
-    }
-    http2.addHeader("Content-Type", "application/json");
-    http2.addHeader("PAYMENT-SIGNATURE", paymentHeader);
-    if (authBearer.length() > 0) {
-      http2.addHeader("Authorization", "Bearer " + authBearer);
-    }
+    // Retry with the payment header. WiFiClientSecure occasionally fails
+    // the TLS handshake on the ESP32 (HTTPCode < 0) right after a previous
+    // HTTPS call closed — so try up to 3 times with a fresh client, only
+    // retrying on transport-level failures (negative codes). An actual HTTP
+    // status like 400/402/500 means the server answered and we should honor
+    // that answer, not retry.
+    int code2 = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+      WiFiClientSecure client2;
+      client2.setInsecure();
+      HTTPClient http2;
+      http2.setTimeout(60000);
+      if (!http2.begin(client2, url)) {
+        code2 = -998;
+        Serial.printf("x402: retry begin failed (attempt %d/3)\n", attempt + 1);
+        delay(200 + attempt * 300);
+        continue;
+      }
+      if (isPost) http2.addHeader("Content-Type", "application/json");
+      http2.addHeader("PAYMENT-SIGNATURE", paymentHeader);
+      if (authBearer.length() > 0) {
+        http2.addHeader("Authorization", "Bearer " + authBearer);
+      }
 
-    uint32_t t1 = millis();
-    int code2 = http2.POST(jsonBody);
-    r.status = code2;
-    r.body   = http2.getString();
-    http2.end();
-    Serial.printf("x402: retry -> %d in %lu ms\n",
-                  code2, (unsigned long)(millis() - t1));
+      uint32_t t1 = millis();
+      code2    = isPost ? http2.POST(jsonBody) : http2.GET();
+      r.status = code2;
+      r.body   = http2.getString();
+      http2.end();
+      Serial.printf("x402: retry -> %d in %lu ms%s\n",
+                    code2, (unsigned long)(millis() - t1),
+                    (code2 < 0 && attempt < 2) ? " (will retry)" : "");
+      if (code2 >= 0) break;  // server answered, don't retry
+      delay(200 + attempt * 300);
+    }
     if (code2 == 200) {
       r.costUsd = amountStr.toDouble() / 1e6;
     } else {
@@ -354,4 +393,15 @@ X402Result x402Post(const String &url,
   http.end();
   if (code != 200) r.error = "status " + String(code);
   return r;
+}
+
+X402Result x402Post(const String &url,
+                    const String &jsonBody,
+                    const String &authBearer) {
+  return x402Request("POST", url, jsonBody, authBearer);
+}
+
+X402Result x402Get(const String &url,
+                   const String &authBearer) {
+  return x402Request("GET", url, String(), authBearer);
 }

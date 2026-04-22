@@ -24,6 +24,10 @@ static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
 static volatile bool s_ready     = false;
 static volatile bool s_playing   = false;
+// Target "steady-state" volume. voiceSpeak ramps from 0 up to this to hide
+// the I2S/decoder start-up click; voiceSetVolume updates both it and the
+// live audio gain.
+static volatile uint8_t s_targetVol = 21;
 
 // ---------------------------------------------------------------------------
 // Boot-time direct-I2S beep (hardware probe)
@@ -227,9 +231,27 @@ bool voiceSpeak(const String &text) {
 
   if (!fetchMp3ToFs(text)) return false;
 
+  // Start playback at volume 0 to hide the audible click produced by the
+  // I2S/DAC state change when the decoder kicks in. The Audio library's
+  // setVolume is a cheap gain field — the audio task on core 0 picks up
+  // the new value on the next DMA chunk, so we can ramp from the main
+  // thread with small blocking delays.
+  const uint8_t target = s_targetVol;
+  s_audio->setVolume(0);
   bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
+  if (ok) {
+    // ~48 ms fade-in — long enough to smear the step across many DMA
+    // buffers, short enough that speech still feels instant.
+    for (int v = 0; v <= (int)target; v += 3) {
+      s_audio->setVolume((uint8_t)(v > target ? target : v));
+      delay(6);
+    }
+    s_audio->setVolume(target);
+  } else {
+    s_audio->setVolume(target);
+    Serial.println("voice: connecttoFS failed");
+  }
   s_playing = ok;
-  if (!ok) Serial.println("voice: connecttoFS failed");
   return ok;
 }
 
@@ -244,6 +266,7 @@ void voiceDiagnose() { /* no-op now */ }
 
 void voiceSetVolume(uint8_t v) {
   if (v > 21) v = 21;
+  s_targetVol = v;
   if (s_audio) s_audio->setVolume(v);
 }
 

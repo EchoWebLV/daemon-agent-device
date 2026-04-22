@@ -29,3 +29,8 @@ struct X402Result {
 X402Result x402Post(const String &url,
                     const String &jsonBody,
                     const String &authBearer = String());
+
+// GET variant of the same flow — used to reach paid third-party services
+// that accept their arguments as query parameters.
+X402Result x402Get(const String &url,
+                   const String &authBearer = String());
