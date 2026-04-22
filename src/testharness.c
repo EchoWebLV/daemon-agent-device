@@ -51,6 +51,12 @@ static const char *TAG = "testharness";
 // in_test_mode(); writes happen only from the harness task.
 static volatile bool s_in_test_mode = false;
 
+// Screen transitions animate for ~220 ms (see ui.c:load_screen_anim). After
+// a SCREEN FORCE or SWIPE the harness waits a little longer so any test that
+// immediately re-reads ui_current_screen_name() sees the settled state, and
+// so a back-to-back command doesn't collide with the tail of the animation.
+#define SCREEN_ANIM_SETTLE_MS 280
+
 // ---------- small response helpers -----------------------------------------
 
 static void resp_ok(const char *rest) {
@@ -164,6 +170,12 @@ static void handle_screen_force(const char *name) {
         resp_err(msg);
         return;
     }
+    // Let the slide animation finish before we echo back / let the next
+    // command in. lv_screen_active() flips to the new screen immediately, so
+    // the ui_current_screen_name() readback is already correct — this delay
+    // mostly prevents the next TEST SWIPE / FORCE from riding into the tail
+    // of the current transition.
+    vTaskDelay(pdMS_TO_TICKS(SCREEN_ANIM_SETTLE_MS));
     // Echo the active screen so the host sees a confirmed, not a hoped-for,
     // transition. We deliberately re-query through ui_current_screen_name()
     // instead of echoing `name` — catches a bug where the loader silently
@@ -217,6 +229,9 @@ static void handle_swipe(const char *args) {
         return;
     }
     ui_inject_swipe(dir);
+    // ui_inject_swipe calls through to ui_show_* which kicks a 220 ms slide
+    // animation. Same rationale as handle_screen_force for waiting it out.
+    vTaskDelay(pdMS_TO_TICKS(SCREEN_ANIM_SETTLE_MS));
     resp_ok("swipe");
 }
 

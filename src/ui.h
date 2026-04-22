@@ -41,8 +41,15 @@ extern "C" {
 
 esp_err_t ui_init(void);
 
-// Switch to a specific screen (wraps lv_screen_load + the per-screen
-// "just became visible" hook). Safe to call from the main loop.
+// Call after touch_init() so LVGL's pointer indev exists. Lowers the swipe
+// threshold from the stock 50 px down to 25 px — makes vertical gestures on
+// the 240x320 panel reliable without having to reach across the whole screen.
+void ui_tune_gestures(void);
+
+// Switch to a specific screen (wraps lv_screen_load_anim + the per-screen
+// "just became visible" hook). Transitions slide at ~220 ms in the direction
+// implied by the semantic screen layout (wallet←creature→settings, wifi
+// below settings). Safe to call from the main loop.
 void ui_show_creature(void);
 void ui_show_wallet(void);
 void ui_show_settings(void);

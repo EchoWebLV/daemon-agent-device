@@ -99,6 +99,11 @@ void app_main(void) {
     // it binds to lv_display_get_default().
     ESP_ERROR_CHECK(touch_init());
 
+    // Dial the swipe threshold down now that the pointer indev exists. Kept
+    // out of ui_init() because the indev is created by touch_init() above;
+    // we'd otherwise find nothing to tune.
+    ui_tune_gestures();
+
     // Wi-Fi: try stored creds first, then the compile-time fallback. 25 s
     // timeout matches the Arduino build. Not fatal on failure — the creature
     // should still be usable offline; log and continue.

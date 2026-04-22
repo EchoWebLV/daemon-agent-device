@@ -131,6 +131,26 @@ static void install_swipe_handlers(void) {
     }
 }
 
+// Dial the gesture threshold down from LVGL's default (50 px min distance)
+// so up/down swipes trigger with less finger travel — we're on a 240x320
+// panel where 50 px is ~15% of the vertical axis and users were reporting
+// that vertical swipes routinely failed to register. Call AFTER touch_init()
+// so the pointer indev has been created.
+void ui_tune_gestures(void) {
+    if (!lvgl_port_lock(0)) return;
+    lv_indev_t *indev = NULL;
+    while ((indev = lv_indev_get_next(indev)) != NULL) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+            // 25 px ≈ thumbnail-sized flick; still well above the noise floor
+            // of the CST328, which reports sub-pixel jitter at rest. Keep the
+            // velocity minimum at its default (3 px/sample) so hand-jitter
+            // doesn't register as phantom swipes.
+            lv_indev_set_gesture_min_distance(indev, 25);
+        }
+    }
+    lvgl_port_unlock();
+}
+
 // --- public API ------------------------------------------------------------
 
 esp_err_t ui_init(void) {
@@ -191,35 +211,80 @@ esp_err_t ui_init(void) {
 }
 
 // --- screen switchers ------------------------------------------------------
+//
+// Each transition animates at ~220 ms so swipes read as "slides" without
+// fighting the user's next touch. Direction is derived from which screens
+// we're transitioning between — see screen_anim_to() for the layout.
 
-void ui_show_creature(void) {
+// Track the last screen we loaded so screen_anim_to() can pick a direction
+// that matches where the user "came from". Defaults to "creature" because
+// ui_init() drops the creature on top as the very first load.
+static const char *s_last_screen = "creature";
+
+// Semantic layout (think of it as a 2-axis grid):
+//
+//     wallet  <——  creature  ——>  settings
+//                                     |
+//                                     v
+//                                   wifi
+//
+// Horizontal moves: target on the right  → MOVE_LEFT  (new enters from right)
+//                   target on the left   → MOVE_RIGHT (new enters from left)
+// Vertical moves  : wifi pops up from the bottom of settings, drops back down
+//                   to dismiss. Off-axis jumps (shouldn't happen today but
+//                   cheap to handle) fade instead of sliding in a weird
+//                   direction.
+static lv_screen_load_anim_t screen_anim_to(const char *from, const char *to) {
+    if (!strcmp(from, "settings") && !strcmp(to, "wifi"))     return LV_SCR_LOAD_ANIM_MOVE_TOP;
+    if (!strcmp(from, "wifi")     && !strcmp(to, "settings")) return LV_SCR_LOAD_ANIM_MOVE_BOTTOM;
+
+    // wallet(0) < creature(1) < settings(2). Anything else drops through
+    // to the fade fallback below.
+    int fpos = -1, tpos = -1;
+    if      (!strcmp(from, "wallet"))   fpos = 0;
+    else if (!strcmp(from, "creature")) fpos = 1;
+    else if (!strcmp(from, "settings")) fpos = 2;
+    if      (!strcmp(to, "wallet"))     tpos = 0;
+    else if (!strcmp(to, "creature"))   tpos = 1;
+    else if (!strcmp(to, "settings"))   tpos = 2;
+    if (fpos >= 0 && tpos >= 0) {
+        if (tpos > fpos) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
+        if (tpos < fpos) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
+    }
+    return LV_SCR_LOAD_ANIM_FADE_IN;
+}
+
+// Centralised loader so every ui_show_* shares the same timing + bookkeeping.
+// auto_del=false because each screen is built once in ui_init() and reused;
+// we don't want LVGL tearing them down between transitions.
+static void load_screen_anim(lv_obj_t *target, const char *name) {
+    lv_screen_load_anim_t anim = screen_anim_to(s_last_screen, name);
     if (lvgl_port_lock(0)) {
-        lv_screen_load(creature_screen());
+        lv_screen_load_anim(target, anim, 220, 0, false);
         lvgl_port_unlock();
     }
+    // Safe: every caller passes a literal. Keep in sync even if the lock
+    // failed — LVGL won't have switched, but the next load_screen_anim call
+    // will just compute an animation that happens to land on the same target.
+    s_last_screen = name;
+}
+
+void ui_show_creature(void) {
+    load_screen_anim(creature_screen(), "creature");
 }
 
 void ui_show_wallet(void) {
-    if (lvgl_port_lock(0)) {
-        lv_screen_load(wallet_screen());
-        lvgl_port_unlock();
-    }
+    load_screen_anim(wallet_screen(), "wallet");
     wallet_screen_refresh();
 }
 
 void ui_show_settings(void) {
-    if (lvgl_port_lock(0)) {
-        lv_screen_load(settings_screen());
-        lvgl_port_unlock();
-    }
+    load_screen_anim(settings_screen(), "settings");
     settings_screen_refresh();
 }
 
 void ui_show_wifi(void) {
-    if (lvgl_port_lock(0)) {
-        lv_screen_load(wifi_screen());
-        lvgl_port_unlock();
-    }
+    load_screen_anim(wifi_screen(), "wifi");
 }
 
 // --- broadcasts ------------------------------------------------------------
