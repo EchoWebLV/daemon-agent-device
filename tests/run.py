@@ -229,6 +229,32 @@ def c_settings_from_swipe(dev: Device) -> str:
     return ""
 
 
+def c_wifi_status_connected(dev: Device) -> str:
+    """Device must be associated with an AP (credentials from NVS)."""
+    resp = dev.send("TEST WIFI STATUS", timeout=3.0)[0].split()
+    # Format: TEST OK wifi <connected|disconnected> <ssid_or_-> <rssi>
+    assert resp[3] == "connected", f"wifi is {resp[3]}"
+    ssid = resp[4].replace("_", " ")
+    rssi = int(resp[5])
+    assert ssid, "empty ssid"
+    assert -100 < rssi < 0, f"implausible rssi {rssi}"
+    return f"({ssid}, {rssi} dBm)"
+
+
+def c_wifi_scan_nonempty(dev: Device) -> str:
+    """Regression guard for the async-scan bug: sync scan must find ≥1 AP."""
+    # Sync scan takes 2–4 s on ESP32. Give it 10.
+    resp = dev.send("TEST WIFI SCAN", timeout=10.0)
+    head = resp[0].split()
+    n = int(head[-1])
+    assert n >= 1, "scan returned 0 networks (regression!)"
+    ssids = [ln.split()[2].replace("_", " ") for ln in resp[1:]]
+    preview = ", ".join(ssids[:3])
+    if n > 3:
+        preview += "…"
+    return f"({n} networks: {preview})"
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -263,6 +289,8 @@ def main() -> int:
         ("menu_tap_wallet",     c_menu_tap_wallet),
         ("menu_tap_info",       c_menu_tap_info),
         ("settings_from_swipe", c_settings_from_swipe),
+        ("wifi_status_connected", c_wifi_status_connected),
+        ("wifi_scan_nonempty",    c_wifi_scan_nonempty),
         # Later tasks insert cases here in protocol order.
     ]
 

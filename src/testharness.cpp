@@ -3,6 +3,8 @@
 // ============================================================================
 #include "testharness.h"
 
+#include <WiFi.h>    // status + scan for TEST WIFI STATUS / SCAN
+
 #include "creature.h"
 #include "menuscreen.h"
 #include "walletscreen.h"
@@ -148,6 +150,40 @@ static void handleLine(const String &line) {
     }
     mainInjectSwipe(d);
     Serial.println("TEST OK swipe");
+    return;
+  }
+
+  // --- WIFI STATUS / SCAN -----------------------------------------------
+  if (rest == "WIFI STATUS") {
+    if (WiFi.status() == WL_CONNECTED) {
+      // SSIDs may contain spaces. Replace with underscores so the host's
+      // space-delimited parser sees a single token. The host reverses it.
+      String ssid = WiFi.SSID();
+      ssid.replace(' ', '_');
+      Serial.printf("TEST OK wifi connected %s %d\n",
+                    ssid.c_str(), (int)WiFi.RSSI());
+    } else {
+      Serial.println("TEST OK wifi disconnected - 0");
+    }
+    return;
+  }
+  if (rest == "WIFI SCAN") {
+    WiFi.mode(WIFI_STA);
+    WiFi.scanDelete();
+    int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+    if (n < 0) {
+      Serial.printf("TEST ERR wifi scan rc=%d\n", n);
+      return;
+    }
+    Serial.printf("TEST OK wifi scan %d\n", n);
+    for (int i = 0; i < n; ++i) {
+      String ssid = WiFi.SSID(i);
+      ssid.replace(' ', '_');
+      const char *enc = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "OPEN" : "WPA";
+      Serial.printf("TEST NET %s %d %s\n",
+                    ssid.c_str(), (int)WiFi.RSSI(i), enc);
+    }
+    WiFi.scanDelete();
     return;
   }
 
