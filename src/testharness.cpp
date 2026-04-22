@@ -9,6 +9,7 @@
 #include "infoscreen.h"
 #include "settingsscreen.h"
 #include "wifiscreen.h"
+#include "touch.h"   // SWIPE_* enum values for TEST SWIPE
 
 static bool   s_testMode = false;
 static String s_lineBuf;
@@ -120,6 +121,33 @@ static void handleLine(const String &line) {
     else if (!strcmp(cur, "settings")) settingsScreenDraw();
     else if (!strcmp(cur, "wifi"))     wifiScreenDraw();
     Serial.printf("TEST OK paint %u\n", (unsigned)(millis() - t0));
+    return;
+  }
+
+  // --- TAP / SWIPE ------------------------------------------------------
+  if (rest.startsWith("TAP ")) {
+    int x = 0, y = 0;
+    if (sscanf(rest.c_str(), "TAP %d %d", &x, &y) == 2) {
+      mainInjectTap((int16_t)x, (int16_t)y);
+      Serial.println("TEST OK tap");
+    } else {
+      Serial.println("TEST ERR tap bad_args");
+    }
+    return;
+  }
+  if (rest.startsWith("SWIPE ")) {
+    String dir = rest.substring(6);
+    int d = 0;
+    if      (dir == "LEFT")  d = SWIPE_LEFT;
+    else if (dir == "RIGHT") d = SWIPE_RIGHT;
+    else if (dir == "UP")    d = SWIPE_UP;
+    else if (dir == "DOWN")  d = SWIPE_DOWN;
+    else {
+      Serial.printf("TEST ERR swipe bad_dir %s\n", dir.c_str());
+      return;
+    }
+    mainInjectSwipe(d);
+    Serial.println("TEST OK swipe");
     return;
   }
 

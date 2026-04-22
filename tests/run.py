@@ -189,6 +189,46 @@ def c_paint_under_budget(dev: Device) -> str:
     return f"(max {worst} ms)"
 
 
+# Menu tile centers, derived from src/menuscreen.cpp constants.
+# TILE_X=10, TILE_W = SCR_W-20 = 220, TILE_H=116, TILE1_Y=44, TILE2_Y=172.
+_MENU_TILE_X   = 10 + 220 // 2           # 120
+_WALLET_TILE_Y = 44 + 116 // 2           # 102
+_INFO_TILE_Y   = 172 + 116 // 2          # 230
+
+
+def c_menu_tap_wallet(dev: Device) -> str:
+    """Tap the Wallet tile from the menu screen; expect transition to wallet."""
+    dev.send("TEST SCREEN FORCE menu", timeout=3.0)
+    time.sleep(0.3)
+    dev.send(f"TEST TAP {_MENU_TILE_X} {_WALLET_TILE_Y}", timeout=2.0)
+    time.sleep(0.3)
+    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
+    assert got == "wallet", f"expected wallet, got {got}"
+    return ""
+
+
+def c_menu_tap_info(dev: Device) -> str:
+    """Tap the Info tile from the menu screen; expect transition to info."""
+    dev.send("TEST SCREEN FORCE menu", timeout=3.0)
+    time.sleep(0.3)
+    dev.send(f"TEST TAP {_MENU_TILE_X} {_INFO_TILE_Y}", timeout=2.0)
+    time.sleep(0.3)
+    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
+    assert got == "info", f"expected info, got {got}"
+    return ""
+
+
+def c_settings_from_swipe(dev: Device) -> str:
+    """Swipe down on the creature screen; expect settings to open."""
+    dev.send("TEST SCREEN FORCE creature", timeout=3.0)
+    time.sleep(0.3)
+    dev.send("TEST SWIPE DOWN", timeout=2.0)
+    time.sleep(0.3)
+    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
+    assert got == "settings", f"expected settings, got {got}"
+    return ""
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -220,6 +260,9 @@ def main() -> int:
         ("version_reports",     c_version_reports),
         ("screen_roundtrip",    c_screen_roundtrip),
         ("paint_under_budget",  c_paint_under_budget),
+        ("menu_tap_wallet",     c_menu_tap_wallet),
+        ("menu_tap_info",       c_menu_tap_info),
+        ("settings_from_swipe", c_settings_from_swipe),
         # Later tasks insert cases here in protocol order.
     ]
 
