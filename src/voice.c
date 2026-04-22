@@ -96,6 +96,12 @@ static esp_err_t i2s_install(uint32_t sample_hz) {
     // cost of a few extra KB of internal RAM.
     chan_cfg.dma_desc_num  = 8;
     chan_cfg.dma_frame_num = 240;
+    // Write zero-fills when the DMA ring underruns. Without this the ring
+    // keeps cycling the last descriptor forever, so the tail of the boot
+    // beep loops indefinitely between the 3-tone probe and the first TTS
+    // stream — which is exactly the "stuck on one sound" regression this
+    // fixes.
+    chan_cfg.auto_clear_after_cb = true;
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) return err;
