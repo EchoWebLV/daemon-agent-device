@@ -64,7 +64,7 @@ static void switchScreen(Screen target) {
   s_screen = target;
   switch (target) {
     case SCREEN_CREATURE: creatureRepaint();     break;
-    case SCREEN_WALLET:   walletScreenDraw();    break;
+    case SCREEN_WALLET:   walletScreenOnEnter(); break;
     case SCREEN_SETTINGS: settingsScreenDraw();  break;
     case SCREEN_WIFI:     wifiScreenEnter();     break;
   }
@@ -243,10 +243,10 @@ void loop() {
   if (s_wifiOk) serverLoop();
 
   // Handle swipes.
-  //   SWIPE_LEFT  → wallet (from creature)
-  //   SWIPE_RIGHT → creature (from wallet)
+  //   SWIPE_UP    → wallet (from creature) — wallet slides up from bottom
   //   SWIPE_DOWN  → open settings (only fires if start was near top edge)
   //   SWIPE_UP    → close settings (back to previous screen)
+  // From the wallet, the X button in the top-right is the only way back.
   SwipeDir sw = touchPoll();
   if (s_screen == SCREEN_SETTINGS) {
     if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
@@ -257,9 +257,14 @@ void loop() {
     // or exits the panel; we just pipe the swipe through.
     wifiScreenHandleSwipe(sw);
     if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_WALLET) {
+    // Forward taps to the wallet so its QR / X buttons can be hit.
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) walletScreenHandleTap(tx, ty);
+    if (walletScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN) switchScreen(SCREEN_SETTINGS);
   } else {
-    if (sw == SWIPE_LEFT)  switchScreen(SCREEN_WALLET);
-    if (sw == SWIPE_RIGHT) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_UP)    switchScreen(SCREEN_WALLET);
     if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
   }
 
