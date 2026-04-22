@@ -5,7 +5,6 @@
 #include "display.h"
 
 #include "driver/spi_master.h"
-#include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -15,12 +14,12 @@
 static const char *TAG = "display";
 
 // ---- Pin map (Waveshare 2.8") -----------------------------------------------
+// Backlight (GPIO5) is owned by devcfg via LEDC PWM; not touched here.
 #define PIN_MOSI   45
 #define PIN_SCLK   40
 #define PIN_CS     42
 #define PIN_DC     41
 #define PIN_RST    39
-#define PIN_BL     5
 
 // SPI2 on the S3 is the general-purpose GP-SPI host; SPI3 has more DMA
 // restrictions on certain pin combos so we stick with SPI2 here.
@@ -38,17 +37,6 @@ static esp_lcd_panel_handle_t    s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io    = NULL;
 
 esp_err_t display_init(void) {
-    // ---- Backlight GPIO (off during init to hide the bring-up flash) --------
-    gpio_config_t bl_cfg = {
-        .pin_bit_mask = (1ULL << PIN_BL),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&bl_cfg));
-    gpio_set_level(PIN_BL, 0);
-
     // ---- SPI bus ------------------------------------------------------------
     // max_transfer_sz picks the upper bound on a single DMA-enabled SPI burst.
     // Sizing for 80 scan lines @ 240 px * 2 B (RGB565) lets us push half the
@@ -113,8 +101,6 @@ esp_err_t display_init(void) {
         ESP_LOGW(TAG, "no PSRAM for clear buffer; skipping");
     }
 
-    // ---- Backlight on -------------------------------------------------------
-    gpio_set_level(PIN_BL, 1);
     ESP_LOGI(TAG, "ST7789 %dx%d up @ %d MHz SPI",
              DISPLAY_WIDTH, DISPLAY_HEIGHT, PIXEL_CLOCK_HZ / 1000000);
     return ESP_OK;

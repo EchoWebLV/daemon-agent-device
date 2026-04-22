@@ -1,0 +1,194 @@
+// ---------------------------------------------------------------------------
+//  NVS-backed device settings + LCD backlight PWM. See devcfg.h.
+// ---------------------------------------------------------------------------
+#include "devcfg.h"
+
+#include <string.h>
+
+#include "driver/ledc.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+
+static const char *TAG = "devcfg";
+
+// ---- Backlight config -------------------------------------------------------
+// Pin matches the Waveshare 2.8" schematic (GPIO5, also used by display.c —
+// display.c sets it high for the panel initialisation; we take it over with
+// LEDC here so brightness is smoothly controllable from settings).
+#define BL_PIN              5
+#define BL_LEDC_MODE        LEDC_LOW_SPEED_MODE
+#define BL_LEDC_TIMER       LEDC_TIMER_0
+#define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
+#define BL_LEDC_FREQ_HZ     5000
+#define BL_LEDC_RESOLUTION  LEDC_TIMER_8_BIT   // 0..255
+#define BL_MIN_DUTY         12                  // never fully dark
+
+// ---- NVS config -------------------------------------------------------------
+#define NVS_NAMESPACE       "daemon"
+#define KEY_VOLUME          "vol"
+#define KEY_BRIGHTNESS      "bri"
+#define KEY_BLUETOOTH       "bt"
+#define KEY_WIFI_SSID       "wf_ssid"
+#define KEY_WIFI_PASSWORD   "wf_pass"
+
+// Upper bounds on strings we persist. WPA2 passwords cap at 63 chars + NUL;
+// SSIDs at 32 + NUL. We round up for headroom (hidden SSIDs / WPA3).
+#define SSID_MAX            64
+#define PASSWORD_MAX        96
+
+// ---- Module state -----------------------------------------------------------
+static bool    s_ready       = false;
+static uint8_t s_volume      = 21;
+static uint8_t s_brightness  = 255;
+static bool    s_bluetooth   = false;
+static char    s_ssid[SSID_MAX];
+static char    s_password[PASSWORD_MAX];
+
+// Small helpers ---------------------------------------------------------------
+static void apply_brightness(uint8_t b) {
+    if (b < BL_MIN_DUTY) b = BL_MIN_DUTY;
+    ledc_set_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL, b);
+    ledc_update_duty(BL_LEDC_MODE, BL_LEDC_CHANNEL);
+}
+
+static esp_err_t ledc_init(void) {
+    const ledc_timer_config_t timer_cfg = {
+        .speed_mode      = BL_LEDC_MODE,
+        .duty_resolution = BL_LEDC_RESOLUTION,
+        .timer_num       = BL_LEDC_TIMER,
+        .freq_hz         = BL_LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_cfg), TAG, "ledc timer");
+
+    const ledc_channel_config_t ch_cfg = {
+        .gpio_num   = BL_PIN,
+        .speed_mode = BL_LEDC_MODE,
+        .channel    = BL_LEDC_CHANNEL,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = BL_LEDC_TIMER,
+        .duty       = 255,
+        .hpoint     = 0,
+    };
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&ch_cfg), TAG, "ledc channel");
+    return ESP_OK;
+}
+
+// Open NVS handle with the desired mode. Returns ESP_OK even when the
+// namespace doesn't exist yet on read (caller gets the defaults it passed).
+static esp_err_t nvs_open_ns(nvs_open_mode_t mode, nvs_handle_t *out) {
+    esp_err_t err = nvs_open(NVS_NAMESPACE, mode, out);
+    if (err == ESP_ERR_NVS_NOT_FOUND && mode == NVS_READONLY) {
+        *out = 0;
+        return ESP_OK;  // no writes yet, so every read returns default
+    }
+    return err;
+}
+
+static void load_u8(nvs_handle_t h, const char *key, uint8_t *out, uint8_t dflt) {
+    if (h == 0) { *out = dflt; return; }
+    if (nvs_get_u8(h, key, out) != ESP_OK) *out = dflt;
+}
+
+static void load_bool(nvs_handle_t h, const char *key, bool *out, bool dflt) {
+    if (h == 0) { *out = dflt; return; }
+    uint8_t v = 0;
+    if (nvs_get_u8(h, key, &v) == ESP_OK) *out = (v != 0);
+    else                                   *out = dflt;
+}
+
+static void load_str(nvs_handle_t h, const char *key, char *out, size_t cap) {
+    out[0] = '\0';
+    if (h == 0) return;
+    size_t len = cap;
+    if (nvs_get_str(h, key, out, &len) != ESP_OK) out[0] = '\0';
+}
+
+static void save_u8(const char *key, uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, key, v);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void save_str(const char *key, const char *v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    if (v == NULL || v[0] == '\0') nvs_erase_key(h, key);
+    else                            nvs_set_str(h, key, v);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Public API ------------------------------------------------------------------
+esp_err_t devcfg_init(void) {
+    if (s_ready) return ESP_OK;
+
+    ESP_RETURN_ON_ERROR(ledc_init(), TAG, "ledc init");
+
+    nvs_handle_t h = 0;
+    ESP_RETURN_ON_ERROR(nvs_open_ns(NVS_READONLY, &h), TAG, "nvs open");
+
+    load_u8  (h, KEY_VOLUME,        &s_volume,     21);
+    load_u8  (h, KEY_BRIGHTNESS,    &s_brightness, 255);
+    load_bool(h, KEY_BLUETOOTH,     &s_bluetooth,  false);
+    load_str (h, KEY_WIFI_SSID,     s_ssid,        sizeof(s_ssid));
+    load_str (h, KEY_WIFI_PASSWORD, s_password,    sizeof(s_password));
+
+    if (h != 0) nvs_close(h);
+
+    apply_brightness(s_brightness);
+    s_ready = true;
+
+    ESP_LOGI(TAG, "loaded: vol=%u bri=%u bt=%d ssid='%s'",
+             s_volume, s_brightness, s_bluetooth ? 1 : 0,
+             s_ssid[0] ? s_ssid : "(none)");
+    return ESP_OK;
+}
+
+uint8_t devcfg_volume(void)     { return s_volume; }
+uint8_t devcfg_brightness(void) { return s_brightness; }
+bool    devcfg_bluetooth(void)  { return s_bluetooth; }
+
+void devcfg_set_volume(uint8_t v) {
+    if (v > 21) v = 21;
+    if (v == s_volume) return;
+    s_volume = v;
+    save_u8(KEY_VOLUME, v);
+}
+
+void devcfg_set_brightness(uint8_t b) {
+    if (b == s_brightness) return;
+    s_brightness = b;
+    apply_brightness(b);
+    save_u8(KEY_BRIGHTNESS, b);
+}
+
+void devcfg_set_bluetooth(bool on) {
+    if (on == s_bluetooth) return;
+    s_bluetooth = on;
+    save_u8(KEY_BLUETOOTH, on ? 1 : 0);
+}
+
+const char *devcfg_wifi_ssid(void)     { return s_ssid; }
+const char *devcfg_wifi_password(void) { return s_password; }
+
+void devcfg_set_wifi(const char *ssid, const char *password) {
+    if (ssid == NULL)     ssid = "";
+    if (password == NULL) password = "";
+    strlcpy(s_ssid,     ssid,     sizeof(s_ssid));
+    strlcpy(s_password, password, sizeof(s_password));
+    save_str(KEY_WIFI_SSID,     s_ssid);
+    save_str(KEY_WIFI_PASSWORD, s_password);
+    ESP_LOGI(TAG, "wifi cred stored for '%s'", s_ssid);
+}
+
+void devcfg_clear_wifi(void) {
+    s_ssid[0]     = '\0';
+    s_password[0] = '\0';
+    save_str(KEY_WIFI_SSID,     "");
+    save_str(KEY_WIFI_PASSWORD, "");
+}

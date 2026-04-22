@@ -7,9 +7,11 @@
 idf_component_register(
     SRCS
         "app_main.c"
+        "devcfg.c"
         "display.c"
         "ui.c"
         "touch.c"
+        "wifi_sta.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -17,6 +19,11 @@ idf_component_register(
         esp_lcd
         driver
         esp_driver_i2c
+        # NVS-backed settings + Wi-Fi STA bring-up.
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
         # LVGL + the IDF port layer that glues it to esp_lcd.
         # Pulled in via src/idf_component.yml.
         lvgl

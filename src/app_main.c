@@ -12,14 +12,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_system.h"
+#include "nvs_flash.h"
 
+#include "devcfg.h"
 #include "display.h"
-#include "ui.h"
 #include "touch.h"
+#include "ui.h"
+#include "wifi_sta.h"
 
 static const char *TAG = "daemon";
 
@@ -46,6 +50,23 @@ static void log_boot_banner(void) {
 void app_main(void) {
     log_boot_banner();
 
+    // ---- NVS ---------------------------------------------------------------
+    // Everything that persists (settings, wifi creds, wallet keypair) lives
+    // in the default NVS partition. Initialise it before anyone tries to
+    // read from it. If the partition is corrupted or a new blob layout ships,
+    // erase and retry once so a bad NVS doesn't brick the boot.
+    esp_err_t nvs = nvs_flash_init();
+    if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs erase (%s); wiping and retrying",
+                 esp_err_to_name(nvs));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs);
+
+    // Device settings (backlight PWM comes online here at the stored duty).
+    ESP_ERROR_CHECK(devcfg_init());
+
     // Bring the ST7789 online early so dead-panel failures show up in the
     // log before we start allocating for LVGL / WiFi / audio.
     ESP_ERROR_CHECK(display_init());
@@ -59,12 +80,24 @@ void app_main(void) {
     // it binds to lv_display_get_default().
     ESP_ERROR_CHECK(touch_init());
 
+    // Wi-Fi: try stored creds first, then the compile-time fallback. 25 s
+    // timeout matches the Arduino build. Not fatal on failure — the creature
+    // should still be usable offline; log and continue.
+    esp_err_t wifi_err = wifi_sta_begin(25000);
+    if (wifi_err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi unavailable (%s); continuing offline",
+                 esp_err_to_name(wifi_err));
+    }
+
     uint32_t tick = 0;
     while (true) {
         size_t free_total = esp_get_free_heap_size();
         size_t free_min   = esp_get_minimum_free_heap_size();
-        ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u B  low-water=%u B",
-                 tick++, (unsigned)free_total, (unsigned)free_min);
+        char ip[16] = {0};
+        wifi_sta_ip_str(ip, sizeof(ip));
+        ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u B  low-water=%u B  ip=%s",
+                 tick++, (unsigned)free_total, (unsigned)free_min,
+                 ip[0] ? ip : "(none)");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
