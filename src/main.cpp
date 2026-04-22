@@ -38,6 +38,7 @@
 #include "wifiscreen.h"
 #include "devcfg.h"
 #include "secrets.h"
+#include "testharness.h"
 
 static TFT_eSPI tft;
 static bool     s_wifiOk   = false;
@@ -222,6 +223,9 @@ void setup() {
   // message and the status bar shows the ticker immediately.
   walletBegin();
   priceBegin();
+
+  // Test harness — dormant until the host sends "TEST BEGIN" on CDC.
+  testHarnessBegin();
   if (s_wifiOk) {
     priceRefresh();
     creatureSetPrice(priceDisplayString());
@@ -252,6 +256,14 @@ void setup() {
 }
 
 void loop() {
+  // Host-driven smoke tests preempt the normal UI loop while active.
+  // Cheap when idle — one Serial.available() poll per iteration.
+  testHarnessTick();
+  if (testHarnessInTestMode()) {
+    delay(1);          // yield to Wi-Fi / background tasks
+    return;
+  }
+
   // HTTP is blocking-per-request, but handleClient() returns quickly if no
   // client is connected, so the animation keeps running.
   if (s_wifiOk) serverLoop();
