@@ -1,0 +1,15 @@
+# ESP-IDF partition table — 16 MB flash layout for Daemon.
+#
+# Offsets:
+#   0x0000   bootloader (managed by IDF, ~32 KB)
+#   0x8000   partition table (4 KB)
+#   0x9000   nvs      — wifi creds, device config, preferences
+#   0xF000   phy_init — RF calibration blob
+#   0x10000  factory  — application (5 MB, plenty of headroom)
+#   0x510000 storage  — LittleFS (~11 MB: wallet keys, TTS cache, logs)
+#
+# Name,     Type, SubType,  Offset,   Size,       Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x500000,
+storage,    data, littlefs, 0x510000, 0xAF0000,

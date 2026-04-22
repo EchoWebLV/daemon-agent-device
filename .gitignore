@@ -1,11 +1,20 @@
-.pio
-.pioenvs
-.piolibdeps
-.vscode
-.clang_complete
-.gcc-flags.json
-.DS_Store
-.pio-venv
+# PlatformIO
+.pio/
+.pio-venv/
 
-# Never commit real Wi-Fi / API credentials
+# ESP-IDF generated (keep sdkconfig.defaults, ignore per-env derived configs)
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+managed_components/
+dependencies.lock
+
+# Secrets
 src/secrets.h
+
+# Misc
+.DS_Store
+*.pyc
+__pycache__/
+.venv/

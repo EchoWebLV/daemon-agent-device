@@ -1,0 +1,53 @@
+# -----------------------------------------------------------------------------
+#  ESP-IDF sdkconfig defaults for Daemon.
+#
+#  Anything set here is applied on a fresh build. After the first build a full
+#  `sdkconfig` is generated from these + IDF defaults; regenerate it by
+#  deleting `.pio/build/<env>/sdkconfig` and rebuilding.
+# -----------------------------------------------------------------------------
+
+# ---- Target chip ------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash ------------------------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ---- Custom partition table -------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM (8 MB octal-SPI on this board) -----------------------------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Allocations smaller than this threshold go to internal RAM (fast); bigger
+# ones fall through to PSRAM. 16 KB matches the Arduino-ESP32 default.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# ---- CPU --------------------------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# ---- Console over native USB Serial/JTAG (no external chip on this board) --
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+
+# ---- FreeRTOS ---------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# ---- Logging ----------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_COLORS=y
+
+# ---- LWIP (HTTPS to ElevenLabs / Solana RPC expects reasonable buffers) ----
+CONFIG_LWIP_MAX_ACTIVE_TCP=8
+CONFIG_LWIP_MAX_LISTENING_TCP=8
+
+# ---- mbedTLS (bigger record buffer so Gemini / ElevenLabs chunks fit) ------
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096

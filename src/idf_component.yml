@@ -1,0 +1,13 @@
+# ESP-IDF managed components for Daemon.
+#
+# The IDF Component Manager pulls these at first build from
+# https://components.espressif.com. Keeping the list here (instead of vendoring
+# sources) means `pio run` stays reproducible and we can upgrade LVGL et al.
+# by bumping a single version.
+dependencies:
+  idf: ">=5.1"
+  # Uncomment as each subsystem comes online:
+  # lvgl/lvgl:                 "^9.2.0"     # display UI
+  # espressif/esp_lvgl_port:   "^2.3.0"     # LVGL <-> esp_lcd glue
+  # espressif/esp_lcd_touch_cst328: "^0.1"  # CST328 touch driver
+  # espressif/esp_littlefs:    "^1.16.0"    # persistent storage
