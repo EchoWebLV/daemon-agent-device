@@ -8,6 +8,11 @@
 #include <TFT_eSPI.h>
 
 bool settingsScreenBegin(TFT_eSPI *tft);
+
+// Called by main.cpp every time Settings becomes the active screen.
+// Plays the slide-down animation once, then leaves the panel painted.
+void settingsScreenOnEnter();
+
 void settingsScreenDraw();   // full repaint
 void settingsScreenTick();   // input + incremental repaint (call each frame)
 

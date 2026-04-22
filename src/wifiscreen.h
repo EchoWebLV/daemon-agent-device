@@ -25,5 +25,12 @@ void wifiScreenTick();
 void wifiScreenHandleSwipe(SwipeDir sw);
 
 // True if the user pressed "back" (or we're done). Main clears by calling
-// `wifiScreenConsumeExit()`.
+// `wifiScreenConsumeExit()`. Triggered by swipes and automatic transitions
+// (e.g. successful connect) — routes the caller back to Settings.
 bool wifiScreenConsumeExit();
+
+// True exactly once after the user tapped the top-right X button. The
+// semantic is "close the Wi-Fi panel and go all the way home to the
+// creature screen" — distinct from wifiScreenConsumeExit() so main.cpp
+// can route the two cases to different destinations.
+bool wifiScreenConsumeCloseHome();

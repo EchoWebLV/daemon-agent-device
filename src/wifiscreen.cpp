@@ -2,6 +2,7 @@
 #include "server.h"
 #include "touch.h"
 #include "devcfg.h"
+#include "screenfx.h"
 
 #include <WiFi.h>
 #include <vector>
@@ -38,6 +39,11 @@ enum Mode : uint8_t {
 static TFT_eSPI *s_tft          = nullptr;
 static Mode      s_mode         = MODE_SCANNING;
 static bool      s_wantExit     = false;
+// Set exactly by the top-right X button tap. Distinct from s_wantExit so
+// main.cpp can route "user asked to go home" to the creature screen,
+// while automatic exits (swipe, successful connect) still fall back to
+// Settings.
+static bool      s_wantHome     = false;
 static bool      s_needFullDraw = false;
 
 struct Net {
@@ -70,12 +76,12 @@ static bool inRect(int16_t x, int16_t y,
   return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
-// Close "X" button lives at the very top-right of every Wi-Fi sub-mode.
-// Size is generous so tapping it is easy on the small screen.
-static constexpr int16_t CLOSE_W = 36;
-static constexpr int16_t CLOSE_H = 24;
-static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W;
-static constexpr int16_t CLOSE_Y = 0;
+// Close "X" button — same 28×24 rect as every other panel, via
+// screenfxDrawXButton. The tap hit-rect matches the visual exactly.
+static constexpr int16_t CLOSE_W = SCREENFX_X_BTN_W;   // 28
+static constexpr int16_t CLOSE_H = SCREENFX_X_BTN_H;   // 24
+static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W - 6;
+static constexpr int16_t CLOSE_Y = 2;
 
 // Press / release tap tracking — same pattern as settingsscreen, to keep
 // "start of a swipe" from being interpreted as a button tap.
@@ -107,19 +113,14 @@ static bool consumeTap(int16_t &tx, int16_t &ty) {
 }
 
 static void drawStatusBar(const char *title) {
-  s_tft->fillRect(0, 0, SCR_W, CLOSE_H, C_BG);
-  s_tft->setTextFont(1);
+  s_tft->fillRect(0, 0, SCR_W, CLOSE_H + CLOSE_Y + 2, C_BG);
+  s_tft->setTextFont(2);
   s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->setCursor(4, 4);
+  s_tft->setCursor(10, CLOSE_Y + 4);
   s_tft->print(title);
 
-  // X close button — outlined pill with an "x" label.
-  s_tft->drawRoundRect(CLOSE_X + 2, CLOSE_Y + 2, CLOSE_W - 4, CLOSE_H - 4, 3, C_ACCENT);
-  s_tft->setTextFont(2);
-  s_tft->setTextDatum(MC_DATUM);
-  s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->drawString("x", CLOSE_X + CLOSE_W / 2, CLOSE_Y + CLOSE_H / 2);
+  screenfxDrawXButton(s_tft, CLOSE_X, CLOSE_Y, C_ACCENT, C_BG);
 }
 
 // True if the tap hit the X button at the top-right.
@@ -277,7 +278,7 @@ static void handleListInput() {
   int16_t x, y;
   if (!consumeTap(x, y)) return;
 
-  if (closeButtonTapped(x, y)) { s_wantExit = true; return; }
+  if (closeButtonTapped(x, y)) { s_wantHome = true; return; }
 
   if (inRect(x, y, BTN_DISC_X, BTN_DISC_Y, BTN_W, BTN_H)) {
     serverWifiDisconnect();
@@ -485,10 +486,10 @@ static void handleKeyboardInput() {
   int16_t x, y;
   if (!consumeTap(x, y)) return;
 
-  // The X button (in the status bar) pops back to the network list.
+  // The X button (in the status bar) means "go home" — close the whole
+  // Wi-Fi flow, not just this mode.
   if (closeButtonTapped(x, y)) {
-    s_mode = MODE_LIST;
-    s_needFullDraw = true;
+    s_wantHome = true;
     return;
   }
 
@@ -569,6 +570,7 @@ void wifiScreenEnter() {
   s_mode = MODE_SCANNING;
   s_needFullDraw = true;
   s_wantExit = false;
+  s_wantHome = false;
   s_password = "";
   s_selectedSSID = "";
   s_listScroll = 0;
@@ -577,6 +579,12 @@ void wifiScreenEnter() {
 bool wifiScreenConsumeExit() {
   if (!s_wantExit) return false;
   s_wantExit = false;
+  return true;
+}
+
+bool wifiScreenConsumeCloseHome() {
+  if (!s_wantHome) return false;
+  s_wantHome = false;
   return true;
 }
 
@@ -605,7 +613,7 @@ void wifiScreenTick() {
       if (consumeTap(tx, ty) && closeButtonTapped(tx, ty)) {
         WiFi.scanDelete();
         s_scanInFlight = false;
-        s_wantExit = true;
+        s_wantHome = true;
         break;
       }
 

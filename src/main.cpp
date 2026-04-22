@@ -63,10 +63,10 @@ static void switchScreen(Screen target) {
   if (target == SCREEN_SETTINGS) s_prevScreen = s_screen;
   s_screen = target;
   switch (target) {
-    case SCREEN_CREATURE: creatureRepaint();     break;
-    case SCREEN_WALLET:   walletScreenOnEnter(); break;
-    case SCREEN_SETTINGS: settingsScreenDraw();  break;
-    case SCREEN_WIFI:     wifiScreenEnter();     break;
+    case SCREEN_CREATURE: creatureRepaint();        break;
+    case SCREEN_WALLET:   walletScreenOnEnter();    break;
+    case SCREEN_SETTINGS: settingsScreenOnEnter();  break;
+    case SCREEN_WIFI:     wifiScreenEnter();        break;
   }
 }
 
@@ -249,14 +249,18 @@ void loop() {
   // From the wallet, the X button in the top-right is the only way back.
   SwipeDir sw = touchPoll();
   if (s_screen == SCREEN_SETTINGS) {
+    // Swipe-up closes back to wherever we came from (preserves the
+    // "pull-down peek" feel). The X button, by contrast, always goes all
+    // the way home to the creature — consistent with every other panel.
     if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
-    if (settingsScreenConsumeClose())       switchScreen(s_prevScreen);
+    if (settingsScreenConsumeClose())       switchScreen(SCREEN_CREATURE);
     if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
   } else if (s_screen == SCREEN_WIFI) {
     // Wi-Fi screen decides itself whether a swipe goes back to the list
     // or exits the panel; we just pipe the swipe through.
     wifiScreenHandleSwipe(sw);
-    if (wifiScreenConsumeExit()) switchScreen(SCREEN_SETTINGS);
+    if (wifiScreenConsumeExit())      switchScreen(SCREEN_SETTINGS);
+    if (wifiScreenConsumeCloseHome()) switchScreen(SCREEN_CREATURE);
   } else if (s_screen == SCREEN_WALLET) {
     // Forward taps to the wallet so its QR / X buttons can be hit.
     int16_t tx, ty;

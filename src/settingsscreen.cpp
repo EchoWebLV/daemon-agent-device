@@ -2,6 +2,7 @@
 #include "devcfg.h"
 #include "price.h"
 #include "touch.h"
+#include "screenfx.h"
 
 #include <WiFi.h>
 
@@ -54,12 +55,12 @@ static bool     s_wantWifiPanel = false;
 // Set when user taps the X close button.
 static bool     s_wantClose     = false;
 
-// Close "X" button — top-right of status bar on every sub-screen.
-// Made it a bit larger than the previous 26×20 so it's easier to land on.
-static constexpr int16_t CLOSE_W = 36;
-static constexpr int16_t CLOSE_H = 24;
-static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W;
-static constexpr int16_t CLOSE_Y = 0;
+// Close "X" button — top-right of the status bar. Visual + hit rect both
+// match screenfxDrawXButton so every panel's X corner looks identical.
+static constexpr int16_t CLOSE_W = SCREENFX_X_BTN_W;   // 28
+static constexpr int16_t CLOSE_H = SCREENFX_X_BTN_H;   // 24
+static constexpr int16_t CLOSE_X = SCR_W - CLOSE_W - 6;
+static constexpr int16_t CLOSE_Y = 2;
 
 // --- Press / release tap detection ----------------------------------------
 // We DO NOT fire row actions on finger-down, because a swipe-up gesture
@@ -83,28 +84,26 @@ bool settingsScreenBegin(TFT_eSPI *tft) {
 // Primitive painters
 // ---------------------------------------------------------------------------
 static void paintStatusBar() {
-  s_tft->fillRect(0, 0, SCR_W, CLOSE_H, C_BG);
-  s_tft->setTextFont(1);
+  // Top-bar height matches the X-button height so the label + ticker +
+  // button all align on a single 24-px strip.
+  s_tft->fillRect(0, 0, SCR_W, CLOSE_H + CLOSE_Y + 2, C_BG);
+
+  s_tft->setTextFont(2);
   s_tft->setTextDatum(TL_DATUM);
   s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->setCursor(4, 4);
+  s_tft->setCursor(10, CLOSE_Y + 4);
   s_tft->print("SETTINGS");
 
-  // Price ticker just to the left of the close button
+  // Price ticker just to the left of the close button.
   String price = priceDisplayString();
   if (price.length() > 0) {
     s_tft->setTextDatum(TR_DATUM);
     s_tft->setTextColor(C_ACCENT_HI, C_BG);
-    s_tft->drawString(price, CLOSE_X - 4, 4);
+    s_tft->drawString(price, CLOSE_X - 6, CLOSE_Y + 4);
   }
   s_lastPrice = price;
 
-  // Close button: [ x ]
-  s_tft->drawRoundRect(CLOSE_X + 2, CLOSE_Y + 2, CLOSE_W - 4, CLOSE_H - 4, 3, C_ACCENT);
-  s_tft->setTextFont(2);
-  s_tft->setTextDatum(MC_DATUM);
-  s_tft->setTextColor(C_ACCENT, C_BG);
-  s_tft->drawString("x", CLOSE_X + CLOSE_W / 2, CLOSE_Y + CLOSE_H / 2);
+  screenfxDrawXButton(s_tft, CLOSE_X, CLOSE_Y, C_ACCENT, C_BG);
 }
 
 // Draws the common label + divider for a row.
@@ -182,10 +181,8 @@ static void paintSlider(const Row &r, int value, int maxValue) {
 }
 
 static void paintFooter() {
-  s_tft->setTextFont(1);
-  s_tft->setTextDatum(TC_DATUM);
-  s_tft->setTextColor(C_DIM, C_BG);
-  s_tft->drawString("swipe up to close", SCR_W / 2, SCR_H - 14);
+  // The X button in the top-right is now the canonical way out of the
+  // panel — no footer hint needed.
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +199,27 @@ void settingsScreenDraw() {
   paintFooter();
   s_lastVol = devcfgVolume();
   s_lastBri = devcfgBrightness();
+}
+
+// Callback for screenfxSlideIn — temporarily re-points the module-local
+// render target at the sprite so the existing painters render off-screen.
+static void paintIntoSprite(TFT_eSPI *sprite) {
+  TFT_eSPI *real = s_tft;
+  s_tft = sprite;
+  settingsScreenDraw();
+  s_tft = real;
+}
+
+void settingsScreenOnEnter() {
+  if (!s_tft) return;
+  // Clear latched close intent from a previous open.
+  s_wantClose     = false;
+  s_wantWifiPanel = false;
+  // Slide DOWN from the top of the screen (fromY = -SCR_H). Falls back
+  // to a snap redraw if PSRAM can't cough up the 150 KB sprite.
+  if (!screenfxSlideIn(s_tft, -SCR_H, paintIntoSprite)) {
+    settingsScreenDraw();
+  }
 }
 
 static bool inRect(int16_t x, int16_t y,
