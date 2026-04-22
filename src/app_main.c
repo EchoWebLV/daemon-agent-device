@@ -21,6 +21,7 @@
 
 #include "devcfg.h"
 #include "display.h"
+#include "server.h"
 #include "touch.h"
 #include "ui.h"
 #include "wifi_sta.h"
@@ -87,6 +88,11 @@ void app_main(void) {
     if (wifi_err != ESP_OK) {
         ESP_LOGW(TAG, "wifi unavailable (%s); continuing offline",
                  esp_err_to_name(wifi_err));
+    } else {
+        // HTTP phone UI comes up once the radio is on. Safe to skip on
+        // wifi failure — no listener without a network to listen on.
+        ESP_ERROR_CHECK(server_start());
+        server_set_status("idle");
     }
 
     uint32_t tick = 0;
