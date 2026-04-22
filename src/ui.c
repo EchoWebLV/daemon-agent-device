@@ -59,13 +59,20 @@ static void nav_wifi_connected(void) {
 // so the swipe doesn't get interpreted as a subsequent click on whatever
 // widget happens to be under the finger when it lifts.
 
+// Mapping rationale: left/right are the canonical axes, but users reach for
+// up/down just as often ("there must be more stuff that way"). Aliasing
+// UP→LEFT and DOWN→RIGHT means every swipe from the creature lands
+// somewhere, and the back-swipe from wallet/settings accepts any direction
+// that "feels like going back".
 static void on_gesture_creature(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_LEFT:  ui_show_wallet();   break;
-        case LV_DIR_RIGHT: ui_show_settings(); break;
+        case LV_DIR_LEFT:
+        case LV_DIR_TOP:    ui_show_wallet();   break;
+        case LV_DIR_RIGHT:
+        case LV_DIR_BOTTOM: ui_show_settings(); break;
         default: break;
     }
 }
@@ -75,7 +82,12 @@ static void on_gesture_wallet(lv_event_t *e) {
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_RIGHT: ui_show_creature(); break;
+        // Any "back-ish" direction returns to the creature. Keeps the
+        // wallet from being a dead-end when the user forgets which way
+        // they came in.
+        case LV_DIR_RIGHT:
+        case LV_DIR_BOTTOM:
+        case LV_DIR_TOP:    ui_show_creature(); break;
         default: break;
     }
 }
@@ -85,7 +97,9 @@ static void on_gesture_settings(lv_event_t *e) {
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_LEFT: ui_show_creature(); break;
+        case LV_DIR_LEFT:
+        case LV_DIR_TOP:
+        case LV_DIR_BOTTOM: ui_show_creature(); break;
         default: break;
     }
 }
@@ -97,7 +111,12 @@ static void on_gesture_wifi(lv_event_t *e) {
     switch (d) {
         // DOWN cancels the Wi-Fi picker and returns to settings, matching
         // the "pull down to dismiss" modal idiom most users already know.
-        case LV_DIR_BOTTOM: ui_show_settings(); break;
+        // UP/LEFT/RIGHT also exit so a lost user isn't trapped in the
+        // keyboard overlay.
+        case LV_DIR_BOTTOM:
+        case LV_DIR_TOP:
+        case LV_DIR_LEFT:
+        case LV_DIR_RIGHT: ui_show_settings(); break;
         default: break;
     }
 }

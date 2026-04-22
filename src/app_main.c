@@ -158,6 +158,15 @@ void app_main(void) {
         }
     }
 
+    // Boot greeting. Only when Wi-Fi is up — ElevenLabs needs the network, and
+    // silence is better than a failed TTS call on an offline boot. Routed
+    // through ui_deliver_reply() so the creature face goes to TALK + subtitle
+    // mirrors what the speaker says, which also exercises the whole
+    // ai→ui→voice pipeline on every cold boot (handy canary).
+    if (wifi_err == ESP_OK) {
+        ui_deliver_reply("Hello, I am Daemon.");
+    }
+
     uint32_t tick = 0;
     while (true) {
         size_t free_total = esp_get_free_heap_size();
