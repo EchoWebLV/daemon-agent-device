@@ -294,6 +294,17 @@ def c_wallet_balance_matches(dev: Device, rpc_url: str = DEFAULT_RPC) -> str:
     return f"({dev_sol:.6f} SOL)"
 
 
+def c_ai_ping(dev: Device) -> str:
+    """Gemini round-trip: one-shot 'ping' prompt, expect success under 8 s."""
+    resp = dev.send("TEST AI PING", timeout=15.0)[0].split()
+    assert resp[:3] == ["TEST", "OK", "ai"], f"bad response: {resp}"
+    status = int(resp[3])
+    latency_ms = int(resp[4])
+    assert status == 200, f"ai status {status}"
+    assert latency_ms < 8000, f"ai took {latency_ms} ms (budget 8000)"
+    return f"({status}, {latency_ms} ms)"
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -332,6 +343,7 @@ def main() -> int:
         ("wifi_scan_nonempty",    c_wifi_scan_nonempty),
         ("wallet_pubkey_valid",   c_wallet_pubkey_valid),
         ("wallet_balance_matches", lambda d: c_wallet_balance_matches(d, args.rpc)),
+        ("ai_ping",               c_ai_ping),
         # Later tasks insert cases here in protocol order.
     ]
 

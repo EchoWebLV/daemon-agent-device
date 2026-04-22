@@ -13,6 +13,7 @@
 #include "wifiscreen.h"
 #include "touch.h"   // SWIPE_* enum values for TEST SWIPE
 #include "wallet.h"  // walletPubkey / walletSolBalance / walletUsdcAmount
+#include "ai.h"      // aiAskOneShot for TEST AI PING
 
 static bool   s_testMode = false;
 static String s_lineBuf;
@@ -203,6 +204,24 @@ static void handleLine(const String &line) {
     walletRefresh();
     Serial.printf("TEST OK balance %.9f %.6f\n",
                   walletSolBalance(), walletUsdcAmount());
+    return;
+  }
+
+  // --- AI PING ----------------------------------------------------------
+  if (rest == "AI PING") {
+    uint32_t t0 = millis();
+    String reply;
+    // aiAskOneShot doesn't touch chat history — cleaner for a smoke test.
+    bool ok = aiAskOneShot("ping", reply);
+    uint32_t dt = millis() - t0;
+    if (!ok) {
+      Serial.printf("TEST ERR ai no_response dt=%u\n", (unsigned)dt);
+      return;
+    }
+    // The ai module doesn't bubble up the HTTP status; protocol keeps the
+    // slot so 200 is a success sentinel and non-200 can mean something
+    // specific later.
+    Serial.printf("TEST OK ai 200 %u\n", (unsigned)dt);
     return;
   }
 
