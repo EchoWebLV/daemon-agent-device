@@ -158,14 +158,24 @@ static void goBackOneStep() {
 // (Storage declared above near the other state variables.)
 // ---------------------------------------------------------------------------
 static void kickScan() {
-  // WiFi.scanNetworks(async=true) returns immediately; we poll scanComplete.
+  // Ensure STA mode first. If the user previously tapped "disconnect",
+  // serverWifiDisconnect() called WiFi.disconnect(true, true) which
+  // powers the radio OFF — a subsequent scan would silently return 0
+  // networks. Setting WIFI_STA here guarantees the radio is on before
+  // we ask it to look around.
+  WiFi.mode(WIFI_STA);
+  // Drop any stale result buffer from a previous scan (async scans share
+  // one internal buffer).
   WiFi.scanDelete();
-  WiFi.scanNetworks(true);
+  // scanNetworks(async=true) returns immediately; we poll scanComplete().
+  int16_t rc = WiFi.scanNetworks(/*async=*/true);
+  Serial.printf("wifi: async scan started rc=%d\n", (int)rc);
   s_scanInFlight = true;
   s_scanStartMs  = millis();
 }
 
 static void ingestScanResults(int n) {
+  Serial.printf("wifi: scan returned %d networks\n", n);
   s_nets.clear();
   for (int i = 0; i < n; ++i) {
     Net net;
@@ -234,6 +244,16 @@ static void drawList() {
 
   // List rows
   s_tft->drawFastHLine(0, LIST_TOP_Y - 4, SCR_W, C_DIV);
+  if (s_nets.empty()) {
+    // Scan returned nothing — tell the user rather than leaving a blank
+    // area that looks like the screen is broken. Common causes: radio
+    // just came back from a disconnect, or we're in a low-signal spot.
+    s_tft->setTextFont(2);
+    s_tft->setTextDatum(TC_DATUM);
+    s_tft->setTextColor(C_DIM, C_BG);
+    s_tft->drawString("no networks found",      SCR_W / 2, LIST_TOP_Y + 18);
+    s_tft->drawString("tap rescan to try again", SCR_W / 2, LIST_TOP_Y + 40);
+  }
   int end = s_listScroll + LIST_ROWS_VISIBLE;
   if (end > (int)s_nets.size()) end = s_nets.size();
   for (int i = s_listScroll; i < end; ++i) {
