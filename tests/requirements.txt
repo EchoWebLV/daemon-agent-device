@@ -1,0 +1,5 @@
+pyserial>=3.5
+requests>=2.31
+solana>=0.34
+solders>=0.20
+base58>=2.1
