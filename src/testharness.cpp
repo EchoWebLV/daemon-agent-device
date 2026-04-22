@@ -19,6 +19,8 @@ static void handleLine(const String &line);
 // Implemented in main.cpp — see "Test-harness bridges" block.
 extern const char *mainScreenName();
 extern bool        mainForceScreen(const char *name);
+extern void        mainInjectTap(int16_t x, int16_t y);
+extern void        mainInjectSwipe(int dir);
 
 void testHarnessBegin() {
   s_lineBuf.reserve(256);

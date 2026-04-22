@@ -113,6 +113,78 @@ bool mainForceScreen(const char *name) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-iteration tap/swipe dispatch. Extracted from loop() so the test
+// harness can inject synthetic events via mainInjectTap / mainInjectSwipe
+// without duplicating the big per-screen branch. The block is intentionally
+// idempotent for SWIPE_NONE so injected taps can call it to drain
+// Consume*() flags without having to fake a swipe direction.
+// ---------------------------------------------------------------------------
+static void dispatchSwipe(SwipeDir sw) {
+  if (s_screen == SCREEN_SETTINGS) {
+    // Swipe-up closes back to wherever we came from (preserves the
+    // "pull-down peek" feel). The X button always goes all the way home
+    // to the creature — consistent with every other panel.
+    if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
+    if (settingsScreenConsumeClose())       switchScreen(SCREEN_CREATURE);
+    if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
+  } else if (s_screen == SCREEN_WIFI) {
+    // Wi-Fi screen decides itself whether a swipe goes back to the list
+    // or exits the panel; we just pipe the swipe through.
+    wifiScreenHandleSwipe(sw);
+    if (wifiScreenConsumeExit())      switchScreen(SCREEN_SETTINGS);
+    if (wifiScreenConsumeCloseHome()) switchScreen(SCREEN_CREATURE);
+  } else if (s_screen == SCREEN_MENU) {
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) menuScreenHandleTap(tx, ty);
+    if (menuScreenConsumeWalletTap()) switchScreen(SCREEN_WALLET);
+    if (menuScreenConsumeInfoTap())   switchScreen(SCREEN_INFO);
+    if (menuScreenConsumeClose())     switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)             switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_WALLET) {
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) walletScreenHandleTap(tx, ty);
+    if (walletScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)           switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_INFO) {
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) infoScreenHandleTap(tx, ty);
+    if (infoScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)         switchScreen(SCREEN_SETTINGS);
+  } else {
+    if (sw == SWIPE_UP)    switchScreen(SCREEN_MENU);
+    if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test-harness event injectors. These bypass the touch driver entirely so
+// the Python runner can simulate a tap or swipe regardless of whether a
+// physical finger is on the screen.
+// ---------------------------------------------------------------------------
+
+// Inject a synthetic swipe direction. Runs the same dispatch the main loop
+// would run for a real swipe from touchPoll().
+void mainInjectSwipe(int dir) {
+  dispatchSwipe((SwipeDir)dir);
+}
+
+// Inject a synthetic tap into the currently active screen. Calls the
+// screen's tap handler directly, then runs dispatchSwipe(SWIPE_NONE) so
+// any Consume*() flags set by the handler drive a screen transition on
+// the same iteration — normal loop() would do both on the next tick.
+void mainInjectTap(int16_t x, int16_t y) {
+  switch (s_screen) {
+    case SCREEN_CREATURE: /* creature has no tap handler */       break;
+    case SCREEN_MENU:     menuScreenHandleTap(x, y);              break;
+    case SCREEN_WALLET:   walletScreenHandleTap(x, y);            break;
+    case SCREEN_INFO:     infoScreenHandleTap(x, y);              break;
+    case SCREEN_SETTINGS: /* no public handler — Consume flags */ break;
+    case SCREEN_WIFI:     /* no public handler — Consume flags */ break;
+  }
+  dispatchSwipe(SWIPE_NONE);
+}
+
+// ---------------------------------------------------------------------------
 // The core "ask Gemini + speak" pipeline.
 // ---------------------------------------------------------------------------
 static void handleUtterance(const String &user) {
@@ -297,46 +369,15 @@ void loop() {
   // client is connected, so the animation keeps running.
   if (s_wifiOk) serverLoop();
 
-  // Handle swipes.
+  // Handle swipes + per-screen tap polling + Consume* drains.
   //   SWIPE_UP   from creature → Menu launcher (slides up)
   //   SWIPE_DOWN from anywhere → Settings (slides down)
   //   SWIPE_UP   from Settings → close back to previous screen
   // Menu / Wallet / Info all use X (top-right) as the only way home.
-  SwipeDir sw = touchPoll();
-  if (s_screen == SCREEN_SETTINGS) {
-    // Swipe-up closes back to wherever we came from (preserves the
-    // "pull-down peek" feel). The X button always goes all the way home
-    // to the creature — consistent with every other panel.
-    if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
-    if (settingsScreenConsumeClose())       switchScreen(SCREEN_CREATURE);
-    if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
-  } else if (s_screen == SCREEN_WIFI) {
-    // Wi-Fi screen decides itself whether a swipe goes back to the list
-    // or exits the panel; we just pipe the swipe through.
-    wifiScreenHandleSwipe(sw);
-    if (wifiScreenConsumeExit())      switchScreen(SCREEN_SETTINGS);
-    if (wifiScreenConsumeCloseHome()) switchScreen(SCREEN_CREATURE);
-  } else if (s_screen == SCREEN_MENU) {
-    int16_t tx, ty;
-    if (touchJustPressed(tx, ty)) menuScreenHandleTap(tx, ty);
-    if (menuScreenConsumeWalletTap()) switchScreen(SCREEN_WALLET);
-    if (menuScreenConsumeInfoTap())   switchScreen(SCREEN_INFO);
-    if (menuScreenConsumeClose())     switchScreen(SCREEN_CREATURE);
-    if (sw == SWIPE_DOWN)             switchScreen(SCREEN_SETTINGS);
-  } else if (s_screen == SCREEN_WALLET) {
-    int16_t tx, ty;
-    if (touchJustPressed(tx, ty)) walletScreenHandleTap(tx, ty);
-    if (walletScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
-    if (sw == SWIPE_DOWN)           switchScreen(SCREEN_SETTINGS);
-  } else if (s_screen == SCREEN_INFO) {
-    int16_t tx, ty;
-    if (touchJustPressed(tx, ty)) infoScreenHandleTap(tx, ty);
-    if (infoScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
-    if (sw == SWIPE_DOWN)         switchScreen(SCREEN_SETTINGS);
-  } else {
-    if (sw == SWIPE_UP)    switchScreen(SCREEN_MENU);
-    if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
-  }
+  // dispatchSwipe is factored out so the test harness can reuse the same
+  // branch via mainInjectSwipe/mainInjectTap — see main.cpp:Test-harness
+  // event injectors above.
+  dispatchSwipe(touchPoll());
 
   // Talking state still drives the creature regardless of which screen is
   // visible — audio and mood transitions are shared.
