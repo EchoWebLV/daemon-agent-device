@@ -99,7 +99,12 @@ esp_err_t display_init(void) {
     if (buf) {
         // Muted navy — deliberately not pure black so "display is dark" vs
         // "display is working but drew black" is distinguishable.
-        const uint16_t navy = 0x0014;  // RGB565: very dark blue
+        //
+        // ST7789 expects RGB565 big-endian on the SPI wire; the ESP32 is
+        // little-endian, so we byte-swap before the fill. Without this, the
+        // panel reads {LSB, MSB} and 0x0014 (navy) decodes as 0x1400 — a
+        // medium green with a faint red tint. Ask me how I know.
+        const uint16_t navy = __builtin_bswap16(0x0014);  // RGB565 dark blue, wire order
         for (size_t i = 0; i < pixels; ++i) buf[i] = navy;
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                   DISPLAY_WIDTH, DISPLAY_HEIGHT, buf);
