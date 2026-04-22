@@ -132,6 +132,30 @@ def c_liveness(dev: Device) -> str:
     return f"(uptime {uptime_ms} ms)"
 
 
+def c_boot_heap_ok(dev: Device) -> str:
+    resp = dev.send("TEST HEAP", timeout=2.0)
+    toks = resp[0].split()
+    assert toks[:3] == ["TEST", "OK", "heap"], f"bad response: {resp}"
+    heap  = int(toks[3])
+    psram = int(toks[4])
+    # Post-boot we should have plenty. 80 KB heap is a generous floor;
+    # an audio buffer alloc leaves us well above this.
+    assert heap  > 80 * 1024,        f"free heap too low: {heap} B"
+    assert psram > 4 * 1024 * 1024,  f"free psram too low: {psram} B"
+    return f"(heap {heap // 1024} KB, psram {psram // (1024*1024)} MB)"
+
+
+def c_version_reports(dev: Device) -> str:
+    resp = dev.send("TEST VERSION", timeout=2.0)
+    toks = resp[0].split()
+    assert toks[:3] == ["TEST", "OK", "version"], f"bad response: {resp}"
+    sdk, date, time_s = toks[3], toks[4], toks[5]
+    assert sdk,    "empty sdk"
+    assert date,   "empty build date"
+    assert time_s, "empty build time"
+    return f"({sdk}, built {date} {time_s})"
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -158,7 +182,9 @@ def main() -> int:
     # Build the case list inside main() so cases can close over `args`
     # (e.g. the wallet case needs --rpc, x402 cases need --skip-x402).
     cases: List[Tuple[str, Callable[[Device], str]]] = [
-        ("liveness", c_liveness),
+        ("liveness",            c_liveness),
+        ("boot_heap_ok",        c_boot_heap_ok),
+        ("version_reports",     c_version_reports),
         # Later tasks insert cases here in protocol order.
     ]
 

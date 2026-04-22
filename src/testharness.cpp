@@ -62,6 +62,25 @@ static void handleLine(const String &line) {
     return;
   }
 
+  // --- HEAP / VERSION ---------------------------------------------------
+  if (rest == "HEAP") {
+    Serial.printf("TEST OK heap %u %u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getFreePsram());
+    return;
+  }
+  if (rest == "VERSION") {
+    // SDK + build timestamp. Keep build_date as a single token — the
+    // protocol is space-delimited, so "Apr 22 2026" becomes "Apr_22_2026".
+    String buildDate = __DATE__;  buildDate.replace(' ', '_');
+    String buildTime = __TIME__;
+    Serial.printf("TEST OK version %s %s %s\n",
+                  ESP.getSdkVersion(),
+                  buildDate.c_str(),
+                  buildTime.c_str());
+    return;
+  }
+
   // --- Unknown verb: always respond -------------------------------------
   Serial.printf("TEST ERR unknown %s\n", rest.c_str());
 }
