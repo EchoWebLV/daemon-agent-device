@@ -490,6 +490,13 @@ void x402_post(const char *url,
         .event_handler     = on_x402_event,
         .user_data         = &state,
         .timeout_ms        = 60000,
+        // The 402 response carries a base64(JSON) payment-required header
+        // that can reach 4–5 KB on sol.blockrun.ai; esp_http_client's
+        // default 512-byte header buffer truncates it and the facilitator
+        // ends up rejecting the retry with another 402. 8 KB leaves
+        // headroom for content-type + auth + other standard response
+        // headers alongside it.
+        .buffer_size       = 8192,
     };
     esp_http_client_handle_t h1 = esp_http_client_init(&cfg1);
     if (!h1) {
@@ -556,6 +563,14 @@ void x402_post(const char *url,
             .event_handler     = on_x402_event,
             .user_data         = &state,
             .timeout_ms        = 60000,
+            // Phase-2 retry carries our base64(payment envelope) in the
+            // PAYMENT-SIGNATURE request header — that envelope can hit
+            // ~12 KB. The default 512-byte TX buffer truncates it on the
+            // wire and the facilitator sees a garbled signature, then
+            // replies 402 again. Size TX for the worst case, keep RX at
+            // 8 KB so the 200-OK response headers still fit comfortably.
+            .buffer_size       = 8192,
+            .buffer_size_tx    = 16384,
         };
         esp_http_client_handle_t h2 = esp_http_client_init(&cfg2);
         if (!h2) {
