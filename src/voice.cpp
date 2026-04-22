@@ -1,5 +1,6 @@
 #include "voice.h"
 #include "secrets.h"
+#include "testharness.h"   // testHarnessInTestMode() — mutes audio during tests
 
 #include <Audio.h>
 #include <WiFiClientSecure.h>
@@ -226,6 +227,11 @@ void voiceLoop() {
 bool voiceSpeak(const String &text) {
   if (!s_ready || !s_audio) return false;
   if (text.length() == 0) return false;
+  // Skip TTS during smoke tests: the boot greeting otherwise fetches an
+  // MP3 and streams it *after* loop() starts (well after the host has
+  // already flipped the device into test mode), and the Audio library's
+  // core-0 prints scramble the single-line TEST replies.
+  if (testHarnessInTestMode()) return false;
 
   if (s_audio->isRunning()) s_audio->stopSong();
 
@@ -270,8 +276,15 @@ void voiceSetVolume(uint8_t v) {
   if (s_audio) s_audio->setVolume(v);
 }
 
-void audio_info(const char *info)    { Serial.print("[audio] ");    Serial.println(info); }
-void audio_id3data(const char *info) { Serial.print("[audio id3] "); Serial.println(info); }
-void audio_bitrate(const char *info) { Serial.print("[audio br] ");  Serial.println(info); }
-void audio_eof_mp3(const char *f)    { (void)f; Serial.println("[audio] eof mp3"); s_playing = false; }
-void audio_eof_stream(const char *f) { (void)f; Serial.println("[audio] eof stream"); s_playing = false; }
+// The Audio library fires these callbacks from a different FreeRTOS task,
+// so their Serial.print calls race the main loop's prints and splice
+// mid-line (e.g. "[audio] Ch[audio] Sa"). Harmless in normal operation,
+// but it scrambles the single-line TEST protocol — so we suppress audio
+// logging while a test session is active. (testharness.h is included
+// at the top of this file so voiceSpeak() can also gate on test mode.)
+static inline bool audioLogOk() { return !testHarnessInTestMode(); }
+void audio_info(const char *info)    { if (audioLogOk()) { Serial.print("[audio] ");    Serial.println(info); } }
+void audio_id3data(const char *info) { if (audioLogOk()) { Serial.print("[audio id3] "); Serial.println(info); } }
+void audio_bitrate(const char *info) { if (audioLogOk()) { Serial.print("[audio br] ");  Serial.println(info); } }
+void audio_eof_mp3(const char *f)    { (void)f; if (audioLogOk()) Serial.println("[audio] eof mp3"); s_playing = false; }
+void audio_eof_stream(const char *f) { (void)f; if (audioLogOk()) Serial.println("[audio] eof stream"); s_playing = false; }

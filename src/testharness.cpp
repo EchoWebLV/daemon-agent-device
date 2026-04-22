@@ -15,12 +15,9 @@
 #include "wallet.h"  // walletPubkey / walletSolBalance / walletUsdcAmount
 #include "ai.h"      // aiAskOneShot for TEST AI PING
 #include "x402.h"    // x402Get / x402Post for TEST X402 CALL
+#include "voice.h"   // voiceStop() so TEST BEGIN silences the audio task
 
-static bool   s_testMode = false;
-static String s_lineBuf;
-
-// Forward decl; defined below, grows as we add verbs.
-static void handleLine(const String &line);
+static bool s_testMode = false;
 
 // Implemented in main.cpp — see "Test-harness bridges" block.
 extern const char *mainScreenName();
@@ -29,7 +26,7 @@ extern void        mainInjectTap(int16_t x, int16_t y);
 extern void        mainInjectSwipe(int dir);
 
 void testHarnessBegin() {
-  s_lineBuf.reserve(256);
+  // Nothing to do: line assembly happens in main.cpp's pumpSerialInput().
 }
 
 bool testHarnessInTestMode() {
@@ -37,23 +34,9 @@ bool testHarnessInTestMode() {
 }
 
 void testHarnessTick() {
-  // Non-blocking line assembly. Any byte that isn't \r/\n appends to the
-  // buffer; \n flushes the buffer through the dispatcher.
-  while (Serial.available()) {
-    int c = Serial.read();
-    if (c < 0) break;
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (s_lineBuf.length() > 0) {
-        handleLine(s_lineBuf);
-      }
-      s_lineBuf = "";
-    } else if (s_lineBuf.length() < 255) {
-      s_lineBuf += (char)c;
-    }
-    // If the buffer would overflow, the extra bytes are silently dropped.
-    // The next \n still flushes whatever was captured, so we never wedge.
-  }
+  // See the header: serial reading lives in main.cpp now. This shim
+  // exists so any older loop() wiring that still calls testHarnessTick()
+  // continues to compile.
 }
 
 // ---------------------------------------------------------------------------
@@ -61,13 +44,19 @@ void testHarnessTick() {
 // Unknown verbs must respond, not hang, so the host's readline() never
 // times out on a typo.
 // ---------------------------------------------------------------------------
-static void handleLine(const String &line) {
+void testHarnessHandleLine(const String &line) {
   if (!line.startsWith("TEST ")) return;   // not our traffic, ignore
   const String rest = line.substring(5);   // drop the "TEST " prefix
 
   // --- BEGIN / END / PING ------------------------------------------------
   if (rest == "BEGIN") {
     s_testMode = true;
+    // Kill any in-flight MP3 playback so the audio task's Serial prints
+    // (which the library reroutes to Serial from its own core) stop
+    // splicing into our single-line replies. The s_testMode flag also
+    // gates the audio_* callbacks in voice.cpp, so even if a new clip
+    // is queued accidentally, it stays silent on the wire.
+    voiceStop();
     Serial.println("TEST OK begin");
     return;
   }

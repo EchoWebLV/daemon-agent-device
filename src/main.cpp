@@ -251,7 +251,17 @@ static void pumpSerialInput() {
     if (c == '\r') continue;
     if (c == '\n') {
       s_serialBuf.trim();
-      if (s_serialBuf.length() > 0) handleUtterance(s_serialBuf);
+      if (s_serialBuf.length() > 0) {
+        // Route test-harness traffic to its dispatcher. Everything else
+        // is still treated as a keyboard-typed utterance from the dev
+        // monitor. Having two readers competing for Serial.available()
+        // bytes used to swallow "TEST BEGIN" as chat input.
+        if (s_serialBuf.startsWith("TEST ")) {
+          testHarnessHandleLine(s_serialBuf);
+        } else {
+          handleUtterance(s_serialBuf);
+        }
+      }
       s_serialBuf = "";
     } else {
       s_serialBuf += (char)c;
@@ -342,24 +352,38 @@ void setup() {
 
   // Boot greeting — proves Wi-Fi, Gemini and the speaker are all alive.
   if (s_wifiOk && s_voiceOk) {
-    creatureSetMood(MOOD_TALK);
-    creatureSetTalking(true);
-    creatureSetSubtitle("Daemon online.");
-    String hello;
-    if (walletPubkey().length()) {
-      hello = String("Daemon online. I am your Solana wallet at ") +
-              walletPubkey().substring(0, 4) + ". Ask me anything.";
-    } else {
-      hello = "Daemon online. Configure my wallet key, then talk to me.";
+    // If the host has already issued "TEST BEGIN" while setup() was
+    // running (cold boot takes ~15 s with Wi-Fi + wallet RPC), pump it
+    // now so test mode is active BEFORE we queue the boot greeting.
+    // Otherwise the TTS fetch kicks off a core-0 MP3 decode whose
+    // [audio] prints scramble the first few TEST replies.
+    pumpSerialInput();
+    if (!testHarnessInTestMode()) {
+      creatureSetMood(MOOD_TALK);
+      creatureSetTalking(true);
+      creatureSetSubtitle("Daemon online.");
+      String hello;
+      if (walletPubkey().length()) {
+        hello = String("Daemon online. I am your Solana wallet at ") +
+                walletPubkey().substring(0, 4) + ". Ask me anything.";
+      } else {
+        hello = "Daemon online. Configure my wallet key, then talk to me.";
+      }
+      voiceSpeak(hello);
     }
-    voiceSpeak(hello);
   }
 }
 
 void loop() {
+  // Serial first, every iteration, in BOTH modes. In test mode we still
+  // need to dispatch incoming TEST lines; in normal mode this reads
+  // typed utterances from the dev monitor. If this call moves below the
+  // test-mode short-circuit, subsequent TEST commands pile up in the
+  // RX buffer with no reader.
+  pumpSerialInput();
+
   // Host-driven smoke tests preempt the normal UI loop while active.
-  // Cheap when idle — one Serial.available() poll per iteration.
-  testHarnessTick();
+  testHarnessTick();   // kept as a no-op hook; see testharness.h
   if (testHarnessInTestMode()) {
     delay(1);          // yield to Wi-Fi / background tasks
     return;
@@ -402,7 +426,7 @@ void loop() {
   }
 
   voiceLoop();
-  pumpSerialInput();
+  // (pumpSerialInput now runs at the top of loop(), in both modes.)
 
   // Background tickers — only run when audio is quiet so we don't stutter
   // mid-playback. Wallet/price fetches themselves now live on background
