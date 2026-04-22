@@ -9,6 +9,10 @@ static String s_lineBuf;
 // Forward decl; defined below, grows as we add verbs.
 static void handleLine(const String &line);
 
+// Implemented in main.cpp — see "Test-harness bridges" block.
+extern const char *mainScreenName();
+extern bool        mainForceScreen(const char *name);
+
 void testHarnessBegin() {
   s_lineBuf.reserve(256);
 }

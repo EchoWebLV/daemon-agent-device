@@ -84,6 +84,35 @@ static void switchScreen(Screen target) {
 }
 
 // ---------------------------------------------------------------------------
+// Test-harness bridges. Exposed as extern-C-style free functions so the
+// harness module (src/testharness.cpp) doesn't need to know about the
+// Screen enum. Names match the on-protocol casing so the mapping is 1:1.
+// ---------------------------------------------------------------------------
+const char *mainScreenName() {
+  switch (s_screen) {
+    case SCREEN_CREATURE: return "creature";
+    case SCREEN_MENU:     return "menu";
+    case SCREEN_WALLET:   return "wallet";
+    case SCREEN_INFO:     return "info";
+    case SCREEN_SETTINGS: return "settings";
+    case SCREEN_WIFI:     return "wifi";
+  }
+  return "unknown";
+}
+
+// Returns true if `name` matched a known screen; false otherwise.
+bool mainForceScreen(const char *name) {
+  if      (!strcmp(name, "creature")) switchScreen(SCREEN_CREATURE);
+  else if (!strcmp(name, "menu"))     switchScreen(SCREEN_MENU);
+  else if (!strcmp(name, "wallet"))   switchScreen(SCREEN_WALLET);
+  else if (!strcmp(name, "info"))     switchScreen(SCREEN_INFO);
+  else if (!strcmp(name, "settings")) switchScreen(SCREEN_SETTINGS);
+  else if (!strcmp(name, "wifi"))     switchScreen(SCREEN_WIFI);
+  else return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // The core "ask Gemini + speak" pipeline.
 // ---------------------------------------------------------------------------
 static void handleUtterance(const String &user) {
