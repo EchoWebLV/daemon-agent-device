@@ -9,6 +9,7 @@
 #include "settings_screen.h"
 #include "screens_common.h"
 #include "devcfg.h"
+#include "voice.h"
 #include "wifi_sta.h"
 
 #include <inttypes.h>
@@ -82,6 +83,7 @@ static void vol_slider_changed(lv_event_t *e) {
     if (v < 0) v = 0;
     if (v > 21) v = 21;
     devcfg_set_volume((uint8_t)v);
+    voice_set_volume((uint8_t)v);   // applies to the next sample written
     if (s_vol_value) lv_label_set_text_fmt(s_vol_value, "%" PRId32, v);
 }
 

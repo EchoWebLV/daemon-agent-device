@@ -18,6 +18,7 @@ idf_component_register(
         "solana_tx.c"
         "touch.c"
         "ui.c"
+        "voice.c"
         "wallet.c"
         "wallet_screen.c"
         "wifi_screen.c"
@@ -34,6 +35,8 @@ idf_component_register(
         esp_lcd
         driver
         esp_driver_i2c
+        # Voice: I2S_STD driver for PCM5101 DAC output.
+        esp_driver_i2s
         # NVS-backed settings + Wi-Fi STA bring-up + HTTP server.
         nvs_flash
         esp_wifi

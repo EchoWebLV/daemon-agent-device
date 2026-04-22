@@ -26,6 +26,7 @@
 #include "server.h"
 #include "touch.h"
 #include "ui.h"
+#include "voice.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -103,6 +104,13 @@ void app_main(void) {
     // a later reconnect; ai_ask() itself rejects when offline.
     ai_begin();
     server_set_say_handler(ai_handle_say);
+
+    // Voice: installs I2S, plays the boot-beep probe so a dead codec is
+    // obvious, and spawns the audio task. Failure here is not fatal — the
+    // rest of the app is useful without audio.
+    if (!voice_begin()) {
+        ESP_LOGW(TAG, "voice_begin failed; continuing muted");
+    }
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.
