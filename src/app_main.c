@@ -19,6 +19,7 @@
 #include "esp_system.h"
 #include "nvs_flash.h"
 
+#include "ai.h"
 #include "devcfg.h"
 #include "display.h"
 #include "price.h"
@@ -96,6 +97,12 @@ void app_main(void) {
         ESP_ERROR_CHECK(server_start());
         server_set_status("idle");
     }
+
+    // AI client: clears conversation history and registers the /say handler.
+    // Wire this even when Wi-Fi didn't come up so the callback is ready for
+    // a later reconnect; ai_ask() itself rejects when offline.
+    ai_begin();
+    server_set_say_handler(ai_handle_say);
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.

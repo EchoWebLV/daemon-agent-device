@@ -47,6 +47,18 @@ const char *devcfg_wifi_password(void);
 void        devcfg_set_wifi(const char *ssid, const char *password);
 void        devcfg_clear_wifi(void);
 
+// LLM model id (uses the same provider/model format as the Chrome
+// extension + sol.blockrun.ai, e.g. "google/gemini-3.1-pro",
+// "openai/gpt-4o-mini"). Empty string means "use the default baked in".
+const char *devcfg_llm_model(void);
+void        devcfg_set_llm_model(const char *model);
+
+// Custom personality. Empty means "use the built-in persona in ai.c".
+// The string is injected at the head of the AI system prompt on every
+// chat round-trip.
+const char *devcfg_personality(void);
+void        devcfg_set_personality(const char *persona);
+
 #ifdef __cplusplus
 }
 #endif

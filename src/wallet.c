@@ -27,6 +27,7 @@
 #include "freertos/task.h"
 
 #include "base58.h"
+#include "ed25519.h"
 #include "secrets.h"
 #include "wifi_sta.h"
 
@@ -73,6 +74,13 @@ static uint8_t s_secret[64]            = {0};     // full 64 or pubkey-only 32
 static size_t  s_secret_len            = 0;       // 32 or 64
 static uint8_t s_pubkey_bytes[32]      = {0};
 static char    s_pubkey[45]            = {0};     // base58, NUL-terminated
+
+// orlp/ed25519 signs with an "expanded" 64-byte private key that is *not*
+// Solana's `[seed || pub]` layout — it's `[a || prefix]` where both halves
+// come from SHA-512(seed). We derive it at wallet_begin() time so every
+// sign() call is a pure curve op without re-hashing the seed.
+static uint8_t s_sign_priv[64]         = {0};
+static bool    s_sign_ready            = false;
 
 static double           s_sol_balance  = 0.0;
 static token_holding_t  s_tokens[WALLET_MAX_TOKENS];
@@ -129,6 +137,20 @@ bool wallet_begin(void) {
         return false;
     }
 
+    // For signing: expand the seed (s_secret[0..32]) into orlp's 64-byte
+    // private-key form and verify the derived pubkey matches the one
+    // Phantom stored. Mismatch means the blob isn't a valid Solana export.
+    s_sign_ready = false;
+    if (s_secret_len == 64) {
+        uint8_t derived_pub[32];
+        ed25519_create_keypair(derived_pub, s_sign_priv, s_secret);
+        if (memcmp(derived_pub, s_pubkey_bytes, 32) == 0) {
+            s_sign_ready = true;
+        } else {
+            ESP_LOGW(TAG, "seed/pubkey mismatch — signing disabled");
+        }
+    }
+
     build_rpc_url();
     s_ok = true;
     ESP_LOGI(TAG, "address %s (key %d bytes, can_sign=%d)",
@@ -137,14 +159,13 @@ bool wallet_begin(void) {
 }
 
 bool wallet_can_sign(void) {
-    // Phase 3: signing not yet implemented. Flipped in phase 4 when we
-    // vendor Ed25519 and check s_secret_len == 64.
-    return false;
+    return s_ok && s_sign_ready;
 }
 
 bool wallet_sign(const uint8_t *data, size_t len, uint8_t sig_out[64]) {
-    (void)data; (void)len; (void)sig_out;
-    return false;
+    if (!wallet_can_sign() || !data || !sig_out) return false;
+    ed25519_sign(sig_out, data, len, s_pubkey_bytes, s_sign_priv);
+    return true;
 }
 
 const char *wallet_pubkey(void)                 { return s_ok ? s_pubkey : ""; }

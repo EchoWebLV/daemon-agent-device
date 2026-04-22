@@ -155,6 +155,11 @@ esp_err_t server_start(void) {
     cfg.server_port     = 80;
     cfg.max_uri_handlers = 8;
     cfg.lru_purge_enable = true;
+    // The /say path runs the full AI pipeline on the httpd task — that's
+    // up to four TLS handshakes (LLM, two Solana RPC calls, LLM retry)
+    // plus cJSON/mbedtls scratch. Default 4 KB blows the canary; 16 KB
+    // leaves room for the stack growth inside mbedtls_ssl_handshake().
+    cfg.stack_size       = 16384;
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
 

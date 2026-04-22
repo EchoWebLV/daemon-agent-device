@@ -32,11 +32,18 @@ static const char *TAG = "devcfg";
 #define KEY_BLUETOOTH       "bt"
 #define KEY_WIFI_SSID       "wf_ssid"
 #define KEY_WIFI_PASSWORD   "wf_pass"
+#define KEY_LLM_MODEL       "llm_model"
+#define KEY_PERSONALITY     "persona"
 
 // Upper bounds on strings we persist. WPA2 passwords cap at 63 chars + NUL;
 // SSIDs at 32 + NUL. We round up for headroom (hidden SSIDs / WPA3).
 #define SSID_MAX            64
 #define PASSWORD_MAX        96
+// Model ids are short ("provider/model" shape caps out around 64 chars);
+// personality is free-form user-written text that shows up in the AI
+// system prompt — bound it to 1 KB so we can't blow past the chat body cap.
+#define LLM_MODEL_MAX       96
+#define PERSONALITY_MAX     1024
 
 // ---- Module state -----------------------------------------------------------
 static bool    s_ready       = false;
@@ -45,6 +52,8 @@ static uint8_t s_brightness  = 255;
 static bool    s_bluetooth   = false;
 static char    s_ssid[SSID_MAX];
 static char    s_password[PASSWORD_MAX];
+static char    s_llm_model[LLM_MODEL_MAX];
+static char    s_personality[PERSONALITY_MAX];
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -137,6 +146,8 @@ esp_err_t devcfg_init(void) {
     load_bool(h, KEY_BLUETOOTH,     &s_bluetooth,  false);
     load_str (h, KEY_WIFI_SSID,     s_ssid,        sizeof(s_ssid));
     load_str (h, KEY_WIFI_PASSWORD, s_password,    sizeof(s_password));
+    load_str (h, KEY_LLM_MODEL,     s_llm_model,   sizeof(s_llm_model));
+    load_str (h, KEY_PERSONALITY,   s_personality, sizeof(s_personality));
 
     if (h != 0) nvs_close(h);
 
@@ -191,4 +202,19 @@ void devcfg_clear_wifi(void) {
     s_password[0] = '\0';
     save_str(KEY_WIFI_SSID,     "");
     save_str(KEY_WIFI_PASSWORD, "");
+}
+
+const char *devcfg_llm_model(void)   { return s_llm_model;   }
+const char *devcfg_personality(void) { return s_personality; }
+
+void devcfg_set_llm_model(const char *model) {
+    if (model == NULL) model = "";
+    strlcpy(s_llm_model, model, sizeof(s_llm_model));
+    save_str(KEY_LLM_MODEL, s_llm_model);
+}
+
+void devcfg_set_personality(const char *persona) {
+    if (persona == NULL) persona = "";
+    strlcpy(s_personality, persona, sizeof(s_personality));
+    save_str(KEY_PERSONALITY, s_personality);
 }
