@@ -4,8 +4,7 @@
 //  Layout (240x320):
 //
 //    +--------------------------------------------------+
-//    | status                       SOL $198.42         |
-//    |                              USDC 12.34          |
+//    | USDC 12.34                     SOL $198.42       |
 //    +--------------------------------------------------+
 //    |                                                  |
 //    |            \         /                           |
@@ -42,7 +41,9 @@ static const char *TAG = "creature_screen";
 
 // --- widget handles --------------------------------------------------------
 static lv_obj_t *s_scr          = NULL;
-static lv_obj_t *s_status_label = NULL;
+// s_status_label is retired — the top-left slot now holds USDC per the user's
+// request. creature_screen_set_status() is kept as a harmless no-op so the
+// main loop doesn't have to learn about the change.
 static lv_obj_t *s_price_label  = NULL;
 static lv_obj_t *s_usdc_label   = NULL;
 static lv_obj_t *s_body         = NULL;
@@ -158,9 +159,10 @@ bool creature_screen_init(void) {
     s_scr = lv_obj_create(NULL);
     scr_apply_bg(s_scr);
 
-    // --- status bar: we build it by hand here so we can reach both the
-    //     right "price" label and a below-it "usdc" label. scr_make_status_bar
-    //     only exposes a single right label, which isn't enough. -----------
+    // --- status bar: one row — USDC (left) and SOL price (right). Both
+    //     labels are vertically centred so a 26-pixel bar is plenty; the
+    //     earlier two-line stacking was what made the SOL ticker appear
+    //     to "leak" down into the creature's space.
     lv_obj_t *bar = lv_obj_create(s_scr);
     lv_obj_set_size(bar, SCR_W, STATUS_BAR_H);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -170,20 +172,15 @@ bool creature_screen_init(void) {
     lv_obj_set_style_pad_all(bar, 4, LV_PART_MAIN);
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_status_label = lv_label_create(bar);
-    lv_label_set_text(s_status_label, "");
-    lv_obj_set_style_text_color(s_status_label, SCR_COLOR_ACCENT, LV_PART_MAIN);
-    lv_obj_align(s_status_label, LV_ALIGN_LEFT_MID, 0, 0);
+    s_usdc_label = lv_label_create(bar);
+    lv_label_set_text(s_usdc_label, "");
+    lv_obj_set_style_text_color(s_usdc_label, SCR_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_align(s_usdc_label, LV_ALIGN_LEFT_MID, 0, 0);
 
     s_price_label = lv_label_create(bar);
     lv_label_set_text(s_price_label, "");
     lv_obj_set_style_text_color(s_price_label, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_align(s_price_label, LV_ALIGN_TOP_RIGHT, 0, -2);
-
-    s_usdc_label = lv_label_create(bar);
-    lv_label_set_text(s_usdc_label, "");
-    lv_obj_set_style_text_color(s_usdc_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_usdc_label, LV_ALIGN_BOTTOM_RIGHT, 0, 2);
+    lv_obj_align(s_price_label, LV_ALIGN_RIGHT_MID, 0, 0);
 
     // --- creature container (ears live above it, so we carve out space
     //     for them between the status bar and the body) -------------------
@@ -285,10 +282,10 @@ bool creature_screen_init(void) {
 lv_obj_t *creature_screen(void) { return s_scr; }
 
 void creature_screen_set_status(const char *s) {
-    if (!s_status_label) return;
-    if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_status_label, s ? s : "");
-    lvgl_port_unlock();
+    // Intentional no-op. The top-left slot now shows USDC; IP-on-screen
+    // was demoted to the serial log. The setter stays so the main loop's
+    // ui_set_status(ip) call remains harmless.
+    (void)s;
 }
 
 void creature_screen_set_price(const char *s) {

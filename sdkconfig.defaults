@@ -51,3 +51,8 @@ CONFIG_LWIP_MAX_LISTENING_TCP=8
 # ---- mbedTLS (bigger record buffer so Gemini / ElevenLabs chunks fit) ------
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# ---- LVGL extras -----------------------------------------------------------
+# QR code lib: wallet screen renders the device pubkey as a QR so a phone
+# wallet can scan it without typing 44 base58 chars.
+CONFIG_LV_USE_QRCODE=y

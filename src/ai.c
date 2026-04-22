@@ -80,6 +80,23 @@ static void pop_last_turn(void) {
     if (s_hist_len > 0) s_hist_len--;
 }
 
+// Keep NVS stores of the Arduino-era model names from silently killing every
+// /say with a 400. If the stored value isn't on the current provider's
+// allow-list, build_chat_body falls back to the hard-coded default.
+static bool is_supported_model(const char *m) {
+    if (!m || !m[0]) return false;
+    static const char *const ALLOWED[] = {
+        "gpt-4o",
+        "gpt-4o-mini",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+    };
+    for (size_t i = 0; i < sizeof(ALLOWED) / sizeof(ALLOWED[0]); ++i) {
+        if (strcmp(m, ALLOWED[i]) == 0) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // System prompt: persona + live wallet state injected every call so the
 // model always sees current balances.
@@ -119,8 +136,17 @@ static int build_chat_body(char *out, size_t cap,
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
+    // The blockrun-backed x402 endpoint rotates its supported-model list from
+    // time to time. As of 2026-04 it takes: gpt-4o, gpt-4o-mini,
+    // claude-sonnet-4, claude-haiku-4.5. Anything else (including the
+    // Arduino-era "shannon/daemon-x402s" we used to have stored in NVS)
+    // comes back as HTTP 400. We default to claude-haiku-4.5 because it
+    // was the cheapest option when last checked — good for chatty replies
+    // that aren't pulling their weight at gpt-4o prices.
     const char *model = devcfg_llm_model();
-    if (!model || !model[0]) model = "google/gemini-3.1-pro";
+    if (!model || !model[0] || !is_supported_model(model)) {
+        model = "claude-haiku-4.5";
+    }
     cJSON_AddStringToObject(root, "model", model);
     cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
     cJSON_AddNumberToObject(root, "temperature", temperature);
@@ -173,7 +199,12 @@ static bool post_chat(const char *body, char *reply_out, size_t reply_cap) {
 
     bool ok = false;
     if (r.status != 200) {
-        ESP_LOGW(TAG, "x402 HTTP %d (err=%s)", r.status, r.error);
+        // Log a snippet of the server's response body so the actual error
+        // ("invalid model", "missing field", etc.) shows up in the serial
+        // log. Most OpenAI-compatible 4xx's include a JSON error message
+        // that's worth more than the status code alone.
+        ESP_LOGW(TAG, "x402 HTTP %d (err=%s) body=%.240s",
+                 r.status, r.error, rsp);
         if (r.status == 402)           strlcpy(reply_out, "I couldn't complete the USDC payment.", reply_cap);
         else if (r.error[0])           snprintf(reply_out, reply_cap, "Daemon's brain is offline: %s", r.error);
         else                           snprintf(reply_out, reply_cap, "HTTP %d", r.status);
@@ -219,6 +250,15 @@ done:
 // ---------------------------------------------------------------------------
 bool ai_begin(void) {
     ai_reset_history();
+    // One-shot migration: if NVS still has an Arduino-era model id we know
+    // the current endpoint rejects, wipe it so build_chat_body() lands on
+    // the default without the user having to do anything. This is a
+    // belt-and-braces — is_supported_model() already guards the POST path.
+    const char *stored = devcfg_llm_model();
+    if (stored && stored[0] && !is_supported_model(stored)) {
+        ESP_LOGW(TAG, "clearing unsupported stored model '%s'", stored);
+        devcfg_set_llm_model("");
+    }
     return true;
 }
 

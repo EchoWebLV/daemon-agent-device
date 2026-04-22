@@ -9,6 +9,7 @@
 #include "settings_screen.h"
 #include "screens_common.h"
 #include "devcfg.h"
+#include "ui.h"
 #include "voice.h"
 #include "wifi_sta.h"
 
@@ -23,10 +24,9 @@ static const char *TAG = "settings_screen";
 
 static lv_obj_t *s_scr = NULL;
 
-// Status bar labels (top).
+// Status bar labels (top). price + usdc are retired on side screens; the
+// setters below are no-ops so ui.c can broadcast without caring.
 static lv_obj_t *s_status_label = NULL;
-static lv_obj_t *s_price_label  = NULL;
-static lv_obj_t *s_usdc_label   = NULL;
 
 // Wi-Fi row.
 static lv_obj_t *s_wifi_row   = NULL;
@@ -65,6 +65,30 @@ static lv_obj_t *make_row(lv_obj_t *parent, int y_top) {
 }
 
 // --- event handlers --------------------------------------------------------
+
+// Shared X close button (see wallet_screen.c for the canonical copy).
+// Duplicated per screen rather than shoved into screens_common.h because
+// this file already owns a row of its own event handlers, and adding a
+// third include layer for ~20 lines of chrome wasn't worth the traversal.
+static void close_clicked(lv_event_t *e) {
+    (void)e;
+    ui_show_creature();
+}
+
+static void add_close_button(lv_obj_t *bar) {
+    lv_obj_t *btn = lv_button_create(bar);
+    lv_obj_set_size(btn, 28, STATUS_BAR_H - 4);
+    lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, close_clicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *x = lv_label_create(btn);
+    lv_label_set_text(x, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(x, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
+    lv_obj_center(x);
+}
 
 static void wifi_row_clicked(lv_event_t *e) {
     (void)e;
@@ -106,7 +130,7 @@ bool settings_screen_init(void) {
     s_scr = lv_obj_create(NULL);
     scr_apply_bg(s_scr);
 
-    // --- status bar ---
+    // --- status bar: title on the left, X on the right ---
     lv_obj_t *bar = lv_obj_create(s_scr);
     lv_obj_set_size(bar, SCR_W, STATUS_BAR_H);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -121,15 +145,7 @@ bool settings_screen_init(void) {
     lv_obj_set_style_text_color(s_status_label, SCR_COLOR_ACCENT, LV_PART_MAIN);
     lv_obj_align(s_status_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    s_price_label = lv_label_create(bar);
-    lv_label_set_text(s_price_label, "");
-    lv_obj_set_style_text_color(s_price_label, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_align(s_price_label, LV_ALIGN_TOP_RIGHT, 0, -2);
-
-    s_usdc_label = lv_label_create(bar);
-    lv_label_set_text(s_usdc_label, "");
-    lv_obj_set_style_text_color(s_usdc_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_usdc_label, LV_ALIGN_BOTTOM_RIGHT, 0, 2);
+    add_close_button(bar);
 
     // --- rows ---
     int y = STATUS_BAR_H + 10;
@@ -236,17 +252,13 @@ void settings_screen_set_status(const char *s) {
 }
 
 void settings_screen_set_price(const char *s) {
-    if (!s_price_label) return;
-    if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_price_label, s ? s : "");
-    lvgl_port_unlock();
+    // No-op: ticker is creature-only now. See wallet_screen_set_price().
+    (void)s;
 }
 
 void settings_screen_set_usdc(const char *s) {
-    if (!s_usdc_label) return;
-    if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_usdc_label, s ? s : "");
-    lvgl_port_unlock();
+    // Ditto.
+    (void)s;
 }
 
 void settings_screen_refresh(void) {

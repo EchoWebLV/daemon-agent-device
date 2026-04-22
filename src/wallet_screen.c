@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 #include "wallet_screen.h"
 #include "screens_common.h"
+#include "ui.h"
 #include "wallet.h"
 #include "price.h"
 
@@ -37,11 +38,15 @@ static const char *TAG = "wallet_screen";
 
 static lv_obj_t *s_scr          = NULL;
 static lv_obj_t *s_status_label = NULL;
-static lv_obj_t *s_price_label  = NULL;
-static lv_obj_t *s_usdc_label   = NULL;
+// price + usdc labels are retired on the side screens — the SOL/USDC ticker
+// now lives only on the creature home. The set_price / set_usdc setters
+// are kept as no-ops so ui.c can still broadcast without caring who
+// listens.
 static lv_obj_t *s_addr_label   = NULL;
 static lv_obj_t *s_sol_label    = NULL;
 static lv_obj_t *s_usd_label    = NULL;
+static lv_obj_t *s_qrcode       = NULL;    // lv_qrcode; rendered once on first refresh
+static bool      s_qr_set       = false;   // flips true after the pubkey is painted in
 static lv_obj_t *s_list         = NULL;
 static lv_obj_t *s_footer       = NULL;
 
@@ -55,6 +60,32 @@ static void truncate_addr(const char *full, char *out, size_t cap) {
     snprintf(out, cap, "%c%c%c%c\xE2\x80\xA6%s",
              full[0], full[1], full[2], full[3],
              full + n - 4);
+}
+
+// "X" close button in the top-right of a status bar. Tapping returns to
+// the creature home, which is the universal "back out of this panel"
+// action on this device. Broken out so wallet/settings/wifi/etc. share
+// the same 28-px hit target + style.
+static void close_clicked(lv_event_t *e) {
+    (void)e;
+    ui_show_creature();
+}
+
+static void add_close_button(lv_obj_t *bar) {
+    lv_obj_t *btn = lv_button_create(bar);
+    lv_obj_set_size(btn, 28, STATUS_BAR_H - 4);
+    lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+    // Transparent background so the X sits cleanly on the bar; a subtle
+    // tap-state tint comes from LVGL's default pressed style.
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, close_clicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *x = lv_label_create(btn);
+    lv_label_set_text(x, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(x, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
+    lv_obj_center(x);
 }
 
 // Format "1234567.89" with comma separators into `out`. Truncates to cap-1.
@@ -93,7 +124,10 @@ bool wallet_screen_init(void) {
     s_scr = lv_obj_create(NULL);
     scr_apply_bg(s_scr);
 
-    // Status bar with left status + right price + right-below USDC.
+    // Status bar: title on the left, close-X on the right. The SOL/USDC
+    // ticker that used to live here was removed — the wallet already
+    // shows its own balances below, and keeping the ticker on every
+    // side screen cluttered a 26-px tall bar.
     lv_obj_t *bar = lv_obj_create(s_scr);
     lv_obj_set_size(bar, SCR_W, STATUS_BAR_H);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -108,46 +142,62 @@ bool wallet_screen_init(void) {
     lv_obj_set_style_text_color(s_status_label, SCR_COLOR_ACCENT, LV_PART_MAIN);
     lv_obj_align(s_status_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    s_price_label = lv_label_create(bar);
-    lv_label_set_text(s_price_label, "");
-    lv_obj_set_style_text_color(s_price_label, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_align(s_price_label, LV_ALIGN_TOP_RIGHT, 0, -2);
+    add_close_button(bar);
 
-    s_usdc_label = lv_label_create(bar);
-    lv_label_set_text(s_usdc_label, "");
-    lv_obj_set_style_text_color(s_usdc_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_usdc_label, LV_ALIGN_BOTTOM_RIGHT, 0, 2);
+    // Top block: two columns below the status bar.
+    //   Left  (≈140 px wide) — truncated address, big SOL balance, USD.
+    //   Right (≈92 px wide)  — QR code of the full base58 pubkey.
+    // The QR is what a phone wallet's "Scan to pay" flow consumes, so it
+    // has to fit a ~44-char address cleanly. 88 px with a 2-module quiet
+    // zone renders a crisp ~29-module code that scans fine from 10 cm.
 
-    // Truncated address.
+    // --- Left column: textual address + balances ---------------------------
     s_addr_label = lv_label_create(s_scr);
     lv_label_set_text(s_addr_label, "—");
     lv_obj_set_style_text_color(s_addr_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_addr_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 6);
+    lv_obj_align(s_addr_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 8);
 
-    // Big SOL balance.
     s_sol_label = lv_label_create(s_scr);
     lv_label_set_text(s_sol_label, "—");
     lv_obj_set_style_text_color(s_sol_label, SCR_COLOR_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_sol_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 30);
+    lv_obj_align(s_sol_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 32);
 
-    // USD equivalent.
     s_usd_label = lv_label_create(s_scr);
     lv_label_set_text(s_usd_label, "");
     lv_obj_set_style_text_color(s_usd_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_usd_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 52);
+    lv_obj_align(s_usd_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 54);
 
-    // HOLDINGS divider label. Kept separate from the list so the list's
-    // own scrolling doesn't drag the header away.
+    // Little caption under the left column hinting what the QR is for.
+    lv_obj_t *scan_hint = lv_label_create(s_scr);
+    lv_label_set_text(scan_hint, "scan \xE2\x86\x92");   // "scan →"
+    lv_obj_set_style_text_color(scan_hint, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_align(scan_hint, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 80);
+
+    // --- Right column: QR code --------------------------------------------
+    //
+    // lv_qrcode expects a light "quiet zone" around the modules to scan
+    // reliably, so we give it a white background panel slightly larger
+    // than the code itself.
+    s_qrcode = lv_qrcode_create(s_scr);
+    lv_qrcode_set_size(s_qrcode, 88);
+    lv_qrcode_set_dark_color(s_qrcode, lv_color_black());
+    lv_qrcode_set_light_color(s_qrcode, lv_color_white());
+    // Placeholder until wallet_screen_refresh() injects the real pubkey —
+    // without this, lv_qrcode renders a red "error" square.
+    lv_qrcode_set_data(s_qrcode, "daemon");
+    lv_obj_align(s_qrcode, LV_ALIGN_TOP_RIGHT, -6, STATUS_BAR_H + 6);
+
+    // --- HOLDINGS header + list -------------------------------------------
+    // Top block is now ~106 px (status 26 + QR 88 - 8 overlap). Push the
+    // holdings section down to clear the QR + caption.
     lv_obj_t *div = lv_label_create(s_scr);
     lv_label_set_text(div, "HOLDINGS");
     lv_obj_set_style_text_color(div, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(div, LV_ALIGN_TOP_LEFT, 12, STATUS_BAR_H + 80);
+    lv_obj_align(div, LV_ALIGN_TOP_LEFT, 12, STATUS_BAR_H + 104);
 
-    // Scrollable list. lv_list has its own visual chrome; we bolt the
-    // Daemon palette on top.
     s_list = lv_list_create(s_scr);
-    lv_obj_set_size(s_list, SCR_W - 20, SCR_H - (STATUS_BAR_H + 104) - 24);
-    lv_obj_align(s_list, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 100);
+    lv_obj_set_size(s_list, SCR_W - 20, SCR_H - (STATUS_BAR_H + 128) - 24);
+    lv_obj_align(s_list, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 124);
     lv_obj_set_style_bg_color(s_list, SCR_COLOR_PANEL, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_list, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(s_list, SCR_COLOR_DIVIDER, LV_PART_MAIN);
@@ -177,17 +227,14 @@ void wallet_screen_set_status(const char *s) {
 }
 
 void wallet_screen_set_price(const char *s) {
-    if (!s_price_label) return;
-    if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_price_label, s ? s : "");
-    lvgl_port_unlock();
+    // No-op: SOL price is creature-only now. Kept so ui.c can broadcast
+    // without caring which screens listen.
+    (void)s;
 }
 
 void wallet_screen_set_usdc(const char *s) {
-    if (!s_usdc_label) return;
-    if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_usdc_label, s ? s : "");
-    lvgl_port_unlock();
+    // Ditto — see note in wallet_screen_set_price().
+    (void)s;
 }
 
 void wallet_screen_refresh(void) {
@@ -224,6 +271,16 @@ void wallet_screen_refresh(void) {
     lv_label_set_text(s_addr_label, addr_short);
     lv_label_set_text_fmt(s_sol_label, "%s SOL", sol_str);
     lv_label_set_text(s_usd_label, usd_str);
+
+    // Paint the full pubkey into the QR exactly once. wallet_pubkey() doesn't
+    // change at runtime, and lv_qrcode_set_data re-renders the whole bitmap,
+    // so repainting on every refresh would be wasted work. The guard also
+    // protects the placeholder "daemon" value from overwriting a valid
+    // render if an early refresh happens before wallet_begin() completes.
+    if (s_qrcode && !s_qr_set && pub && pub[0]) {
+        lv_qrcode_set_data(s_qrcode, pub);
+        s_qr_set = true;
+    }
 
     // Replace the list contents. lv_list_add_text / lv_list_add_button
     // don't expose a clear; rebuilding is simplest.

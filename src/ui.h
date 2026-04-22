@@ -8,9 +8,14 @@
 //
 //  After init, the app main loop is expected to call:
 //
-//    ui_set_status("idle")          — short left-of-status-bar text
-//    ui_set_price("SOL $198.42")    — right-of-status-bar ticker
-//    ui_set_usdc("USDC 12.34")      — below the ticker
+//    ui_set_status("idle")          — no-op today; kept so callers that
+//                                     used to push the IP into the top bar
+//                                     keep compiling. The creature's top
+//                                     bar now shows USDC (left) and SOL
+//                                     price (right); side screens show
+//                                     their name + an X close button.
+//    ui_set_price("SOL $198.42")    — right-of-creature-status-bar ticker
+//    ui_set_usdc("USDC 12.34")      — left-of-creature-status-bar ticker
 //    ui_tick()                      — ~25 Hz; drives creature animations
 //    ui_refresh_wallet() / ui_refresh_settings()
 //                                   — after a wallet refresh / settings change
