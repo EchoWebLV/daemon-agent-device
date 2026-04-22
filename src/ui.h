@@ -15,10 +15,13 @@
 //    ui_refresh_wallet() / ui_refresh_settings()
 //                                   — after a wallet refresh / settings change
 //
-//  Navigation (swipe to cycle screens, back-to-creature from wifi on
-//  connect) is wired in phase 7's integration layer; for now the only
-//  screen visible is the creature, and tapping the Wi-Fi row in settings
-//  is the one explicit transition.
+//  Navigation:
+//    creature  ← swipe left  → wallet
+//    creature  ← swipe right → settings → tap Wi-Fi row → wifi screen
+//    wifi      ← swipe down (or on-connect) → settings
+//    wallet    ← swipe right → creature
+//    settings  ← swipe left  → creature
+//  Swipe handlers are installed by ui_init() on each screen's root.
 // ---------------------------------------------------------------------------
 #include <stdbool.h>
 
@@ -59,6 +62,15 @@ void ui_tick(void);
 // to call on the usual 30-60 s wallet/price cadence.
 void ui_refresh_wallet(void);
 void ui_refresh_settings(void);
+
+// Called by the AI /say handler once a reply is ready. Updates the
+// creature's subtitle + mood, triggers voice_speak(), and stays on the
+// creature screen so the user sees the face while Daemon talks.
+//
+// The call itself is cheap and returns immediately — audio plays on the
+// voice task. While the reply is being spoken the creature's mouth
+// animates via the internal lv_timer.
+void ui_deliver_reply(const char *text);
 
 #ifdef __cplusplus
 }

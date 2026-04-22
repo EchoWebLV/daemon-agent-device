@@ -32,6 +32,19 @@
 
 static const char *TAG = "daemon";
 
+// Wraps ai_handle_say() so the creature face + TTS kick in as a side effect
+// of answering /say. Keeping the forwarder here (rather than in ai.c or ui.c)
+// lets each module stay unaware of the others — ai.c writes a reply, ui.c
+// displays+speaks it, and this one-liner is the seam where the two meet.
+static void say_with_ui(const char *user, char *reply_out, size_t reply_cap) {
+    ai_handle_say(user, reply_out, reply_cap);
+    // Only drive the UI when we got a non-empty answer. On error ai.c writes
+    // a short human-readable blurb into reply_out which is still worth showing.
+    if (reply_out && reply_out[0]) {
+        ui_deliver_reply(reply_out);
+    }
+}
+
 static void log_boot_banner(void) {
     esp_chip_info_t chip = {0};
     esp_chip_info(&chip);
@@ -102,8 +115,11 @@ void app_main(void) {
     // AI client: clears conversation history and registers the /say handler.
     // Wire this even when Wi-Fi didn't come up so the callback is ready for
     // a later reconnect; ai_ask() itself rejects when offline.
+    //
+    // say_with_ui() is the forwarder that plumbs replies into the creature
+    // subtitle + voice task — see the wrapper at the top of this file.
     ai_begin();
-    server_set_say_handler(ai_handle_say);
+    server_set_say_handler(say_with_ui);
 
     // Voice: installs I2S, plays the boot-beep probe so a dead codec is
     // obvious, and spawns the audio task. Failure here is not fatal — the
@@ -177,6 +193,11 @@ void app_main(void) {
             ui_refresh_settings();
             last_ui_refresh = now_ms;
         }
+
+        // Polls voice_is_speaking() so the creature's mouth stops animating
+        // when the audio task drains. Internal mouth frames are driven by
+        // an LVGL timer — 1 Hz is fine for the on/off transition.
+        ui_tick();
 
         ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u  lw=%u  ip=%s  %s  %s",
                  tick++, (unsigned)free_total, (unsigned)free_min,

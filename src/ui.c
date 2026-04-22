@@ -15,13 +15,16 @@
 #include "creature_screen.h"
 #include "wallet_screen.h"
 #include "settings_screen.h"
+#include "voice.h"
 #include "wifi_screen.h"
 
 #include <inttypes.h>
+#include <string.h>
 
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_lvgl_port.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 
 static const char *TAG = "ui";
@@ -43,6 +46,66 @@ static void nav_wifi_connected(void) {
     // connected SSID in the Wi-Fi row.
     ui_show_settings();
     settings_screen_refresh();
+}
+
+// --- swipe navigation -------------------------------------------------------
+//
+// Each screen's root gets a LV_EVENT_GESTURE listener wired to a screen-
+// specific dispatch table. We swallow the gesture with lv_indev_wait_release
+// so the swipe doesn't get interpreted as a subsequent click on whatever
+// widget happens to be under the finger when it lifts.
+
+static void on_gesture_creature(lv_event_t *e) {
+    (void)e;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
+    switch (d) {
+        case LV_DIR_LEFT:  ui_show_wallet();   break;
+        case LV_DIR_RIGHT: ui_show_settings(); break;
+        default: break;
+    }
+}
+
+static void on_gesture_wallet(lv_event_t *e) {
+    (void)e;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
+    switch (d) {
+        case LV_DIR_RIGHT: ui_show_creature(); break;
+        default: break;
+    }
+}
+
+static void on_gesture_settings(lv_event_t *e) {
+    (void)e;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
+    switch (d) {
+        case LV_DIR_LEFT: ui_show_creature(); break;
+        default: break;
+    }
+}
+
+static void on_gesture_wifi(lv_event_t *e) {
+    (void)e;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
+    switch (d) {
+        // DOWN cancels the Wi-Fi picker and returns to settings, matching
+        // the "pull down to dismiss" modal idiom most users already know.
+        case LV_DIR_BOTTOM: ui_show_settings(); break;
+        default: break;
+    }
+}
+
+static void install_swipe_handlers(void) {
+    if (lvgl_port_lock(0)) {
+        lv_obj_add_event_cb(creature_screen(), on_gesture_creature, LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(wallet_screen(),   on_gesture_wallet,   LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(settings_screen(), on_gesture_settings, LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(wifi_screen(),     on_gesture_wifi,     LV_EVENT_GESTURE, NULL);
+        lvgl_port_unlock();
+    }
 }
 
 // --- public API ------------------------------------------------------------
@@ -87,6 +150,10 @@ esp_err_t ui_init(void) {
     // Wire the two explicit transitions the screens themselves trigger.
     settings_screen_on_wifi_click(nav_go_to_wifi);
     wifi_screen_on_connected(nav_wifi_connected);
+
+    // Swipe listeners on each screen's root. Must run after the screens are
+    // built so the roots exist.
+    install_swipe_handlers();
 
     // Land on the creature.
     if (lvgl_port_lock(0)) {
@@ -169,6 +236,20 @@ void ui_set_talking(bool on) {
 
 void ui_tick(void) {
     creature_screen_tick();
+
+    // Voice-driven mouth sync. The audio task owns voice_is_speaking(); we
+    // just flip the creature's talking flag on the transitions so the mouth
+    // closes itself when the buffer runs dry and the mood returns to idle.
+    // Edge-triggered — no work in steady state.
+    static bool last_speaking = false;
+    bool speaking = voice_is_speaking();
+    if (speaking != last_speaking) {
+        creature_screen_set_talking(speaking);
+        if (!speaking) {
+            creature_screen_set_mood(CREATURE_MOOD_IDLE);
+        }
+        last_speaking = speaking;
+    }
 }
 
 void ui_refresh_wallet(void) {
@@ -177,4 +258,23 @@ void ui_refresh_wallet(void) {
 
 void ui_refresh_settings(void) {
     settings_screen_refresh();
+}
+
+// --- AI reply bridge -------------------------------------------------------
+
+void ui_deliver_reply(const char *text) {
+    if (!text || !text[0]) return;
+
+    // Subtitle under the creature, mood → TALK, mouth on, and snap to the
+    // creature screen so the user sees the face regardless of where they
+    // were when the reply landed. ui_tick() will flip talking off once the
+    // voice task drains the audio stream.
+    creature_screen_set_subtitle(text);
+    creature_screen_set_mood(CREATURE_MOOD_TALK);
+    creature_screen_set_talking(true);
+    ui_show_creature();
+
+    // Kick the voice task. Returns immediately; audio streams out on the
+    // voice task without blocking the /say HTTP response path.
+    voice_speak(text);
 }
