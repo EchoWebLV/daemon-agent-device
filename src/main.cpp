@@ -32,6 +32,8 @@
 #include "price.h"
 #include "touch.h"
 #include "walletscreen.h"
+#include "menuscreen.h"
+#include "infoscreen.h"
 #include "settingsscreen.h"
 #include "wifiscreen.h"
 #include "devcfg.h"
@@ -47,12 +49,20 @@ static constexpr uint32_t WALLET_INTERVAL_MS = 60000;   // 60 s
 static uint32_t s_nextPriceMs  = 0;
 static uint32_t s_nextWalletMs = 0;
 
-// Screens: creature (home), wallet (swipe-left), settings (pull-down).
+// Screens:
+//   CREATURE — home, the animated daemon
+//   MENU     — slide-up launcher with Wallet / Info tiles (swipe UP)
+//   WALLET   — reached from the Menu's Wallet tile
+//   INFO     — reached from the Menu's Info tile
+//   SETTINGS — pull-down from any non-settings screen (swipe DOWN)
+//   WIFI     — sub-screen reached from Settings' Wi-Fi row
 enum Screen : uint8_t {
   SCREEN_CREATURE = 0,
-  SCREEN_WALLET   = 1,
-  SCREEN_SETTINGS = 2,
-  SCREEN_WIFI     = 3,   // sub-screen reached from Settings
+  SCREEN_MENU     = 1,
+  SCREEN_WALLET   = 2,
+  SCREEN_INFO     = 3,
+  SCREEN_SETTINGS = 4,
+  SCREEN_WIFI     = 5,   // sub-screen reached from Settings
 };
 static Screen s_screen     = SCREEN_CREATURE;
 static Screen s_prevScreen = SCREEN_CREATURE;   // where to return after settings
@@ -64,7 +74,9 @@ static void switchScreen(Screen target) {
   s_screen = target;
   switch (target) {
     case SCREEN_CREATURE: creatureRepaint();        break;
+    case SCREEN_MENU:     menuScreenOnEnter();      break;
     case SCREEN_WALLET:   walletScreenOnEnter();    break;
+    case SCREEN_INFO:     infoScreenOnEnter();      break;
     case SCREEN_SETTINGS: settingsScreenOnEnter();  break;
     case SCREEN_WIFI:     wifiScreenEnter();        break;
   }
@@ -169,6 +181,8 @@ void setup() {
     tft.print("creature sprite alloc failed");
   }
   walletScreenBegin(&tft);
+  menuScreenBegin(&tft);
+  infoScreenBegin(&tft);
   settingsScreenBegin(&tft);
   wifiScreenBegin(&tft);
   touchBegin();
@@ -243,15 +257,15 @@ void loop() {
   if (s_wifiOk) serverLoop();
 
   // Handle swipes.
-  //   SWIPE_UP    → wallet (from creature) — wallet slides up from bottom
-  //   SWIPE_DOWN  → open settings (only fires if start was near top edge)
-  //   SWIPE_UP    → close settings (back to previous screen)
-  // From the wallet, the X button in the top-right is the only way back.
+  //   SWIPE_UP   from creature → Menu launcher (slides up)
+  //   SWIPE_DOWN from anywhere → Settings (slides down)
+  //   SWIPE_UP   from Settings → close back to previous screen
+  // Menu / Wallet / Info all use X (top-right) as the only way home.
   SwipeDir sw = touchPoll();
   if (s_screen == SCREEN_SETTINGS) {
     // Swipe-up closes back to wherever we came from (preserves the
-    // "pull-down peek" feel). The X button, by contrast, always goes all
-    // the way home to the creature — consistent with every other panel.
+    // "pull-down peek" feel). The X button always goes all the way home
+    // to the creature — consistent with every other panel.
     if (sw == SWIPE_UP)                     switchScreen(s_prevScreen);
     if (settingsScreenConsumeClose())       switchScreen(SCREEN_CREATURE);
     if (settingsScreenConsumeWifiTap())     switchScreen(SCREEN_WIFI);
@@ -261,14 +275,25 @@ void loop() {
     wifiScreenHandleSwipe(sw);
     if (wifiScreenConsumeExit())      switchScreen(SCREEN_SETTINGS);
     if (wifiScreenConsumeCloseHome()) switchScreen(SCREEN_CREATURE);
+  } else if (s_screen == SCREEN_MENU) {
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) menuScreenHandleTap(tx, ty);
+    if (menuScreenConsumeWalletTap()) switchScreen(SCREEN_WALLET);
+    if (menuScreenConsumeInfoTap())   switchScreen(SCREEN_INFO);
+    if (menuScreenConsumeClose())     switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)             switchScreen(SCREEN_SETTINGS);
   } else if (s_screen == SCREEN_WALLET) {
-    // Forward taps to the wallet so its QR / X buttons can be hit.
     int16_t tx, ty;
     if (touchJustPressed(tx, ty)) walletScreenHandleTap(tx, ty);
     if (walletScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
-    if (sw == SWIPE_DOWN) switchScreen(SCREEN_SETTINGS);
+    if (sw == SWIPE_DOWN)           switchScreen(SCREEN_SETTINGS);
+  } else if (s_screen == SCREEN_INFO) {
+    int16_t tx, ty;
+    if (touchJustPressed(tx, ty)) infoScreenHandleTap(tx, ty);
+    if (infoScreenConsumeClose()) switchScreen(SCREEN_CREATURE);
+    if (sw == SWIPE_DOWN)         switchScreen(SCREEN_SETTINGS);
   } else {
-    if (sw == SWIPE_UP)    switchScreen(SCREEN_WALLET);
+    if (sw == SWIPE_UP)    switchScreen(SCREEN_MENU);
     if (sw == SWIPE_DOWN)  switchScreen(SCREEN_SETTINGS);
   }
 
@@ -287,7 +312,9 @@ void loop() {
   // Per-screen tick.
   switch (s_screen) {
     case SCREEN_CREATURE: creatureTick();       break;
+    case SCREEN_MENU:     menuScreenTick();     break;
     case SCREEN_WALLET:   walletScreenTick();   break;
+    case SCREEN_INFO:     infoScreenTick();     break;
     case SCREEN_SETTINGS: settingsScreenTick(); break;
     case SCREEN_WIFI:     wifiScreenTick();     break;
   }
