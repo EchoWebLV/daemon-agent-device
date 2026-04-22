@@ -24,6 +24,7 @@
 #include "display.h"
 #include "price.h"
 #include "server.h"
+#include "testharness.h"
 #include "touch.h"
 #include "ui.h"
 #include "voice.h"
@@ -165,6 +166,14 @@ void app_main(void) {
     // ai→ui→voice pipeline on every cold boot (handy canary).
     if (wifi_err == ESP_OK) {
         ui_deliver_reply("Hello, I am Daemon.");
+    }
+
+    // Host-driven smoke-test harness. Spawns a task that blocks on stdin and
+    // dispatches "TEST ..." lines. Always on — the task idles on fgets() when
+    // no host is connected, so there's no runtime cost outside of an active
+    // test run. See src/testharness.c and tests/run.py.
+    if (!test_harness_begin()) {
+        ESP_LOGW(TAG, "test harness failed to start; tests will be unreachable");
     }
 
     uint32_t tick = 0;

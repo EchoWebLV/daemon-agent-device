@@ -209,7 +209,11 @@ def c_version_reports(dev: Device) -> str:
     return f"({sdk}, built {date} {time_s})"
 
 
-SCREENS = ["creature", "menu", "wallet", "info", "settings", "wifi"]
+# The ESP-IDF build has four screens (creature / wallet / settings / wifi).
+# The original Arduino spec listed six (adding menu / info) but those were
+# never rebuilt after the ESP-IDF migration — see ui.h comments. We test
+# what exists.
+SCREENS = ["creature", "wallet", "settings", "wifi"]
 
 
 def c_screen_roundtrip(dev: Device) -> str:
@@ -256,43 +260,29 @@ def c_paint_under_budget(dev: Device) -> str:
     return f"(max {worst} ms)"
 
 
-# Menu tile centers, derived from src/menuscreen.cpp constants.
-# TILE_X=10, TILE_W = SCR_W-20 = 220, TILE_H=116, TILE1_Y=44, TILE2_Y=172.
-_MENU_TILE_X   = 10 + 220 // 2           # 120
-_WALLET_TILE_Y = 44 + 116 // 2           # 102
-_INFO_TILE_Y   = 172 + 116 // 2          # 230
-
-
-def c_menu_tap_wallet(dev: Device) -> str:
-    """Tap the Wallet tile from the menu screen; expect transition to wallet."""
-    dev.send("TEST SCREEN FORCE menu", timeout=3.0)
-    time.sleep(0.3)
-    dev.send(f"TEST TAP {_MENU_TILE_X} {_WALLET_TILE_Y}", timeout=2.0)
-    time.sleep(0.3)
-    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
-    assert got == "wallet", f"expected wallet, got {got}"
-    return ""
-
-
-def c_menu_tap_info(dev: Device) -> str:
-    """Tap the Info tile from the menu screen; expect transition to info."""
-    dev.send("TEST SCREEN FORCE menu", timeout=3.0)
-    time.sleep(0.3)
-    dev.send(f"TEST TAP {_MENU_TILE_X} {_INFO_TILE_Y}", timeout=2.0)
-    time.sleep(0.3)
-    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
-    assert got == "info", f"expected info, got {got}"
-    return ""
-
-
 def c_settings_from_swipe(dev: Device) -> str:
-    """Swipe down on the creature screen; expect settings to open."""
+    """Swipe down on the creature screen; expect settings to open. On the
+    ESP-IDF build this maps to ui_inject_swipe(DOWN) — same transition the
+    LVGL gesture listener runs when the user actually swipes."""
     dev.send("TEST SCREEN FORCE creature", timeout=3.0)
     time.sleep(0.3)
     dev.send("TEST SWIPE DOWN", timeout=2.0)
     time.sleep(0.3)
     got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
     assert got == "settings", f"expected settings, got {got}"
+    return ""
+
+
+def c_wallet_from_swipe(dev: Device) -> str:
+    """From the creature, swipe LEFT should land on the wallet screen. This
+    covers the other half of the gesture dispatch that c_settings_from_swipe
+    skips, so a regression in LV_DIR_LEFT handling shows up here."""
+    dev.send("TEST SCREEN FORCE creature", timeout=3.0)
+    time.sleep(0.3)
+    dev.send("TEST SWIPE LEFT", timeout=2.0)
+    time.sleep(0.3)
+    got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
+    assert got == "wallet", f"expected wallet, got {got}"
     return ""
 
 
@@ -439,19 +429,22 @@ def main() -> int:
     # Build the case list inside main() so cases can close over `args`
     # (e.g. the wallet case needs --rpc, x402 cases need --skip-x402).
     cases: List[Tuple[str, Callable[[Device], str]]] = [
-        ("liveness",            c_liveness),
-        ("boot_heap_ok",        c_boot_heap_ok),
-        ("version_reports",     c_version_reports),
-        ("screen_roundtrip",    c_screen_roundtrip),
-        ("paint_under_budget",  c_paint_under_budget),
-        ("menu_tap_wallet",     c_menu_tap_wallet),
-        ("menu_tap_info",       c_menu_tap_info),
-        ("settings_from_swipe", c_settings_from_swipe),
-        ("wifi_status_connected", c_wifi_status_connected),
-        ("wifi_scan_nonempty",    c_wifi_scan_nonempty),
-        ("wallet_pubkey_valid",   c_wallet_pubkey_valid),
+        ("liveness",               c_liveness),
+        ("boot_heap_ok",           c_boot_heap_ok),
+        ("version_reports",        c_version_reports),
+        ("screen_roundtrip",       c_screen_roundtrip),
+        ("paint_under_budget",     c_paint_under_budget),
+        # Gesture dispatch: creature → DOWN → settings and creature → LEFT →
+        # wallet. These replace the menu_tap_* cases from the original Arduino
+        # spec — the ESP-IDF build doesn't have a menu screen; swipes are
+        # the only way to move between creature / wallet / settings.
+        ("settings_from_swipe",    c_settings_from_swipe),
+        ("wallet_from_swipe",      c_wallet_from_swipe),
+        ("wifi_status_connected",  c_wifi_status_connected),
+        ("wifi_scan_nonempty",     c_wifi_scan_nonempty),
+        ("wallet_pubkey_valid",    c_wallet_pubkey_valid),
         ("wallet_balance_matches", lambda d: c_wallet_balance_matches(d, args.rpc)),
-        ("ai_ping",               c_ai_ping),
+        ("ai_ping",                c_ai_ping),
         *[
             (f"x402_{label}", _make_x402_case(label, url, lo, hi))
             for (label, url, lo, hi) in X402_URLS

@@ -283,6 +283,64 @@ void ui_refresh_settings(void) {
     settings_screen_refresh();
 }
 
+// --- Test-harness bridges --------------------------------------------------
+
+const char *ui_current_screen_name(void) {
+    // Compare the active screen pointer to each of the four cached screen
+    // roots. Reads lv_screen_active() under the port lock so we never race
+    // the LVGL task mid-transition. Returns a literal — the comparison is
+    // only needed while we hold the lock.
+    const char *name = "unknown";
+    if (lvgl_port_lock(0)) {
+        lv_obj_t *a = lv_screen_active();
+        if      (a == creature_screen()) name = "creature";
+        else if (a == wallet_screen())   name = "wallet";
+        else if (a == settings_screen()) name = "settings";
+        else if (a == wifi_screen())     name = "wifi";
+        lvgl_port_unlock();
+    }
+    return name;
+}
+
+void ui_inject_swipe(int direction) {
+    // Mirrors the on_gesture_* handlers above so test-driven swipes take the
+    // same navigation path a finger would. Direction encoding matches the
+    // TEST SWIPE verb: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN.
+    //
+    // Resolve the source screen by name because the caller might invoke us
+    // from a task that doesn't hold the port lock — ui_current_screen_name()
+    // takes care of that itself, and ui_show_*() each lock internally.
+    const char *from = ui_current_screen_name();
+
+    if (!strcmp(from, "creature")) {
+        // LV_DIR_LEFT / LV_DIR_TOP  -> wallet
+        // LV_DIR_RIGHT / LV_DIR_BOTTOM -> settings
+        if      (direction == 0 || direction == 2) ui_show_wallet();
+        else if (direction == 1 || direction == 3) ui_show_settings();
+    } else if (!strcmp(from, "wallet")) {
+        // Any "back-ish" direction returns to the creature.
+        if (direction == 1 || direction == 3 || direction == 2) ui_show_creature();
+    } else if (!strcmp(from, "settings")) {
+        if (direction == 0 || direction == 2 || direction == 3) ui_show_creature();
+    } else if (!strcmp(from, "wifi")) {
+        // Wi-Fi dismisses on any direction, per on_gesture_wifi.
+        if (direction >= 0 && direction <= 3) ui_show_settings();
+    }
+    // Unknown source screen: no-op.
+}
+
+void ui_force_repaint(void) {
+    // lv_refr_now drives a full dirty-area flush synchronously on the caller's
+    // thread while we hold the port lock. The harness wraps this in
+    // esp_timer_get_time() calls to time the paint.
+    if (lvgl_port_lock(0)) {
+        lv_obj_t *a = lv_screen_active();
+        if (a) lv_obj_invalidate(a);
+        lv_refr_now(NULL);
+        lvgl_port_unlock();
+    }
+}
+
 // --- AI reply bridge -------------------------------------------------------
 
 void ui_deliver_reply(const char *text) {

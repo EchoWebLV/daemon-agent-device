@@ -16,6 +16,7 @@ idf_component_register(
         "server.c"
         "settings_screen.c"
         "solana_tx.c"
+        "testharness.c"
         "touch.c"
         "ui.c"
         "voice.c"
