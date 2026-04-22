@@ -17,6 +17,8 @@
 #include "esp_flash.h"
 #include "esp_system.h"
 
+#include "display.h"
+
 static const char *TAG = "daemon";
 
 static void log_boot_banner(void) {
@@ -41,6 +43,10 @@ static void log_boot_banner(void) {
 
 void app_main(void) {
     log_boot_banner();
+
+    // Bring the ST7789 online early so dead-panel failures show up in the
+    // log before we start allocating for LVGL / WiFi / audio.
+    ESP_ERROR_CHECK(display_init());
 
     uint32_t tick = 0;
     while (true) {
