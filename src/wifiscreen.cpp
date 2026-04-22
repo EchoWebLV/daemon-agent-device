@@ -63,10 +63,9 @@ static uint32_t s_resultShownAt = 0;
 static String s_resultMsg;
 static bool   s_resultOk = false;
 
-// Scan state (defined + populated further down). Declared here so earlier
-// helpers like goBackOneStep() can reference them.
+// Set while a scan buffer exists on the WiFi stack — goBackOneStep()
+// uses it to decide whether to call WiFi.scanDelete() on the way out.
 static bool     s_scanInFlight;
-static uint32_t s_scanStartMs;
 
 // ---------------------------------------------------------------------------
 // Utility
@@ -131,7 +130,7 @@ static bool closeButtonTapped(int16_t x, int16_t y) {
 // Mode-aware "back": keyboard/connecting/result drops back to the list;
 // scanning + list drop out of the Wi-Fi panel entirely.
 static void goBackOneStep() {
-  // Cancel any in-flight async scan so it doesn't leave stale results.
+  // Cancel any in-flight scan buffer so it doesn't leave stale results.
   if (s_scanInFlight) {
     WiFi.scanDelete();
     s_scanInFlight = false;
@@ -152,40 +151,48 @@ static void goBackOneStep() {
 }
 
 // ---------------------------------------------------------------------------
-// Scan — async. A blocking WiFi.scanNetworks() freezes the UI for ~4 s and
-// makes the X/swipe unresponsive during that window, which is the bug the
-// user just hit. With async scan we keep ticking touch on every frame.
-// (Storage declared above near the other state variables.)
+// Scan — SYNCHRONOUS.
+//
+// We originally tried async (scanNetworks(true) + scanComplete polling) so
+// touch stayed responsive, but on this ESP32 Arduino core the async scan
+// silently returns zero results when the radio is currently associated
+// with an AP — which is exactly the normal state when the user opens the
+// Wi-Fi panel. The boot-time logNearbyNetworks() uses a sync scan and
+// works reliably, so we use the same pattern here.
+//
+// Cost: the UI freezes for ~3–5 s while the scan runs. We paint the
+// "scanning…" message first, then block. The spinner and any pending
+// taps wait until scanNetworks() returns.
 // ---------------------------------------------------------------------------
-static void kickScan() {
-  // Ensure STA mode first. If the user previously tapped "disconnect",
-  // serverWifiDisconnect() called WiFi.disconnect(true, true) which
-  // powers the radio OFF — a subsequent scan would silently return 0
-  // networks. Setting WIFI_STA here guarantees the radio is on before
-  // we ask it to look around.
+static void runScan() {
+  // STA is a prerequisite for scanning. After serverWifiDisconnect()
+  // (which calls WiFi.disconnect(true, true)) the radio is OFF and the
+  // scan would silently return 0.
   WiFi.mode(WIFI_STA);
-  // Drop any stale result buffer from a previous scan (async scans share
-  // one internal buffer).
   WiFi.scanDelete();
-  // scanNetworks(async=true) returns immediately; we poll scanComplete().
-  int16_t rc = WiFi.scanNetworks(/*async=*/true);
-  Serial.printf("wifi: async scan started rc=%d\n", (int)rc);
-  s_scanInFlight = true;
-  s_scanStartMs  = millis();
-}
 
-static void ingestScanResults(int n) {
-  Serial.printf("wifi: scan returned %d networks\n", n);
+  Serial.printf("wifi: starting sync scan, mode=%d status=%d\n",
+                (int)WiFi.getMode(), (int)WiFi.status());
+  uint32_t t0 = millis();
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  uint32_t dt = millis() - t0;
+  Serial.printf("wifi: scan done in %u ms, n=%d\n", (unsigned)dt, n);
+
   s_nets.clear();
-  for (int i = 0; i < n; ++i) {
-    Net net;
-    net.ssid = WiFi.SSID(i);
-    net.rssi = WiFi.RSSI(i);
-    net.enc  = WiFi.encryptionType(i);
-    if (net.ssid.length() > 0) s_nets.push_back(net);
+  if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      Net net;
+      net.ssid = WiFi.SSID(i);
+      net.rssi = WiFi.RSSI(i);
+      net.enc  = WiFi.encryptionType(i);
+      Serial.printf("  [%2d] %-32s rssi=%d enc=%d\n",
+                    i, net.ssid.c_str(), (int)net.rssi, (int)net.enc);
+      if (net.ssid.length() > 0) s_nets.push_back(net);
+    }
   }
   WiFi.scanDelete();
-  s_listScroll = 0;
+  s_listScroll   = 0;
+  s_scanInFlight = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -622,42 +629,18 @@ void wifiScreenTick() {
   switch (s_mode) {
     case MODE_SCANNING: {
       if (s_needFullDraw) {
+        // Paint the "scanning…" message FIRST, then flush by running the
+        // scan. Because the scan blocks for several seconds, we can't
+        // accept taps during it — the X appears frozen until the scan
+        // finishes. That's acceptable; it's the same cadence the boot
+        // scan uses and it always finds networks.
         drawCenteredMessage("scanning…", nullptr, C_ACCENT);
         s_needFullDraw = false;
-        if (!s_scanInFlight) kickScan();
-      }
-
-      // Allow cancelling while scan runs: a tap on the X button or any
-      // swipe back exits the Wi-Fi panel straight away.
-      int16_t tx, ty;
-      if (consumeTap(tx, ty) && closeButtonTapped(tx, ty)) {
-        WiFi.scanDelete();
-        s_scanInFlight = false;
-        s_wantHome = true;
-        break;
-      }
-
-      int res = WiFi.scanComplete();
-      if (res >= 0) {
-        ingestScanResults(res);
-        s_scanInFlight = false;
-        s_mode = MODE_LIST;
-        s_needFullDraw = true;
-      } else if (res == WIFI_SCAN_FAILED) {
-        Serial.println("wifi scan failed");
-        s_scanInFlight = false;
-        s_mode = MODE_LIST;
-        s_needFullDraw = true;
-      } else if (millis() - s_scanStartMs > 20000) {
-        // Safety net — scanComplete() has been seen to get stuck at -1.
-        Serial.println("wifi scan timed out");
-        WiFi.scanDelete();
-        s_scanInFlight = false;
+        s_scanInFlight = true;
+        runScan();                 // blocking; populates s_nets.
         s_mode = MODE_LIST;
         s_needFullDraw = true;
       }
-      // Otherwise keep rendering the "scanning…" screen; we just fall
-      // through and let the rest of loop() run (animation, touch, etc).
       break;
     }
 
