@@ -29,10 +29,14 @@
 
 static const char *TAG = "ui";
 
-// 40 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
-// 2 * 240 * 40 * 2 B = 38.4 KB. Comfortable next to the ~316 KB internal
-// heap free at boot; keeps LVGL's draw path DMA-fed without touching PSRAM.
-#define LVGL_BUF_LINES 40
+// 20 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
+// 2 * 240 * 20 * 2 B = 19.2 KB. The board has ~228 KB internal free at boot,
+// but by the time LVGL allocates buf2, fragmentation can break up the larger
+// contiguous runs — 40-line buffers crashed with "Not enough memory for buf2"
+// on real silicon, so we keep each buffer under 10 KB to stay well inside
+// whatever contiguous block the allocator has left. Trade-off: LVGL flushes
+// partials more often, but the SPI link at 80 MHz eats the extra calls.
+#define LVGL_BUF_LINES 20
 
 // --- navigation plumbed through callbacks ----------------------------------
 
