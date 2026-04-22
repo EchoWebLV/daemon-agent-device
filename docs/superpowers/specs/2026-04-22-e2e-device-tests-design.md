@@ -126,7 +126,7 @@ see what the device was saying when it broke).
 | `TEST WIFI STATUS`               | `TEST OK wifi <status> <ssid\|-> <rssi\|0>`                              | Connection state without scanning.                   |
 | `TEST WIFI SCAN`                 | `TEST OK wifi scan <n>` then `n` lines `TEST NET <ssid> <rssi> <enc>`    | Sync scan, full result set.                          |
 | `TEST WALLET PUBKEY`             | `TEST OK pubkey <base58>`                                                | On-device wallet address.                            |
-| `TEST WALLET BALANCE`            | `TEST OK balance <lamports>`                                             | Device's own view of SOL balance.                    |
+| `TEST WALLET BALANCE`            | `TEST OK balance <sol_float> <usdc_float>`                               | Device's own view of SOL + USDC balances. Floats match `walletSolBalance()` / `walletUsdcAmount()` — both already UI-scaled, so the host compares against `rpc.get_balance / 1e9`. |
 | `TEST AI PING`                   | `TEST OK ai <http_status> <latency_ms>` or `TEST ERR ai <reason>`        | Round-trip a trivial prompt through Gemini.          |
 | `TEST X402 CALL <url>`           | `TEST OK x402 <http_status> <paid_usdc_base> <latency_ms>`               | Drive one paid request end-to-end. `paid_usdc_base` is USDC in 6-decimal base units (e.g. 50000 = $0.05). |
 | anything else                    | `TEST ERR unknown <verb>`                                                | Never hang, always answer.                           |
@@ -149,14 +149,18 @@ from solana.rpc.api import Client
 
 BAUD = 115200
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
-# Real production URLs — these are the same endpoints the firmware hits
-# in normal use. Pulled from src/server.cpp / src/aiclient.cpp at
-# implementation time; keeping them in one place here so the runner
-# and the firmware never drift.
+# Real production URL. Only one endpoint is cleanly accessible as a
+# constant (LLM_ENDPOINT in src/ai.cpp); services.cpp builds catalog URLs
+# dynamically from NVS. We hit the same endpoint three times with
+# distinct prompts — this directly exercises blockhash freshness across
+# three consecutive paid transactions (see memory/MEMORY.md on the
+# blockhash-reuse regression). The firmware auto-selects POST with a
+# chat/completions body when the URL matches; anything else uses GET.
+_CHAT_URL = "https://sol.blockrun.ai/api/v1/chat/completions"
 X402_URLS = [
-    # ("quote",   "https://..."),
-    # ("image",   "https://..."),
-    # ("catalog", "https://..."),
+    ("chat1", _CHAT_URL),
+    ("chat2", _CHAT_URL),
+    ("chat3", _CHAT_URL),
 ]
 
 class Device:
@@ -347,7 +351,7 @@ device: /dev/cu.usbmodem101 (ESP32-S3)
 [PASS] wifi_scan_nonempty        (7 networks)
 [PASS] wifi_status_connected     (MyAP, -54 dBm)
 [PASS] wallet_pubkey_valid       (HN7cABP...LqgB)
-[PASS] wallet_balance_matches    (12_340_000 lamports)
+[PASS] wallet_balance_matches    (0.012340 SOL)
 [PASS] ai_ping                   (200, 1820 ms)
 [PASS] paint_under_budget        (max 31 ms)
 [SKIP] x402_payment_1            (--skip-x402)
