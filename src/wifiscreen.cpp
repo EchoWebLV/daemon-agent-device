@@ -623,6 +623,36 @@ void wifiScreenHandleSwipe(SwipeDir sw) {
   }
 }
 
+// Full repaint of the current mode's body. Called by the test harness via
+// `TEST SCREEN PAINT`. Mirrors the draw branches in wifiScreenTick() but
+// skips the side effects (no scan kickoff, no connect attempt). The
+// scanning mode just paints the "scanning…" placeholder — it's cheap and
+// reflects what the user would actually see mid-scan.
+void wifiScreenDraw() {
+  if (!s_tft) return;
+  switch (s_mode) {
+    case MODE_SCANNING:
+      drawCenteredMessage("scanning…", nullptr, C_ACCENT);
+      break;
+    case MODE_LIST:
+      drawList();
+      break;
+    case MODE_KEYBOARD:
+      drawPasswordField();
+      drawKeyboard();
+      break;
+    case MODE_CONNECTING:
+      drawCenteredMessage("connecting…", s_selectedSSID.c_str(), C_ACCENT);
+      break;
+    case MODE_RESULT:
+      // Result view is painted inside attemptConnection(); a repaint would
+      // require caching the last result text. Best-effort: redraw the list
+      // backdrop so the test still measures a concrete paint.
+      drawList();
+      break;
+  }
+}
+
 void wifiScreenTick() {
   if (!s_tft) return;
 

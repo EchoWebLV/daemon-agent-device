@@ -3,6 +3,13 @@
 // ============================================================================
 #include "testharness.h"
 
+#include "creature.h"
+#include "menuscreen.h"
+#include "walletscreen.h"
+#include "infoscreen.h"
+#include "settingsscreen.h"
+#include "wifiscreen.h"
+
 static bool   s_testMode = false;
 static String s_lineBuf;
 
@@ -82,6 +89,35 @@ static void handleLine(const String &line) {
                   ESP.getSdkVersion(),
                   buildDate.c_str(),
                   buildTime.c_str());
+    return;
+  }
+
+  // --- SCREEN GET / FORCE / PAINT ---------------------------------------
+  if (rest == "SCREEN GET") {
+    Serial.printf("TEST OK screen %s\n", mainScreenName());
+    return;
+  }
+  if (rest.startsWith("SCREEN FORCE ")) {
+    String name = rest.substring(strlen("SCREEN FORCE "));
+    if (!mainForceScreen(name.c_str())) {
+      Serial.printf("TEST ERR screen unknown %s\n", name.c_str());
+      return;
+    }
+    Serial.printf("TEST OK screen %s\n", mainScreenName());
+    return;
+  }
+  if (rest == "SCREEN PAINT") {
+    uint32_t t0 = millis();
+    // Re-enter the current screen's Draw path to force a repaint of the
+    // body. Avoids the ~220 ms slide-in: we call Draw() directly.
+    const char *cur = mainScreenName();
+    if      (!strcmp(cur, "creature")) creatureRepaint();
+    else if (!strcmp(cur, "menu"))     menuScreenDraw();
+    else if (!strcmp(cur, "wallet"))   walletScreenDraw();
+    else if (!strcmp(cur, "info"))     infoScreenDraw();
+    else if (!strcmp(cur, "settings")) settingsScreenDraw();
+    else if (!strcmp(cur, "wifi"))     wifiScreenDraw();
+    Serial.printf("TEST OK paint %u\n", (unsigned)(millis() - t0));
     return;
   }
 

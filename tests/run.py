@@ -156,6 +156,39 @@ def c_version_reports(dev: Device) -> str:
     return f"({sdk}, built {date} {time_s})"
 
 
+SCREENS = ["creature", "menu", "wallet", "info", "settings", "wifi"]
+
+
+def c_screen_roundtrip(dev: Device) -> str:
+    """For every known screen: FORCE, then GET, confirm the state changed."""
+    for name in SCREENS:
+        resp = dev.send(f"TEST SCREEN FORCE {name}", timeout=3.0)
+        assert resp and resp[0].endswith(name), f"force {name}: {resp}"
+        # Confirm via a separate GET so we're not trusting the FORCE reply.
+        resp = dev.send("TEST SCREEN GET", timeout=2.0)
+        got = resp[0].split()[-1]
+        assert got == name, f"GET after FORCE {name} returned {got}"
+    return f"({len(SCREENS)}/{len(SCREENS)} screens)"
+
+
+def c_paint_under_budget(dev: Device) -> str:
+    """Each screen's full repaint must finish under 60 ms. The wifi screen
+    gets a longer settle because its first tick kicks off a blocking scan;
+    by the time PAINT lands the scan has completed and MODE_LIST is up."""
+    worst = 0
+    for name in SCREENS:
+        dev.send(f"TEST SCREEN FORCE {name}", timeout=3.0)
+        # Wi-Fi's first tick blocks in scanNetworks(); give it room.
+        settle = 5.0 if name == "wifi" else 0.25
+        time.sleep(settle)
+        resp = dev.send("TEST SCREEN PAINT", timeout=6.0)
+        ms = int(resp[0].split()[-1])
+        assert ms < 60, f"{name} repaint took {ms} ms (budget 60)"
+        if ms > worst:
+            worst = ms
+    return f"(max {worst} ms)"
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -185,6 +218,8 @@ def main() -> int:
         ("liveness",            c_liveness),
         ("boot_heap_ok",        c_boot_heap_ok),
         ("version_reports",     c_version_reports),
+        ("screen_roundtrip",    c_screen_roundtrip),
+        ("paint_under_budget",  c_paint_under_budget),
         # Later tasks insert cases here in protocol order.
     ]
 

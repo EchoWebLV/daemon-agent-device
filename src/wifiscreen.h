@@ -19,6 +19,11 @@ void wifiScreenEnter();
 // Called each frame while active.
 void wifiScreenTick();
 
+// Full repaint of whatever mode is currently active. Used by the test
+// harness to exercise the paint path; a no-op for modes whose draw
+// functions aren't cheap to call on demand (e.g. while scanning).
+void wifiScreenDraw();
+
 // Feed swipe events in. The Wi-Fi screen handles them contextually:
 // swipes inside the keyboard / connecting / result modes go back to the
 // network-picker list; swipes on the list itself exit the whole panel.
