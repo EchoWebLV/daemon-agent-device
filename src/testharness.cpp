@@ -216,6 +216,18 @@ void testHarnessHandleLine(const String &line) {
       body += String(callSeq);
       body += "\"}]}";
       r = x402Post(url, body);
+    } else if (url.indexOf("/api/call") >= 0) {
+      // Shannon-style paid endpoint (GET/POST /api/call). Sends the
+      // minimal JSON body the server documents; the ping-<seq> token
+      // keeps every call's payload distinct so the x402 layer signs a
+      // fresh blockhash each time (same rationale as the chat case —
+      // see memory/MEMORY.md).
+      String body;
+      body.reserve(64);
+      body  = "{\"message\":\"ping ";
+      body += String(callSeq);
+      body += "\"}";
+      r = x402Post(url, body);
     } else {
       r = x402Get(url);
     }

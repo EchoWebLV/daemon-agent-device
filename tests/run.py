@@ -23,17 +23,23 @@ from solders.pubkey import Pubkey
 BAUD = 115200
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
 
-# Real paid endpoints pulled from the firmware source.
-# Only one URL is cleanly accessible as a constant (LLM_ENDPOINT in
-# src/ai.cpp); services.cpp builds catalog URLs dynamically from NVS.
-# We hit the chat endpoint three times with distinct prompts so each
-# call signs a fresh blockhash — direct coverage for the bug documented
-# in memory/MEMORY.md (cached blockhashes → duplicate-signature tx).
-_CHAT_URL = "https://sol.blockrun.ai/api/v1/chat/completions"
-X402_URLS: List[Tuple[str, str]] = [
-    ("chat1", _CHAT_URL),
-    ("chat2", _CHAT_URL),
-    ("chat3", _CHAT_URL),
+# Real paid endpoints. Each tuple is (label, url, min_uusdc, max_uusdc)
+# where the µUSDC range is what the endpoint is expected to charge per
+# call — tight enough to catch "payment not accounted" regressions
+# (floor) without false-positiving on an endpoint whose price rises a
+# bit (ceiling at $1).
+#
+# The three chat hits exist so each call signs a fresh blockhash — direct
+# coverage for the bug documented in memory/MEMORY.md (cached blockhashes
+# → duplicate-signature tx). Shannon gets one hit at its documented
+# $0.00003 price point to cover a second x402 implementation.
+_CHAT_URL    = "https://sol.blockrun.ai/api/v1/chat/completions"
+_SHANNON_URL = "https://daemon-x402s-seven.vercel.app/api/call"
+X402_URLS: List[Tuple[str, str, int, int]] = [
+    ("chat1",   _CHAT_URL,       1_000, 1_000_000),   # ~$0.0027 observed
+    ("chat2",   _CHAT_URL,       1_000, 1_000_000),
+    ("chat3",   _CHAT_URL,       1_000, 1_000_000),
+    ("shannon", _SHANNON_URL,       10, 1_000_000),   # ~$0.00003 documented
 ]
 
 
@@ -374,10 +380,15 @@ def _usdc_precondition(dev: Device) -> Optional[str]:
     return None
 
 
-def _make_x402_case(label: str, url: str) -> Callable[[Device], str]:
+def _make_x402_case(
+    label: str, url: str, min_uusdc: int, max_uusdc: int,
+) -> Callable[[Device], str]:
     """Build a case function that sends TEST X402 CALL <url>, with a
     pre-flight USDC balance check that SKIPs (not fails) the case if the
-    wallet is short."""
+    wallet is short. `min_uusdc` / `max_uusdc` bracket the endpoint's
+    expected price in µUSDC (6-decimal base units) — tight enough to
+    catch "payment not accounted" regressions without tripping on small
+    price changes."""
     def fn(dev: Device) -> str:
         skip = _usdc_precondition(dev)
         if skip:
@@ -392,13 +403,12 @@ def _make_x402_case(label: str, url: str) -> Callable[[Device], str]:
         paid_base  = int(resp[4])
         latency_ms = int(resp[5])
         assert status == 200, f"http {status}"
-        # $0.001–$1.00 inclusive. The blockrun.ai chat endpoint bills
-        # ~$0.0027 per small prompt in practice, and any payment below
-        # $0.001 is either free-tier or mis-accounted; above $1.00 would
-        # be a mis-priced endpoint that we do NOT want the device paying.
-        assert 1_000 <= paid_base <= 1_000_000, (
-            f"paid {paid_base} uUSDC is out of range")
-        return f"({status}, ${paid_base / 1e6:.4f}, {latency_ms} ms)"
+        assert min_uusdc <= paid_base <= max_uusdc, (
+            f"paid {paid_base} uUSDC out of range "
+            f"[{min_uusdc}, {max_uusdc}]")
+        # 5 decimals so sub-cent prices (e.g. Shannon at $0.00003) stay
+        # visible instead of rounding to $0.0000.
+        return f"({status}, ${paid_base / 1e6:.5f}, {latency_ms} ms)"
     fn.__name__ = f"c_x402_{label}"
     return fn
 
@@ -443,8 +453,8 @@ def main() -> int:
         ("wallet_balance_matches", lambda d: c_wallet_balance_matches(d, args.rpc)),
         ("ai_ping",               c_ai_ping),
         *[
-            (f"x402_payment_{i + 1}", _make_x402_case(label, url))
-            for i, (label, url) in enumerate(X402_URLS)
+            (f"x402_{label}", _make_x402_case(label, url, lo, hi))
+            for (label, url, lo, hi) in X402_URLS
         ],
     ]
 
