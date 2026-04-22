@@ -19,6 +19,7 @@
 
 #include "display.h"
 #include "ui.h"
+#include "touch.h"
 
 static const char *TAG = "daemon";
 
@@ -53,6 +54,10 @@ void app_main(void) {
     // overdrawn by LVGL's first frame, but keeping it around means we still
     // get a "display is alive" signal even if LVGL itself fails to start.
     ESP_ERROR_CHECK(ui_init());
+
+    // CST328 touch → LVGL pointer input. Must come after ui_init() because
+    // it binds to lv_display_get_default().
+    ESP_ERROR_CHECK(touch_init());
 
     uint32_t tick = 0;
     while (true) {

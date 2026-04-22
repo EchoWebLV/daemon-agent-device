@@ -9,14 +9,20 @@ idf_component_register(
         "app_main.c"
         "display.c"
         "ui.c"
+        "touch.c"
     INCLUDE_DIRS
         "."
     REQUIRES
-        # ST7789 bring-up over SPI.
+        # ST7789 bring-up over SPI; CST328 bring-up over I2C master.
         esp_lcd
         driver
+        esp_driver_i2c
         # LVGL + the IDF port layer that glues it to esp_lcd.
         # Pulled in via src/idf_component.yml.
         lvgl
         esp_lvgl_port
+        # CST328 touch controller + the esp_lcd_touch abstraction it
+        # plugs into. Both pulled in via src/idf_component.yml.
+        esp_lcd_touch
+        esp_lcd_touch_cst328
 )

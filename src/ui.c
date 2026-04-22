@@ -5,12 +5,29 @@
 #include "ui.h"
 #include "display.h"
 
+#include <inttypes.h>
+
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 
 static const char *TAG = "ui";
+
+// Tap counter on the hello screen. Lets the touch bring-up have a visible,
+// end-to-end "did LVGL see that finger?" signal. Keeping the state here
+// instead of in touch.c keeps the boundary clean: touch.c talks to the
+// CST328; ui.c owns widgets.
+static uint32_t s_tap_count = 0;
+static lv_obj_t *s_tap_label = NULL;
+
+static void hello_btn_clicked(lv_event_t *e) {
+    (void)e;
+    s_tap_count++;
+    if (s_tap_label) {
+        lv_label_set_text_fmt(s_tap_label, "Taps: %" PRIu32, s_tap_count);
+    }
+}
 
 // 40 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
 // 2 * 240 * 40 * 2 B = 38.4 KB — comfortable next to the ~316 KB free heap
@@ -57,12 +74,32 @@ esp_err_t ui_init(void) {
         lv_obj_t *title = lv_label_create(scr);
         lv_label_set_text(title, "Daemon");
         lv_obj_set_style_text_color(title, lv_color_hex(0xE6E6FA), LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_CENTER, 0, -14);
+        lv_obj_align(title, LV_ALIGN_CENTER, 0, -60);
 
         lv_obj_t *sub = lv_label_create(scr);
         lv_label_set_text(sub, "LVGL v9 on ESP-IDF 5.5");
         lv_obj_set_style_text_color(sub, lv_color_hex(0x7A9BFF), LV_PART_MAIN);
-        lv_obj_align(sub, LV_ALIGN_CENTER, 0, 12);
+        lv_obj_align(sub, LV_ALIGN_CENTER, 0, -38);
+
+        // Big tappable button so touch regressions show up immediately.
+        // Click handler bumps a counter; label below reflects it.
+        lv_obj_t *btn = lv_button_create(scr);
+        lv_obj_set_size(btn, 160, 60);
+        lv_obj_align(btn, LV_ALIGN_CENTER, 0, 10);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1E3A8A), LV_PART_MAIN);
+        lv_obj_add_event_cb(btn, hello_btn_clicked, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *btn_label = lv_label_create(btn);
+        lv_label_set_text(btn_label, "Tap me");
+        lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF),
+                                    LV_PART_MAIN);
+        lv_obj_center(btn_label);
+
+        s_tap_label = lv_label_create(scr);
+        lv_label_set_text(s_tap_label, "Taps: 0");
+        lv_obj_set_style_text_color(s_tap_label, lv_color_hex(0xCBD5E1),
+                                    LV_PART_MAIN);
+        lv_obj_align(s_tap_label, LV_ALIGN_CENTER, 0, 70);
 
         lvgl_port_unlock();
     }
