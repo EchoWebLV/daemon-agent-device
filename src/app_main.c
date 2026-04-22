@@ -117,7 +117,22 @@ void app_main(void) {
     // Cadence for periodic pulls. 30 s matches the Arduino build.
     const uint32_t WALLET_REFRESH_EVERY_MS = 60000;
     const uint32_t PRICE_REFRESH_EVERY_MS  = 30000;
-    uint32_t last_wallet = 0, last_price = 0;
+    const uint32_t UI_REFRESH_EVERY_MS     = 5000;   // redraw wallet/settings
+    uint32_t last_wallet = 0, last_price = 0, last_ui_refresh = 0;
+
+    // Seed the UI with the IP so the creature status shows "idle: 192.168…"
+    // even before the first tick.
+    {
+        char ip[16] = {0};
+        wifi_sta_ip_str(ip, sizeof(ip));
+        if (ip[0]) {
+            char s[32];
+            snprintf(s, sizeof(s), "%s", ip);
+            ui_set_status(s);
+        } else {
+            ui_set_status(wifi_sta_is_connected() ? "online" : "offline");
+        }
+    }
 
     uint32_t tick = 0;
     while (true) {
@@ -138,10 +153,22 @@ void app_main(void) {
             }
         }
 
-        char price_str[16];
-        char usdc_str[16];
+        char price_str[24];
+        char usdc_str[24];
         price_display_string(price_str, sizeof(price_str));
         wallet_usdc_display_string(usdc_str, sizeof(usdc_str));
+
+        // Push status-bar values to every screen so the ticker stays
+        // current regardless of which screen the user is looking at.
+        ui_set_price(price_str);
+        ui_set_usdc(usdc_str);
+        if (ip[0]) ui_set_status(ip);
+
+        if (now_ms - last_ui_refresh >= UI_REFRESH_EVERY_MS) {
+            ui_refresh_wallet();
+            ui_refresh_settings();
+            last_ui_refresh = now_ms;
+        }
 
         ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u  lw=%u  ip=%s  %s  %s",
                  tick++, (unsigned)free_total, (unsigned)free_min,

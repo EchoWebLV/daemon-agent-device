@@ -10,7 +10,9 @@
 #include "devcfg.h"
 #include "secrets.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 #include "esp_check.h"
 #include "esp_event.h"
@@ -34,6 +36,8 @@ static esp_netif_t      *s_netif        = NULL;
 static EventGroupHandle_t s_events      = NULL;
 static int               s_retries      = 0;
 static esp_ip4_addr_t    s_ip           = { 0 };
+static char              s_ssid[33]     = "";    // current association
+static int8_t            s_rssi         = 0;
 
 // --- Event handling ---------------------------------------------------------
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -55,6 +59,13 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
         s_ip        = evt->ip_info.ip;
         s_retries   = 0;
         s_connected = true;
+        // Record SSID + RSSI at the moment the IP lands so the settings
+        // screen doesn't have to poll the driver every frame.
+        wifi_ap_record_t ap = {0};
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            strlcpy(s_ssid, (const char *)ap.ssid, sizeof(s_ssid));
+            s_rssi = ap.rssi;
+        }
         ESP_LOGI(TAG, "got IP: " IPSTR, IP2STR(&s_ip));
         xEventGroupSetBits(s_events, CONNECTED_BIT);
     }
@@ -177,4 +188,95 @@ void wifi_sta_ip_str(char *out, size_t cap) {
     if (cap == 0) return;
     if (!s_connected) { out[0] = '\0'; return; }
     snprintf(out, cap, IPSTR, IP2STR(&s_ip));
+}
+
+const char *wifi_sta_current_ssid(void) { return s_connected ? s_ssid : ""; }
+int8_t       wifi_sta_current_rssi(void) { return s_connected ? s_rssi : 0;  }
+
+// ---------------------------------------------------------------------------
+// Scan: blocking, de-duplicated, RSSI-sorted.
+// ---------------------------------------------------------------------------
+size_t wifi_sta_scan(wifi_sta_scan_ap_t *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    if (!s_driver_ready) {
+        ESP_LOGW(TAG, "scan before init");
+        return 0;
+    }
+
+    // The driver requires the STA interface to be started. wifi_sta_connect
+    // calls esp_wifi_start on first attempt; if we've never connected we
+    // have to start it ourselves. Ignoring "already started" is fine.
+    esp_err_t start_err = esp_wifi_start();
+    if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_NOT_STOPPED) {
+        ESP_LOGW(TAG, "scan: wifi_start: %s", esp_err_to_name(start_err));
+        return 0;
+    }
+
+    wifi_scan_config_t scan_cfg = {0};   // default: active, all channels, 120 ms/ch
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, /*block=*/true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(err));
+        return 0;
+    }
+
+    uint16_t n_found = 0;
+    esp_wifi_scan_get_ap_num(&n_found);
+    if (n_found == 0) {
+        ESP_LOGI(TAG, "scan: 0 APs visible");
+        return 0;
+    }
+
+    // Pull up to 32 raw records from the driver so we have a reasonable
+    // dedupe pool even when the caller only asked for a handful.
+    const uint16_t RAW_CAP = 32;
+    wifi_ap_record_t *raw = calloc(RAW_CAP, sizeof(*raw));
+    if (!raw) {
+        ESP_LOGW(TAG, "scan: oom (%u records)", (unsigned)n_found);
+        esp_wifi_clear_ap_list();
+        return 0;
+    }
+    uint16_t got = (n_found < RAW_CAP) ? n_found : RAW_CAP;
+    esp_wifi_scan_get_ap_records(&got, raw);
+
+    // Dedupe: prefer the strongest RSSI for each SSID. Case-sensitive match
+    // — some APs advertise the same SSID with different capitalisation and
+    // the user really has chosen one or the other.
+    size_t n_out = 0;
+    for (uint16_t i = 0; i < got && n_out < cap; ++i) {
+        const char *ssid = (const char *)raw[i].ssid;
+        if (ssid[0] == '\0') continue;  // skip hidden networks
+
+        // Already seen?
+        ssize_t dupe = -1;
+        for (size_t j = 0; j < n_out; ++j) {
+            if (strncmp(out[j].ssid, ssid, sizeof(out[j].ssid)) == 0) { dupe = (ssize_t)j; break; }
+        }
+        if (dupe >= 0) {
+            if (raw[i].rssi > out[dupe].rssi) out[dupe].rssi = raw[i].rssi;
+            continue;
+        }
+
+        strlcpy(out[n_out].ssid, ssid, sizeof(out[n_out].ssid));
+        out[n_out].rssi      = raw[i].rssi;
+        out[n_out].auth_open = (raw[i].authmode == WIFI_AUTH_OPEN) ? 1 : 0;
+        n_out++;
+    }
+    free(raw);
+    esp_wifi_clear_ap_list();
+
+    // Sort by RSSI descending (strongest first). n_out is small enough
+    // that bubble-sort is fine — no need for qsort's indirection.
+    for (size_t i = 0; i + 1 < n_out; ++i) {
+        for (size_t j = 0; j + 1 + i < n_out; ++j) {
+            if (out[j].rssi < out[j + 1].rssi) {
+                wifi_sta_scan_ap_t tmp = out[j];
+                out[j] = out[j + 1];
+                out[j + 1] = tmp;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "scan: %u dedup'd APs (from %u raw / %u total)",
+             (unsigned)n_out, (unsigned)got, (unsigned)n_found);
+    return n_out;
 }

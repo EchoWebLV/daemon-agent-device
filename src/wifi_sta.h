@@ -51,6 +51,28 @@ bool wifi_sta_is_connected(void);
 // "192.168.1.17"). Returns "" when not connected. `cap` must be >= 16.
 void wifi_sta_ip_str(char *out, size_t cap);
 
+// SSID of the currently-associated AP, or "" if not connected. Pointer
+// valid until the next (re)connect.
+const char *wifi_sta_current_ssid(void);
+
+// Signal strength of the currently-associated AP, or 0 if not connected.
+int8_t wifi_sta_current_rssi(void);
+
+// Blocking AP scan. Fills `out` with up to `cap` entries; returns the
+// number written (0..cap). The driver's own result list can be longer
+// — we just truncate to fit the caller's array. Duplicates (same SSID
+// seen on multiple channels) are collapsed, keeping the strongest RSSI.
+// Safe to call while connected; the radio briefly leaves the BSS but
+// auto-rejoins when the scan ends. Blocks ~2-3 s for the default active
+// scan sweep across all 2.4 GHz channels.
+typedef struct {
+    char    ssid[33];       // NUL-terminated, up to 32 bytes
+    int8_t  rssi;           // dBm (negative)
+    uint8_t auth_open;      // 1 if WIFI_AUTH_OPEN, else 0 (WPA/WPA2/etc.)
+} wifi_sta_scan_ap_t;
+
+size_t wifi_sta_scan(wifi_sta_scan_ap_t *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

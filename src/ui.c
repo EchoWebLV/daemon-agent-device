@@ -1,9 +1,21 @@
 // ---------------------------------------------------------------------------
-//  LVGL bring-up — ties esp_lvgl_port to the already-initialised ST7789
-//  panel and drops a hello label on the root screen. See ui.h.
+//  LVGL bring-up + screen wiring.
+//
+//  Owns:
+//    • esp_lvgl_port startup + display attach
+//    • the four Daemon screens (creature / wallet / settings / wifi)
+//    • the cross-screen broadcast of status/price/usdc labels
+//
+//  Navigation today is limited: boot shows creature, settings' Wi-Fi row
+//  navigates to wifi_screen, and a successful connect returns to settings.
+//  Swipe-based screen cycling comes with the phase-7 integration pass.
 // ---------------------------------------------------------------------------
 #include "ui.h"
 #include "display.h"
+#include "creature_screen.h"
+#include "wallet_screen.h"
+#include "settings_screen.h"
+#include "wifi_screen.h"
 
 #include <inttypes.h>
 
@@ -14,26 +26,26 @@
 
 static const char *TAG = "ui";
 
-// Tap counter on the hello screen. Lets the touch bring-up have a visible,
-// end-to-end "did LVGL see that finger?" signal. Keeping the state here
-// instead of in touch.c keeps the boundary clean: touch.c talks to the
-// CST328; ui.c owns widgets.
-static uint32_t s_tap_count = 0;
-static lv_obj_t *s_tap_label = NULL;
+// 40 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
+// 2 * 240 * 40 * 2 B = 38.4 KB. Comfortable next to the ~316 KB internal
+// heap free at boot; keeps LVGL's draw path DMA-fed without touching PSRAM.
+#define LVGL_BUF_LINES 40
 
-static void hello_btn_clicked(lv_event_t *e) {
-    (void)e;
-    s_tap_count++;
-    if (s_tap_label) {
-        lv_label_set_text_fmt(s_tap_label, "Taps: %" PRIu32, s_tap_count);
-    }
+// --- navigation plumbed through callbacks ----------------------------------
+
+static void nav_go_to_wifi(void) {
+    ui_show_wifi();
+    wifi_screen_kick_scan();
 }
 
-// 40 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
-// 2 * 240 * 40 * 2 B = 38.4 KB — comfortable next to the ~316 KB free heap
-// we had at boot. PSRAM would work too but internal RAM is faster and the
-// buffer is small enough to keep there.
-#define LVGL_BUF_LINES 40
+static void nav_wifi_connected(void) {
+    // Wi-Fi picker bounces back to settings so the user sees the newly-
+    // connected SSID in the Wi-Fi row.
+    ui_show_settings();
+    settings_screen_refresh();
+}
+
+// --- public API ------------------------------------------------------------
 
 esp_err_t ui_init(void) {
     // --- LVGL task: runs lv_timer_handler every ~5 ms on core 1, prio 2. ----
@@ -65,42 +77,20 @@ esp_err_t ui_init(void) {
     lv_display_t *disp = lvgl_port_add_disp(&disp_cfg);
     ESP_RETURN_ON_FALSE(disp, ESP_FAIL, TAG, "lvgl_port_add_disp");
 
-    // --- Hello screen. LVGL isn't thread-safe; use the port mutex. ----------
+    // --- Screens. Each module locks the port mutex itself; we just call
+    //     the init entry points in order and load the creature on top. -----
+    ESP_RETURN_ON_FALSE(creature_screen_init(), ESP_FAIL, TAG, "creature_screen_init");
+    ESP_RETURN_ON_FALSE(wallet_screen_init(),   ESP_FAIL, TAG, "wallet_screen_init");
+    ESP_RETURN_ON_FALSE(settings_screen_init(), ESP_FAIL, TAG, "settings_screen_init");
+    ESP_RETURN_ON_FALSE(wifi_screen_init(),     ESP_FAIL, TAG, "wifi_screen_init");
+
+    // Wire the two explicit transitions the screens themselves trigger.
+    settings_screen_on_wifi_click(nav_go_to_wifi);
+    wifi_screen_on_connected(nav_wifi_connected);
+
+    // Land on the creature.
     if (lvgl_port_lock(0)) {
-        lv_obj_t *scr = lv_screen_active();
-        lv_obj_set_style_bg_color(scr, lv_color_hex(0x001428), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(scr,   LV_OPA_COVER,             LV_PART_MAIN);
-
-        lv_obj_t *title = lv_label_create(scr);
-        lv_label_set_text(title, "Daemon");
-        lv_obj_set_style_text_color(title, lv_color_hex(0xE6E6FA), LV_PART_MAIN);
-        lv_obj_align(title, LV_ALIGN_CENTER, 0, -60);
-
-        lv_obj_t *sub = lv_label_create(scr);
-        lv_label_set_text(sub, "LVGL v9 on ESP-IDF 5.5");
-        lv_obj_set_style_text_color(sub, lv_color_hex(0x7A9BFF), LV_PART_MAIN);
-        lv_obj_align(sub, LV_ALIGN_CENTER, 0, -38);
-
-        // Big tappable button so touch regressions show up immediately.
-        // Click handler bumps a counter; label below reflects it.
-        lv_obj_t *btn = lv_button_create(scr);
-        lv_obj_set_size(btn, 160, 60);
-        lv_obj_align(btn, LV_ALIGN_CENTER, 0, 10);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1E3A8A), LV_PART_MAIN);
-        lv_obj_add_event_cb(btn, hello_btn_clicked, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t *btn_label = lv_label_create(btn);
-        lv_label_set_text(btn_label, "Tap me");
-        lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF),
-                                    LV_PART_MAIN);
-        lv_obj_center(btn_label);
-
-        s_tap_label = lv_label_create(scr);
-        lv_label_set_text(s_tap_label, "Taps: 0");
-        lv_obj_set_style_text_color(s_tap_label, lv_color_hex(0xCBD5E1),
-                                    LV_PART_MAIN);
-        lv_obj_align(s_tap_label, LV_ALIGN_CENTER, 0, 70);
-
+        lv_screen_load(creature_screen());
         lvgl_port_unlock();
     }
 
@@ -108,4 +98,83 @@ esp_err_t ui_init(void) {
              DISPLAY_WIDTH, DISPLAY_HEIGHT,
              (unsigned)(2 * DISPLAY_WIDTH * LVGL_BUF_LINES * 2 / 1024));
     return ESP_OK;
+}
+
+// --- screen switchers ------------------------------------------------------
+
+void ui_show_creature(void) {
+    if (lvgl_port_lock(0)) {
+        lv_screen_load(creature_screen());
+        lvgl_port_unlock();
+    }
+}
+
+void ui_show_wallet(void) {
+    if (lvgl_port_lock(0)) {
+        lv_screen_load(wallet_screen());
+        lvgl_port_unlock();
+    }
+    wallet_screen_refresh();
+}
+
+void ui_show_settings(void) {
+    if (lvgl_port_lock(0)) {
+        lv_screen_load(settings_screen());
+        lvgl_port_unlock();
+    }
+    settings_screen_refresh();
+}
+
+void ui_show_wifi(void) {
+    if (lvgl_port_lock(0)) {
+        lv_screen_load(wifi_screen());
+        lvgl_port_unlock();
+    }
+}
+
+// --- broadcasts ------------------------------------------------------------
+
+void ui_set_status(const char *s) {
+    creature_screen_set_status(s);
+    wallet_screen_set_status(s);
+    settings_screen_set_status(s);
+    wifi_screen_set_status(s);
+}
+
+void ui_set_price(const char *s) {
+    creature_screen_set_price(s);
+    wallet_screen_set_price(s);
+    settings_screen_set_price(s);
+    wifi_screen_set_price(s);
+}
+
+void ui_set_usdc(const char *s) {
+    creature_screen_set_usdc(s);
+    wallet_screen_set_usdc(s);
+    settings_screen_set_usdc(s);
+    wifi_screen_set_usdc(s);
+}
+
+void ui_set_subtitle(const char *s) {
+    creature_screen_set_subtitle(s);
+}
+
+void ui_set_mood(ui_mood_t m) {
+    creature_screen_set_mood((creature_mood_t)m);
+}
+
+void ui_set_talking(bool on) {
+    creature_screen_set_talking(on);
+}
+
+void ui_tick(void) {
+    creature_screen_tick();
+}
+
+void ui_refresh_wallet(void) {
+    wallet_screen_refresh();
+}
+
+void ui_refresh_settings(void) {
+    settings_screen_refresh();
 }
