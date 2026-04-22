@@ -394,6 +394,13 @@ def main() -> int:
     print("-> TEST BEGIN\n")
     try:
         passed = failed = skipped = 0
+
+        # Bracket the case loop with a heap reading so heap_no_leak can
+        # flag long-running leaks that wouldn't show up in any single
+        # case. It's inline (not a case in the list) because it depends
+        # on every earlier case running first.
+        heap_before = int(dev.send("TEST HEAP", timeout=2.0)[0].split()[3])
+
         for name, fn in cases:
             if args.only and args.only not in name:
                 continue
@@ -406,6 +413,23 @@ def main() -> int:
                 passed += 1
             else:
                 failed += 1
+
+        # heap_no_leak: full-suite free-heap delta. Budget ±20 KB; bigger
+        # drift typically means an unfreed String or JsonDocument. --only
+        # filters skip this because partial runs won't hit a leak path.
+        heap_after = int(dev.send("TEST HEAP", timeout=2.0)[0].split()[3])
+        delta = heap_after - heap_before
+        if args.only is None:
+            if abs(delta) < 20 * 1024:
+                print(f"[PASS] {'heap_no_leak':<26}  (delta {delta:+d} B)")
+                passed += 1
+            else:
+                print(f"[FAIL] {'heap_no_leak':<26}  (delta {delta:+d} B; budget +/-20 KB)")
+                failed += 1
+        else:
+            print(f"[SKIP] {'heap_no_leak':<26}  (--only filter active)")
+            skipped += 1
+
         print(f"\n{passed} passed, {failed} failed, {skipped} skipped")
         return 0 if failed == 0 else 1
     finally:
