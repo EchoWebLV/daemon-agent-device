@@ -3,9 +3,8 @@
 #include "testharness.h"   // testHarnessInTestMode() — mutes audio during tests
 
 #include <Audio.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <LittleFS.h>
+#include <WiFi.h>
+#include <LittleFS.h>      // still mounted for other callers (logs, tts cache)
 #include <driver/i2s.h>
 
 // ---------------------------------------------------------------------------
@@ -15,12 +14,11 @@ static constexpr int I2S_BCLK = 48;
 static constexpr int I2S_LRC  = 38;
 static constexpr int I2S_DOUT = 47;
 
-// ElevenLabs response cached into LittleFS and played back through the
-// Audio library's proven connecttoFS path. This is a known-working flow;
-// the streaming-direct-to-decoder patch had a premature EOF bug in the
-// library's chunked reader that cut audio off after ~6 KB.
-static constexpr const char *TTS_FS_PATH = "/tts.mp3";
-
+// Streaming path via the library's injected connecttoElevenlabs() method
+// (see patches/audio_elevenlabs_patch.py). The HTTPS POST opens, and the
+// MP3 response body is piped straight into Helix → I2S as the bytes
+// arrive — no LittleFS round-trip, no "wait for full download before
+// first sample" dead air.
 static Audio       *s_audio      = nullptr;
 static TaskHandle_t s_audioTask  = nullptr;
 static volatile bool s_ready     = false;
@@ -100,90 +98,6 @@ static void audioTaskEntry(void *) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON escape (defensive for quotes / newlines in Daemon's replies)
-// ---------------------------------------------------------------------------
-static String jsonEscape(const String &in) {
-  String out;
-  out.reserve(in.length() + 16);
-  for (size_t i = 0; i < in.length(); ++i) {
-    char c = in[i];
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
-      default:   if ((uint8_t)c >= 0x20) out += c;
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Blocking fetch: POST → ElevenLabs → MP3 → LittleFS
-// ---------------------------------------------------------------------------
-static bool fetchMp3ToFs(const String &text) {
-  if (String(ELEVENLABS_API_KEY).startsWith("PASTE-") ||
-      strlen(ELEVENLABS_API_KEY) < 10) {
-    Serial.println("voice: no ElevenLabs key configured");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("voice: no wifi");
-    return false;
-  }
-
-  String url = "https://api.elevenlabs.io/v1/text-to-speech/";
-  url += ELEVENLABS_VOICE_ID;
-  url += "/stream?output_format=mp3_44100_128";
-
-  String body = "{\"text\":\"";
-  body += jsonEscape(text);
-  body += "\",\"model_id\":\"";
-  body += ELEVENLABS_MODEL;
-  body += "\",\"voice_settings\":{\"stability\":0.45,\"similarity_boost\":0.8,"
-          "\"style\":0.3,\"use_speaker_boost\":true}}";
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(25000);
-  if (!http.begin(client, url)) {
-    Serial.println("voice: http.begin failed");
-    return false;
-  }
-  http.addHeader("xi-api-key",   ELEVENLABS_API_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept",       "audio/mpeg");
-
-  uint32_t t0 = millis();
-  int code = http.POST(body);
-  if (code != 200) {
-    String err = http.getString();
-    Serial.printf("voice: HTTP %d from ElevenLabs: %s\n", code, err.c_str());
-    http.end();
-    return false;
-  }
-
-  File f = LittleFS.open(TTS_FS_PATH, FILE_WRITE);
-  if (!f) {
-    Serial.println("voice: LittleFS open failed");
-    http.end();
-    return false;
-  }
-  int written = http.writeToStream(&f);
-  f.close();
-  http.end();
-  if (written <= 0) {
-    Serial.printf("voice: writeToStream failed (%d)\n", written);
-    return false;
-  }
-  Serial.printf("voice: %d bytes MP3 in %lu ms\n",
-                written, (unsigned long)(millis() - t0));
-  return true;
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 bool voiceBegin() {
@@ -233,18 +147,41 @@ bool voiceSpeak(const String &text) {
   // core-0 prints scramble the single-line TEST replies.
   if (testHarnessInTestMode()) return false;
 
-  if (s_audio->isRunning()) s_audio->stopSong();
+  if (String(ELEVENLABS_API_KEY).startsWith("PASTE-") ||
+      strlen(ELEVENLABS_API_KEY) < 10) {
+    Serial.println("voice: no ElevenLabs key configured");
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("voice: no wifi");
+    return false;
+  }
 
-  if (!fetchMp3ToFs(text)) return false;
+  if (s_audio->isRunning()) s_audio->stopSong();
 
   // Start playback at volume 0 to hide the audible click produced by the
   // I2S/DAC state change when the decoder kicks in. The Audio library's
   // setVolume is a cheap gain field — the audio task on core 0 picks up
   // the new value on the next DMA chunk, so we can ramp from the main
   // thread with small blocking delays.
+  //
+  // With the streaming path, connecttoElevenlabs() returns as soon as the
+  // POST has been written and the server's response headers are being
+  // read. The first decoded PCM frame typically lands 150–300 ms later,
+  // so this ramp is running during that "almost-but-not-quite-speaking"
+  // window and hides both the DAC pop and the initial decoder jitter.
   const uint8_t target = s_targetVol;
   s_audio->setVolume(0);
-  bool ok = s_audio->connecttoFS(LittleFS, TTS_FS_PATH);
+
+  uint32_t t0 = millis();
+  bool ok = s_audio->connecttoElevenlabs(
+      ELEVENLABS_VOICE_ID,
+      ELEVENLABS_API_KEY,
+      text.c_str(),
+      ELEVENLABS_MODEL);   // usually "eleven_flash_v2_5"; see secrets.h
+  Serial.printf("voice: connecttoElevenlabs -> %s in %lu ms\n",
+                ok ? "ok" : "FAIL", (unsigned long)(millis() - t0));
+
   if (ok) {
     // ~48 ms fade-in — long enough to smear the step across many DMA
     // buffers, short enough that speech still feels instant.
@@ -255,7 +192,7 @@ bool voiceSpeak(const String &text) {
     s_audio->setVolume(target);
   } else {
     s_audio->setVolume(target);
-    Serial.println("voice: connecttoFS failed");
+    Serial.println("voice: ElevenLabs stream start failed");
   }
   s_playing = ok;
   return ok;

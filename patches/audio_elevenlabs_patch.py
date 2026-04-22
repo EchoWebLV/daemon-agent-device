@@ -53,11 +53,24 @@ bool Audio::connecttoElevenlabs(const char* voiceId, const char* apiKey,
 
     const char *host = "api.elevenlabs.io";
     const uint16_t port = 443;
-    if(!modelId || !*modelId) modelId = "eleven_turbo_v2_5";
+    // eleven_flash_v2_5 is ElevenLabs' lowest-latency model (~75 ms TTFB
+    // vs ~200 ms for eleven_turbo_v2_5). Quality is fine for a small
+    // speaker on a desk board.
+    if(!modelId || !*modelId) modelId = "eleven_flash_v2_5";
 
-    char path[160];
+    // output_format=mp3_22050_32: 22.05 kHz / 32 kbps ≈ 4 KB/s, which is
+    // ~4× smaller than mp3_44100_128. First decodable MP3 frame arrives
+    // proportionally sooner over WiFi and the Helix decoder has a much
+    // easier job. 22 kHz is plenty for speech over a mono PCM5101.
+    //
+    // optimize_streaming_latency=3: ElevenLabs' "max latency optimisation"
+    // — trades a touch of prosody for ~40% less TTFB. 4 also exists but
+    // disables the text normaliser and mispronounces numbers.
+    char path[200];
     snprintf(path, sizeof(path),
-        "/v1/text-to-speech/%s/stream?output_format=mp3_44100_128", voiceId);
+        "/v1/text-to-speech/%s/stream"
+        "?output_format=mp3_22050_32&optimize_streaming_latency=3",
+        voiceId);
 
     size_t textLen = strlen(text);
     size_t bodyCap = textLen * 2 + 320;
