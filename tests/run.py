@@ -23,11 +23,17 @@ from solders.pubkey import Pubkey
 BAUD = 115200
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
 
-# Filled in Task 15 from `grep x402Post src/*.cpp`. Keep empty until then.
+# Real paid endpoints pulled from the firmware source.
+# Only one URL is cleanly accessible as a constant (LLM_ENDPOINT in
+# src/ai.cpp); services.cpp builds catalog URLs dynamically from NVS.
+# We hit the chat endpoint three times with distinct prompts so each
+# call signs a fresh blockhash — direct coverage for the bug documented
+# in memory/MEMORY.md (cached blockhashes → duplicate-signature tx).
+_CHAT_URL = "https://sol.blockrun.ai/api/v1/chat/completions"
 X402_URLS: List[Tuple[str, str]] = [
-    # ("quote",   "https://..."),
-    # ("image",   "https://..."),
-    # ("catalog", "https://..."),
+    ("chat1", _CHAT_URL),
+    ("chat2", _CHAT_URL),
+    ("chat3", _CHAT_URL),
 ]
 
 
@@ -305,6 +311,40 @@ def c_ai_ping(dev: Device) -> str:
     return f"({status}, {latency_ms} ms)"
 
 
+def _usdc_precondition(dev: Device) -> Optional[str]:
+    """Return None if the wallet has ≥ $0.05 USDC, else a skip reason.
+    Relies on TEST WALLET BALANCE returning '<sol> <usdc>' as the 4th/5th
+    tokens (see src/testharness.cpp WALLET BALANCE branch)."""
+    resp = dev.send("TEST WALLET BALANCE", timeout=5.0)[0].split()
+    usdc = float(resp[4])
+    if usdc < 0.05:
+        return f"needs >= $0.05 USDC, have ${usdc:.4f}"
+    return None
+
+
+def _make_x402_case(label: str, url: str) -> Callable[[Device], str]:
+    """Build a case function that sends TEST X402 CALL <url>, with a
+    pre-flight USDC balance check that SKIPs (not fails) the case if the
+    wallet is short."""
+    def fn(dev: Device) -> str:
+        skip = _usdc_precondition(dev)
+        if skip:
+            raise AssertionError(f"SKIP: {skip}")
+        resp = dev.send(f"TEST X402 CALL {url}", timeout=25.0)[0].split()
+        assert resp[:3] == ["TEST", "OK", "x402"], f"bad response: {resp}"
+        status     = int(resp[3])
+        paid_base  = int(resp[4])
+        latency_ms = int(resp[5])
+        assert status == 200, f"http {status}"
+        # $0.01–$1.00 inclusive. Below: free / mis-accounted. Above: a
+        # mis-priced endpoint that we do NOT want the device paying for.
+        assert 10_000 <= paid_base <= 1_000_000, (
+            f"paid {paid_base} uUSDC is out of range")
+        return f"({status}, ${paid_base / 1e6:.4f}, {latency_ms} ms)"
+    fn.__name__ = f"c_x402_{label}"
+    return fn
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -344,7 +384,10 @@ def main() -> int:
         ("wallet_pubkey_valid",   c_wallet_pubkey_valid),
         ("wallet_balance_matches", lambda d: c_wallet_balance_matches(d, args.rpc)),
         ("ai_ping",               c_ai_ping),
-        # Later tasks insert cases here in protocol order.
+        *[
+            (f"x402_payment_{i + 1}", _make_x402_case(label, url))
+            for i, (label, url) in enumerate(X402_URLS)
+        ],
     ]
 
     dev.begin()

@@ -14,6 +14,7 @@
 #include "touch.h"   // SWIPE_* enum values for TEST SWIPE
 #include "wallet.h"  // walletPubkey / walletSolBalance / walletUsdcAmount
 #include "ai.h"      // aiAskOneShot for TEST AI PING
+#include "x402.h"    // x402Get / x402Post for TEST X402 CALL
 
 static bool   s_testMode = false;
 static String s_lineBuf;
@@ -204,6 +205,42 @@ static void handleLine(const String &line) {
     walletRefresh();
     Serial.printf("TEST OK balance %.9f %.6f\n",
                   walletSolBalance(), walletUsdcAmount());
+    return;
+  }
+
+  // --- X402 CALL --------------------------------------------------------
+  if (rest.startsWith("X402 CALL ")) {
+    String url = rest.substring(strlen("X402 CALL "));
+    static uint32_t callSeq = 0;
+    ++callSeq;
+    uint32_t t0 = millis();
+    X402Result r;
+    // The LLM endpoint only accepts POST with an OpenAI-style chat body.
+    // Everything else goes through GET. We send a tiny unique prompt each
+    // call so the paid path actually differs (fresh blockhash per tx —
+    // see MEMORY.md on the blockhash-reuse regression).
+    if (url.indexOf("/chat/completions") >= 0) {
+      String body;
+      body.reserve(256);
+      body  = "{\"model\":\"gemini-2.5-flash\",";
+      body += "\"messages\":[{\"role\":\"user\",\"content\":\"ping ";
+      body += String(callSeq);
+      body += "\"}]}";
+      r = x402Post(url, body);
+    } else {
+      r = x402Get(url);
+    }
+    uint32_t dt = millis() - t0;
+    if (r.status == 0) {
+      Serial.printf("TEST ERR x402 %s dt=%u\n",
+                    r.error.length() ? r.error.c_str() : "unknown",
+                    (unsigned)dt);
+      return;
+    }
+    // paid_usdc_base = 6-decimal USDC base units (e.g. 50000 = $0.05).
+    uint64_t paid_base = (uint64_t)llround(r.costUsd * 1000000.0);
+    Serial.printf("TEST OK x402 %d %llu %u\n",
+                  r.status, (unsigned long long)paid_base, (unsigned)dt);
     return;
   }
 
