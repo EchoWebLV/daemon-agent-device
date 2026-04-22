@@ -12,6 +12,7 @@
 #include "settingsscreen.h"
 #include "wifiscreen.h"
 #include "touch.h"   // SWIPE_* enum values for TEST SWIPE
+#include "wallet.h"  // walletPubkey / walletSolBalance / walletUsdcAmount
 
 static bool   s_testMode = false;
 static String s_lineBuf;
@@ -184,6 +185,24 @@ static void handleLine(const String &line) {
                     ssid.c_str(), (int)WiFi.RSSI(i), enc);
     }
     WiFi.scanDelete();
+    return;
+  }
+
+  // --- WALLET PUBKEY / BALANCE ------------------------------------------
+  if (rest == "WALLET PUBKEY") {
+    const String pk = walletPubkey();
+    if (pk.length() == 0) {
+      Serial.println("TEST ERR wallet no_pubkey");
+    } else {
+      Serial.printf("TEST OK pubkey %s\n", pk.c_str());
+    }
+    return;
+  }
+  if (rest == "WALLET BALANCE") {
+    // Force a fresh refresh so the host isn't reading a minute-old cache.
+    walletRefresh();
+    Serial.printf("TEST OK balance %.9f %.6f\n",
+                  walletSolBalance(), walletUsdcAmount());
     return;
   }
 

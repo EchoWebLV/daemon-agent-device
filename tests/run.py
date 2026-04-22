@@ -12,8 +12,11 @@ import sys
 import time
 from typing import Callable, List, Optional, Tuple
 
+import base58
 import serial
 import serial.tools.list_ports
+from solana.rpc.api import Client as SolanaClient
+from solders.pubkey import Pubkey
 
 # --- Config ----------------------------------------------------------------
 
@@ -255,6 +258,42 @@ def c_wifi_scan_nonempty(dev: Device) -> str:
     return f"({n} networks: {preview})"
 
 
+def _device_pubkey(dev: Device) -> str:
+    """Helper: TEST WALLET PUBKEY → base58 string."""
+    resp = dev.send("TEST WALLET PUBKEY", timeout=3.0)[0].split()
+    assert resp[:3] == ["TEST", "OK", "pubkey"], f"bad response: {resp}"
+    return resp[3]
+
+
+def c_wallet_pubkey_valid(dev: Device) -> str:
+    """Device returns a base58-encoded Ed25519 pubkey (32 bytes decoded)."""
+    pk_b58 = _device_pubkey(dev)
+    decoded = base58.b58decode(pk_b58)
+    assert len(decoded) == 32, f"pubkey decodes to {len(decoded)} bytes, expected 32"
+    short = pk_b58[:4] + "…" + pk_b58[-4:]
+    return f"({short})"
+
+
+def c_wallet_balance_matches(dev: Device, rpc_url: str = DEFAULT_RPC) -> str:
+    """Device-reported SOL balance must match an independent RPC query
+    within 0.0001 SOL (rounding / blockhash timing slack)."""
+    # Device side.
+    resp = dev.send("TEST WALLET BALANCE", timeout=5.0)[0].split()
+    assert resp[:3] == ["TEST", "OK", "balance"], f"bad response: {resp}"
+    dev_sol = float(resp[3])
+
+    # RPC side, independently.
+    pubkey = Pubkey.from_string(_device_pubkey(dev))
+    rpc = SolanaClient(rpc_url)
+    lamports = rpc.get_balance(pubkey).value
+    rpc_sol = lamports / 1e9
+
+    tol = 0.0001   # ~100k lamports; comfortable rounding slack
+    assert abs(dev_sol - rpc_sol) < tol, (
+        f"device reports {dev_sol:.6f} SOL, RPC reports {rpc_sol:.6f} SOL")
+    return f"({dev_sol:.6f} SOL)"
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
@@ -291,6 +330,8 @@ def main() -> int:
         ("settings_from_swipe", c_settings_from_swipe),
         ("wifi_status_connected", c_wifi_status_connected),
         ("wifi_scan_nonempty",    c_wifi_scan_nonempty),
+        ("wallet_pubkey_valid",   c_wallet_pubkey_valid),
+        ("wallet_balance_matches", lambda d: c_wallet_balance_matches(d, args.rpc)),
         # Later tasks insert cases here in protocol order.
     ]
 
