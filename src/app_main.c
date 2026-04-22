@@ -21,9 +21,11 @@
 
 #include "devcfg.h"
 #include "display.h"
+#include "price.h"
 #include "server.h"
 #include "touch.h"
 #include "ui.h"
+#include "wallet.h"
 #include "wifi_sta.h"
 
 static const char *TAG = "daemon";
@@ -95,15 +97,48 @@ void app_main(void) {
         server_set_status("idle");
     }
 
+    // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
+    // wallet just decodes the static key, and price_begin() is a no-op.
+    // Refreshes only attempt network traffic when wifi_sta_is_connected().
+    wallet_begin();
+    price_begin();
+    if (wifi_err == ESP_OK) {
+        wallet_request_refresh();
+        price_request_refresh();
+    }
+
+    // Cadence for periodic pulls. 30 s matches the Arduino build.
+    const uint32_t WALLET_REFRESH_EVERY_MS = 60000;
+    const uint32_t PRICE_REFRESH_EVERY_MS  = 30000;
+    uint32_t last_wallet = 0, last_price = 0;
+
     uint32_t tick = 0;
     while (true) {
         size_t free_total = esp_get_free_heap_size();
         size_t free_min   = esp_get_minimum_free_heap_size();
         char ip[16] = {0};
         wifi_sta_ip_str(ip, sizeof(ip));
-        ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u B  low-water=%u B  ip=%s",
+
+        uint32_t now_ms = tick * 1000;   // heartbeat ticks once a second
+        if (wifi_sta_is_connected()) {
+            if (now_ms - last_wallet >= WALLET_REFRESH_EVERY_MS) {
+                wallet_request_refresh();
+                last_wallet = now_ms;
+            }
+            if (now_ms - last_price >= PRICE_REFRESH_EVERY_MS) {
+                price_request_refresh();
+                last_price = now_ms;
+            }
+        }
+
+        char price_str[16];
+        char usdc_str[16];
+        price_display_string(price_str, sizeof(price_str));
+        wallet_usdc_display_string(usdc_str, sizeof(usdc_str));
+
+        ESP_LOGI(TAG, "tick=%" PRIu32 "  free=%u  lw=%u  ip=%s  %s  %s",
                  tick++, (unsigned)free_total, (unsigned)free_min,
-                 ip[0] ? ip : "(none)");
+                 ip[0] ? ip : "(none)", price_str, usdc_str);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
