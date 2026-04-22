@@ -104,12 +104,65 @@ void aiResetHistory() {
 }
 
 // ---------------------------------------------------------------------------
-// sol.blockrun.ai HTTP gateway — OpenAI-compatible /v1/chat/completions
-// behind an x402 USDC paywall on Solana mainnet. All chat calls flow
-// through here so the device actually pays for each reply from the wallet,
-// matching the Chrome extension's behaviour exactly.
+// LLM endpoint registry
+//
+// Two shapes are supported:
+//
+//   LLM_SHAPE_OPENAI_CHAT   — OpenAI-compatible /v1/chat/completions body:
+//                             {"model":"...","messages":[{role,content}...]}.
+//                             Reply at choices[0].message.content. Supports
+//                             the full tool-calling loop. This is how the
+//                             sol.blockrun.ai gateway works (and any model
+//                             routed through it just by its id).
+//
+//   LLM_SHAPE_SIMPLE_MESSAGE — Minimal custom x402 gateway body:
+//                             {"message":"<flattened-turns>"}.
+//                             Reply is probed across a list of common field
+//                             names (response/message/reply/text/content/
+//                             answer/data). No tool-calling. This is the
+//                             shape the user's own x402 deployments use
+//                             (e.g. Shannon at daemon-x402s-seven.vercel.app).
+//
+// To add a new LLM:
+//   - If it lives behind sol.blockrun.ai (any provider routed through that
+//     gateway): add a one-liner to the MODELS array in src/server.cpp only.
+//     Nothing to do here — unknown ids fall back to BLOCKRUN_CHAT_URL.
+//   - If it's your own x402 deployment (its own URL + body shape):
+//       1. Add a one-liner to kLlmEndpoints[] below.
+//       2. Add a matching one-liner to MODELS in src/server.cpp so it
+//          appears in the portal's dropdown.
 // ---------------------------------------------------------------------------
-static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completions";
+static const char *BLOCKRUN_CHAT_URL =
+    "https://sol.blockrun.ai/api/v1/chat/completions";
+
+enum LlmShape {
+  LLM_SHAPE_OPENAI_CHAT,
+  LLM_SHAPE_SIMPLE_MESSAGE,
+};
+
+struct LlmEndpoint {
+  const char *id;    // model id as it appears in MODELS / NVS
+  const char *url;   // x402 POST target
+  LlmShape    shape;
+};
+
+// Only CUSTOM x402 endpoints go here. Anything not listed falls back to
+// BLOCKRUN_CHAT_URL with LLM_SHAPE_OPENAI_CHAT. Keep the id strings in
+// sync with MODELS in src/server.cpp.
+static const LlmEndpoint kLlmEndpoints[] = {
+    { "shannon/daemon-x402s",
+      "https://daemon-x402s-seven.vercel.app/api/call",
+      LLM_SHAPE_SIMPLE_MESSAGE },
+};
+
+// Find a registered custom endpoint by id; returns nullptr when the id
+// should fall back to the default blockrun chat path.
+static const LlmEndpoint *findLlmEndpoint(const String &id) {
+  for (const auto &e : kLlmEndpoints) {
+    if (id == e.id) return &e;
+  }
+  return nullptr;
+}
 
 // Build the OpenAI-style request body. `historyTurns` expects turns in the
 // Gemini format we already use (role=="user"/"model"); we translate them
@@ -152,8 +205,10 @@ static String buildChatBody(const String &model,
 
 // POSTs the chat completion through x402 and returns the assistant's reply
 // text. Fills outReply with a human-friendly error string on failure.
-static bool postChatThroughX402(const String &body, String &outReply) {
-  X402Result r = x402Post(String(LLM_ENDPOINT), body);
+static bool postChatThroughX402(const String &url,
+                                const String &body,
+                                String &outReply) {
+  X402Result r = x402Post(url, body);
   if (r.status != 200) {
     Serial.printf("ai: x402 POST %d (err=%s)\n", r.status, r.error.c_str());
     if (r.status == 402) {
@@ -187,6 +242,92 @@ static bool postChatThroughX402(const String &body, String &outReply) {
   return true;
 }
 
+// POSTs a single-turn {"message":"..."} body to a custom x402 LLM gateway
+// (LLM_SHAPE_SIMPLE_MESSAGE). These deployments don't understand
+// OpenAI-style chat history, so `flattenedTurns` is expected to be the
+// user's utterance with any prior turns already inlined (see flattenForSimpleShape).
+static bool postSimpleMessageThroughX402(const String &url,
+                                         const String &flattenedTurns,
+                                         String &outReply) {
+  JsonDocument req;
+  req["message"] = flattenedTurns;
+  String body;
+  serializeJson(req, body);
+
+  X402Result r = x402Post(url, body);
+  if (r.status != 200) {
+    Serial.printf("ai: x402 POST (simple) %d (err=%s)\n",
+                  r.status, r.error.c_str());
+    if (r.status == 402) {
+      outReply = "I couldn't complete the USDC payment for this reply.";
+    } else if (r.error.length() > 0) {
+      outReply = "Daemon's brain is offline: " + r.error;
+    } else {
+      outReply = "HTTP " + String(r.status);
+    }
+    return false;
+  }
+  if (r.costUsd > 0) {
+    Serial.printf("ai: paid $%.5f USDC for this reply\n", r.costUsd);
+  }
+
+  // Probe the common reply field names for custom x402 LLMs. We don't
+  // standardise on one — each deployment can pick whatever it wants, and
+  // we handle the usual suspects so adding a new one doesn't require
+  // touching this file.
+  JsonDocument res;
+  if (!deserializeJson(res, r.body)) {
+    static const char *kFields[] = {
+        "response", "message", "reply", "text", "content", "answer", "data",
+    };
+    for (const char *f : kFields) {
+      if (res[f].is<const char *>()) {
+        String s = res[f].as<String>();
+        s.trim();
+        if (s.length() > 0) { outReply = s; return true; }
+      }
+    }
+    // Some gateways wrap the assistant reply in OpenAI's structure even
+    // when they don't expose full chat. Try that shape as a last resort.
+    if (res["choices"][0]["message"]["content"].is<const char *>()) {
+      String s = res["choices"][0]["message"]["content"].as<String>();
+      s.trim();
+      if (s.length() > 0) { outReply = s; return true; }
+    }
+  }
+
+  // Unparseable JSON or no recognised field: hand back the raw body,
+  // trimmed. This means a brand-new custom endpoint usually "just works"
+  // for plain-text replies even before we teach ai.cpp its exact shape.
+  String raw = r.body;
+  raw.trim();
+  if (raw.length() == 0) {
+    outReply = "I forgot what I was going to say.";
+    return false;
+  }
+  outReply = raw;
+  return true;
+}
+
+// Flattens recent history (plus the most recent user turn already on the
+// stack) into a single prompt string for SIMPLE_MESSAGE-shape endpoints,
+// which can't carry structured chat history. Prepends the system prompt
+// so personality and wallet context still flow through.
+static String flattenForSimpleShape() {
+  String out;
+  out.reserve(1024);
+  out += buildSystemPrompt();
+  out += "\n\n---\n";
+  for (int i = 0; i < s_histLen; ++i) {
+    const String &role = s_history[i].role;
+    out += (role == "model") ? "assistant: " : "user: ";
+    out += s_history[i].text;
+    out += "\n";
+  }
+  out += "assistant: ";
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Multi-turn chat — goes through sol.blockrun.ai with x402 USDC payment.
 // If the user has enabled any x402 services in the web settings, those are
@@ -200,8 +341,28 @@ bool aiAsk(const String &userText, String &outReply) {
   if (userText.length() == 0) return false;
   pushTurn("user", userText);
 
+  // Shape-aware dispatch. Custom SIMPLE_MESSAGE gateways (user's own x402
+  // LLM deployments) don't do OpenAI chat history or tool calls, so we
+  // flatten the history and hand it off before the chat/tool machinery.
+  const String currentModel = devcfgLlmModel();
+  const LlmEndpoint *custom = findLlmEndpoint(currentModel);
+  if (custom && custom->shape == LLM_SHAPE_SIMPLE_MESSAGE) {
+    String reply;
+    bool ok = postSimpleMessageThroughX402(String(custom->url),
+                                           flattenForSimpleShape(),
+                                           reply);
+    if (!ok) {
+      s_histLen--;           // roll back the pending user turn
+      outReply = reply;
+      return false;
+    }
+    pushTurn("model", reply);
+    outReply = reply;
+    return true;
+  }
+
   JsonDocument req;
-  req["model"]       = devcfgLlmModel();
+  req["model"]       = currentModel;
   req["max_tokens"]  = 512;
   req["temperature"] = 0.9f;
 
@@ -280,7 +441,7 @@ bool aiAsk(const String &userText, String &outReply) {
                   round, (unsigned)body.length(),
                   body.indexOf("\"tools\":") >= 0 ? "yes" : "no");
 
-    X402Result r = x402Post(String(LLM_ENDPOINT), body);
+    X402Result r = x402Post(String(BLOCKRUN_CHAT_URL), body);
     if (r.status != 200) {
       Serial.printf("ai: x402 POST %d (err=%s)\n", r.status, r.error.c_str());
       if (r.body.length() > 0) {
@@ -396,10 +557,18 @@ bool aiAsk(const String &userText, String &outReply) {
 // ---------------------------------------------------------------------------
 bool aiAskOneShot(const String &prompt, String &outReply) {
   if (prompt.length() == 0) return false;
-  String body = buildChatBody(devcfgLlmModel(),
+  const String currentModel = devcfgLlmModel();
+  const LlmEndpoint *custom = findLlmEndpoint(currentModel);
+  if (custom && custom->shape == LLM_SHAPE_SIMPLE_MESSAGE) {
+    // One-shot into a SIMPLE_MESSAGE gateway: send the bare prompt, no
+    // system-prompt wrapping (the smoke-test harness uses this and we
+    // want the reply shape it observes to stay minimal).
+    return postSimpleMessageThroughX402(String(custom->url), prompt, outReply);
+  }
+  String body = buildChatBody(currentModel,
                               nullptr, 0,
                               prompt,
                               /*maxTokens=*/ 512,
                               /*temperature=*/ 1.1f);
-  return postChatThroughX402(body, outReply);
+  return postChatThroughX402(String(BLOCKRUN_CHAT_URL), body, outReply);
 }

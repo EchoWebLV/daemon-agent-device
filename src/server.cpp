@@ -180,6 +180,12 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
 
 <script>
 // ────────── static catalog (mirrored from the chrome extension) ──────────
+// Adding a new model:
+//   - Blockrun-routed model (any OpenAI-compatible id, no new URL/body
+//     shape): add one line here. Nothing to do in firmware.
+//   - Your own x402 deployment (own URL, own body shape): add one line
+//     here AND a matching entry in kLlmEndpoints[] in src/ai.cpp so the
+//     dispatcher knows where to POST and how to parse the reply.
 const MODELS = [
   {id:'deepseek/deepseek-chat',         name:'DeepSeek V3',         provider:'DeepSeek'},
   {id:'openai/gpt-4o-mini',             name:'GPT-4o Mini',         provider:'OpenAI'},
@@ -198,6 +204,8 @@ const MODELS = [
   {id:'xai/grok-3',                     name:'Grok 3',              provider:'xAI'},
   {id:'google/gemini-3.1-pro',          name:'Gemini 3.1 Pro',      provider:'Google'},
   {id:'anthropic/claude-opus-4.6',      name:'Claude Opus 4.6',     provider:'Anthropic'},
+  // ── Custom x402 gateways (also registered in src/ai.cpp kLlmEndpoints) ──
+  {id:'shannon/daemon-x402s',           name:'Shannon',             provider:'Custom x402'},
 ];
 
 const CATS = {
