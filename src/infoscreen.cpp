@@ -4,18 +4,19 @@
 
 #include <WiFi.h>
 
-static constexpr int16_t SCR_W = 240;
-static constexpr int16_t SCR_H = 320;
+static constexpr int16_t SCR_W = SCREENFX_W;
+static constexpr int16_t SCR_H = SCREENFX_H;
 
-// Palette — same as menu / wallet.
-static constexpr uint16_t C_BG        = 0x0000;
-static constexpr uint16_t C_PANEL     = 0x1082;
-static constexpr uint16_t C_PANEL_HI  = 0x2124;
-static constexpr uint16_t C_ACCENT    = 0x0AFF;
-static constexpr uint16_t C_ACCENT_HI = 0x07FF;
-static constexpr uint16_t C_TEXT      = 0xFFFF;
-static constexpr uint16_t C_DIM       = 0x9CD3;   // a hair brighter than wallet's dim
-static constexpr uint16_t C_DIMMER    = 0x39C7;
+// All colors now come from the shared UI_C_* palette in screenfx.h so the
+// info page feels like the same OS as wallet / menu.
+static constexpr uint16_t C_BG        = UI_C_BG;
+static constexpr uint16_t C_PANEL     = UI_C_CARD;
+static constexpr uint16_t C_PANEL_HI  = UI_C_CARD_HI;
+static constexpr uint16_t C_ACCENT    = UI_C_WARN;       // info = amber
+static constexpr uint16_t C_ACCENT_HI = UI_C_WARN_DIM;
+static constexpr uint16_t C_TEXT      = UI_C_TEXT;
+static constexpr uint16_t C_DIM       = UI_C_TEXT_DIM;
+static constexpr uint16_t C_DIMMER    = UI_C_TEXT_DIMMER;
 
 // Top bar geometry (matches the other panels).
 static constexpr int16_t TOPBAR_Y = 3;

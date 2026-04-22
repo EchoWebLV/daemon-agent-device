@@ -3,140 +3,166 @@
 #include "wallet.h"
 #include "price.h"
 
-static constexpr int16_t SCR_W    = 240;
-static constexpr int16_t SCR_H    = 320;
+static constexpr int16_t SCR_W = SCREENFX_W;
+static constexpr int16_t SCR_H = SCREENFX_H;
 
-// Palette (RGB565) — kept in lockstep with walletscreen.cpp so the top
-// bars and accents match across panels.
-static constexpr uint16_t C_BG        = 0x0000;
-static constexpr uint16_t C_PANEL     = 0x1082;   // dark slate card body
-static constexpr uint16_t C_PANEL_HI  = 0x2124;   // slightly brighter, for accents
-static constexpr uint16_t C_ACCENT    = 0x0AFF;   // Daemon blue
-static constexpr uint16_t C_ACCENT_HI = 0x07FF;   // cyan rim
-static constexpr uint16_t C_TEXT      = 0xFFFF;
-static constexpr uint16_t C_DIM       = 0x7BEF;
-static constexpr uint16_t C_DIMMER    = 0x39C7;
-
-// Top bar geometry — match walletscreen so the two sheets align visually.
+// Top bar geometry — matches wallet / info so the header rail is pixel-
+// aligned across every panel.
 static constexpr int16_t TOPBAR_Y = 3;
 static constexpr int16_t CLOSE_W  = SCREENFX_X_BTN_W;
 static constexpr int16_t CLOSE_H  = SCREENFX_X_BTN_H;
 static constexpr int16_t CLOSE_X  = SCR_W - CLOSE_W - 6;
 static constexpr int16_t CLOSE_Y  = TOPBAR_Y;
 
-// Tile geometry. Two full-width cards, stacked vertically with equal
-// breathing room above, between and below.
-static constexpr int16_t TILE_X   = 14;
+// Two full-width tiles stacked vertically, each ~116 px tall with
+// breathing room above / between / below.
+static constexpr int16_t TILE_X   = 10;
 static constexpr int16_t TILE_W   = SCR_W - 2 * TILE_X;
-static constexpr int16_t TILE_H   = 120;
+static constexpr int16_t TILE_H   = 116;
 static constexpr int16_t TILE1_Y  = 44;
-static constexpr int16_t TILE2_Y  = TILE1_Y + TILE_H + 14;   // 178
+static constexpr int16_t TILE2_Y  = TILE1_Y + TILE_H + 12;   // 172
 
 static TFT_eSPI *s_tft = nullptr;
 
 // Latched intents.
-static bool s_wantClose      = false;
-static bool s_wantWalletTap  = false;
-static bool s_wantInfoTap    = false;
+static bool s_wantClose     = false;
+static bool s_wantWalletTap = false;
+static bool s_wantInfoTap   = false;
 
-// Cached preview state so we only redraw tiles when their subtitles change.
+// Subtitle change detection so we only repaint tiles when needed.
 static double   s_lastSol      = -1.0;
 static double   s_lastUsdc     = -1.0;
 static uint32_t s_lastHeapKB   = 0;
 static uint32_t s_lastTickMs   = 0;
 
 // ---------------------------------------------------------------------------
-// Icon painters — drawn programmatically so we don't need to ship images.
+// Icons — drawn programmatically so we ship no PNGs. Each icon sits inside
+// a 56×56 square whose center is passed in.
 // ---------------------------------------------------------------------------
 
-// Wallet icon: a little credit-card-shaped rectangle with a "$" glyph.
+// Wallet icon: a soft "bill fold" silhouette with a dollar mark on the
+// card face. Two layered rounded rects fake an inset clasp.
 static void drawWalletIcon(int16_t cx, int16_t cy) {
-  const int16_t w = 46, h = 32;
+  const int16_t w = 48, h = 36;
   const int16_t x = cx - w / 2;
   const int16_t y = cy - h / 2;
-  s_tft->fillRoundRect(x, y, w, h, 5, C_ACCENT);
-  // A thin inner border for depth.
-  s_tft->drawRoundRect(x + 2, y + 2, w - 4, h - 4, 4, C_ACCENT_HI);
-  // "$" centered
-  s_tft->setTextFont(4);
+
+  // Subtle drop shadow for perceived depth.
+  s_tft->fillRoundRect(x + 1, y + 2, w, h, 7, UI_C_BG_DEEP);
+  // Card body.
+  s_tft->fillRoundRect(x, y, w, h, 7, UI_C_ACCENT);
+  // Inner bevel.
+  s_tft->drawRoundRect(x + 2, y + 2, w - 4, h - 4, 5, UI_C_ACCENT_HI);
+  // Horizontal magnetic-stripe band across the top third.
+  s_tft->fillRect(x + 4, y + 8, w - 8, 3, UI_C_BG_DEEP);
+  // "$" glyph, bold, centered in the lower half of the card.
+  s_tft->setFreeFont(&FreeSansBold12pt7b);
   s_tft->setTextDatum(MC_DATUM);
-  s_tft->setTextColor(C_BG, C_ACCENT);
-  s_tft->drawString("$", cx, cy + 1);
+  s_tft->setTextColor(UI_C_TEXT, UI_C_ACCENT);
+  s_tft->drawString("$", cx, cy + 5);
+  s_tft->setFreeFont(nullptr);
 }
 
-// Info icon: filled circle with an italic "i" glyph.
+// Info icon: a two-ring amber disc with a lowercase "i" glyph. The
+// concentric rings are what sells the "badge" read at a glance.
 static void drawInfoIcon(int16_t cx, int16_t cy) {
-  const int16_t r = 20;
-  s_tft->fillCircle(cx, cy, r, C_ACCENT);
-  s_tft->drawCircle(cx, cy, r, C_ACCENT_HI);
-  s_tft->setTextFont(4);
-  s_tft->setTextDatum(MC_DATUM);
-  s_tft->setTextColor(C_BG, C_ACCENT);
-  s_tft->drawString("i", cx, cy + 1);
+  const int16_t r = 22;
+  // Drop shadow.
+  s_tft->fillCircle(cx + 1, cy + 2, r, UI_C_BG_DEEP);
+  // Outer disc.
+  s_tft->fillCircle(cx, cy, r, UI_C_WARN);
+  // Outer rim.
+  s_tft->drawCircle(cx, cy, r, UI_C_WARN_DIM);
+  // Inner ring for extra depth.
+  s_tft->drawCircle(cx, cy, r - 4, UI_C_WARN_DIM);
+  // "i" — a small dot above, a longer stem below.
+  s_tft->fillCircle(cx, cy - 8, 2, UI_C_BG_DEEP);
+  s_tft->fillRect(cx - 2, cy - 3, 4, 12, UI_C_BG_DEEP);
 }
 
 // ---------------------------------------------------------------------------
-// Card painter — shared by both tiles.
+// Tile painter — shared layout with per-tile icon / title / subtitle /
+// accent color.
 // ---------------------------------------------------------------------------
 typedef void (*IconFn)(int16_t, int16_t);
 
 static void paintTile(int16_t y,
                       const char *title,
                       const char *subtitle,
-                      IconFn iconFn) {
-  // Background card.
-  s_tft->fillRoundRect(TILE_X, y, TILE_W, TILE_H, 10, C_PANEL);
-  s_tft->drawRoundRect(TILE_X, y, TILE_W, TILE_H, 10, C_PANEL_HI);
+                      uint16_t    accent,
+                      IconFn      iconFn) {
+  // Wipe the tile slot first so re-renders don't leave artifacts.
+  s_tft->fillRect(TILE_X, y - 4, TILE_W, TILE_H + 8, UI_C_BG);
 
-  // Icon zone: 60-px-wide strip on the left, centered vertically.
-  const int16_t iconCX = TILE_X + 36;
+  // The shared card chrome — shadow + body + highlight border + left
+  // accent stripe.
+  screenfxDrawCard(s_tft, TILE_X, y, TILE_W, TILE_H, accent);
+
+  // Icon well — 56×56 square on the left, centered vertically.
+  const int16_t iconCX = TILE_X + 18 + 28;     // accent stripe + pad + half
   const int16_t iconCY = y + TILE_H / 2;
   iconFn(iconCX, iconCY);
 
-  // Title — big accent label.
-  s_tft->setTextFont(4);
+  // Thin vertical separator between the icon well and the text column.
+  const int16_t sepX = TILE_X + 82;
+  s_tft->fillRect(sepX, y + 16, 1, TILE_H - 32, UI_C_CARD_HI);
+
+  // Title — big, bright, FreeSansBold 12pt for a solid header weight.
+  s_tft->setFreeFont(&FreeSansBold12pt7b);
   s_tft->setTextDatum(TL_DATUM);
-  s_tft->setTextColor(C_TEXT, C_PANEL);
-  s_tft->setCursor(TILE_X + 74, y + 26);
+  s_tft->setTextColor(UI_C_TEXT, UI_C_CARD);
+  s_tft->setCursor(sepX + 10, y + 26);
   s_tft->print(title);
 
-  // Subtitle — dim one-line preview.
-  s_tft->setTextFont(2);
-  s_tft->setTextColor(C_DIM, C_PANEL);
-  s_tft->setCursor(TILE_X + 74, y + 58);
+  // Subtitle — FreeSans 9pt in dim text color. Rendered as a single line
+  // without wrapping; callers keep the subtitle short.
+  s_tft->setFreeFont(&FreeSans9pt7b);
+  s_tft->setTextColor(UI_C_TEXT_DIM, UI_C_CARD);
+  s_tft->setCursor(sepX + 10, y + 58);
   s_tft->print(subtitle);
 
-  // Chevron ">" on the right hinting the card is tappable.
-  s_tft->setTextFont(4);
+  // Accent mini-label under subtitle: "Tap to open" in the tile's accent
+  // color, a hair larger than the built-in small font for readability.
+  s_tft->setFreeFont(nullptr);
+  s_tft->setTextFont(1);
+  s_tft->setTextColor(accent, UI_C_CARD);
+  s_tft->setCursor(sepX + 10, y + TILE_H - 18);
+  s_tft->print("TAP TO OPEN");
+
+  // Chevron ">" on the right edge, vertically centered.
+  s_tft->setFreeFont(&FreeSansBold18pt7b);
   s_tft->setTextDatum(MR_DATUM);
-  s_tft->setTextColor(C_ACCENT_HI, C_PANEL);
-  s_tft->drawString(">", TILE_X + TILE_W - 14, y + TILE_H / 2);
+  s_tft->setTextColor(UI_C_ACCENT_HI, UI_C_CARD);
+  s_tft->drawString(">", TILE_X + TILE_W - 16, y + TILE_H / 2);
+  s_tft->setFreeFont(nullptr);
 }
 
 // ---------------------------------------------------------------------------
-// Top bar — title centered, price ticker on the right, X close button.
+// Status bar — MENU label, centered price ticker, X close button.
 // ---------------------------------------------------------------------------
 static void paintStatusBar() {
-  s_tft->fillRect(0, 0, SCR_W, 30, C_BG);
+  s_tft->fillRect(0, 0, SCR_W, 30, UI_C_BG);
 
+  s_tft->setFreeFont(nullptr);
   s_tft->setTextFont(2);
   s_tft->setTextDatum(TL_DATUM);
-  s_tft->setTextColor(C_ACCENT, C_BG);
+  s_tft->setTextColor(UI_C_ACCENT, UI_C_BG);
   s_tft->setCursor(10, TOPBAR_Y + 4);
   s_tft->print("MENU");
 
-  // Centered price ticker, if we have one.
   String price = priceDisplayString();
   if (price.length() > 0) {
     s_tft->setTextDatum(TC_DATUM);
-    s_tft->setTextColor(C_ACCENT_HI, C_BG);
+    s_tft->setTextColor(UI_C_ACCENT_HI, UI_C_BG);
     s_tft->drawString(price, SCR_W / 2, TOPBAR_Y + 4);
   }
 
-  screenfxDrawXButton(s_tft, CLOSE_X, CLOSE_Y, C_ACCENT, C_BG);
+  screenfxDrawXButton(s_tft, CLOSE_X, CLOSE_Y, UI_C_ACCENT, UI_C_BG);
 }
 
-// Build the wallet tile subtitle: "0.090 SOL · 12,345 USDC" etc.
+// ---------------------------------------------------------------------------
+// Subtitle builders
+// ---------------------------------------------------------------------------
 static String walletSubtitle() {
   char buf[64];
   double sol  = walletSolBalance();
@@ -151,17 +177,16 @@ static String walletSubtitle() {
   return String(buf);
 }
 
-// Build the info tile subtitle: "heap free · uptime".
 static String infoSubtitle() {
   char buf[64];
   uint32_t heapKB = ESP.getFreeHeap() / 1024;
   uint32_t up = millis() / 1000;
   uint32_t m = up / 60, s = up % 60;
   if (m >= 60) {
-    snprintf(buf, sizeof(buf), "%u KB free  ·  up %uh %um",
+    snprintf(buf, sizeof(buf), "%u KB free  ·  %uh %um up",
              (unsigned)heapKB, (unsigned)(m / 60), (unsigned)(m % 60));
   } else {
-    snprintf(buf, sizeof(buf), "%u KB free  ·  up %um %us",
+    snprintf(buf, sizeof(buf), "%u KB free  ·  %um %us up",
              (unsigned)heapKB, (unsigned)m, (unsigned)s);
   }
   return String(buf);
@@ -176,10 +201,13 @@ bool menuScreenBegin(TFT_eSPI *tft) {
 }
 
 static void fullPaint() {
-  s_tft->fillScreen(C_BG);
+  s_tft->fillScreen(UI_C_BG);
   paintStatusBar();
-  paintTile(TILE1_Y, "Wallet", walletSubtitle().c_str(), drawWalletIcon);
-  paintTile(TILE2_Y, "Info",   infoSubtitle().c_str(),   drawInfoIcon);
+
+  paintTile(TILE1_Y, "Wallet", walletSubtitle().c_str(),
+            UI_C_ACCENT, drawWalletIcon);
+  paintTile(TILE2_Y, "Info",   infoSubtitle().c_str(),
+            UI_C_WARN,   drawInfoIcon);
 
   s_lastSol    = walletSolBalance();
   s_lastUsdc   = walletUsdcAmount();
@@ -210,36 +238,36 @@ void menuScreenDraw() {
 void menuScreenTick() {
   if (!s_tft) return;
 
-  // Refresh subtitles at ~2 Hz so balances and uptime stay current
-  // without flicker.
   uint32_t now = millis();
-  if (now - s_lastTickMs < 500) return;
+  if (now - s_lastTickMs < 500) return;     // ~2 Hz
   s_lastTickMs = now;
 
   bool walletChanged =
-      (walletSolBalance()  != s_lastSol) ||
-      (walletUsdcAmount()  != s_lastUsdc);
-  bool infoChanged =
-      ((ESP.getFreeHeap() / 1024) != s_lastHeapKB) ||
-      true;  // uptime always changes; always repaint info tile.
+      (walletSolBalance() != s_lastSol) ||
+      (walletUsdcAmount() != s_lastUsdc);
+  // Uptime always ticks, so the info tile always refreshes.
+  bool infoChanged = true;
 
   if (walletChanged) {
-    paintTile(TILE1_Y, "Wallet", walletSubtitle().c_str(), drawWalletIcon);
+    paintTile(TILE1_Y, "Wallet", walletSubtitle().c_str(),
+              UI_C_ACCENT, drawWalletIcon);
     s_lastSol  = walletSolBalance();
     s_lastUsdc = walletUsdcAmount();
   }
   if (infoChanged) {
-    paintTile(TILE2_Y, "Info",   infoSubtitle().c_str(),   drawInfoIcon);
+    paintTile(TILE2_Y, "Info", infoSubtitle().c_str(),
+              UI_C_WARN, drawInfoIcon);
     s_lastHeapKB = ESP.getFreeHeap() / 1024;
   }
-  // Keep the price ticker fresh.
+
+  // Keep the price ticker current.
   paintStatusBar();
 }
 
 void menuScreenHandleTap(int16_t x, int16_t y) {
   if (!s_tft) return;
 
-  // X close button → home.
+  // X → home.
   if (x >= CLOSE_X && x < CLOSE_X + CLOSE_W &&
       y >= CLOSE_Y && y < CLOSE_Y + CLOSE_H) {
     s_wantClose = true;

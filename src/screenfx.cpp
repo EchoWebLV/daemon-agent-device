@@ -68,3 +68,37 @@ void screenfxDrawXButton(TFT_eSPI *tft,
   tft->drawLine(cx - r,     cy + r,     cx + r,     cy - r,     fg);
   tft->drawLine(cx - r + 1, cy + r,     cx + r + 1, cy - r,     fg);
 }
+
+// ---------------------------------------------------------------------------
+// Card surface — layered fake-depth rectangle. We don't have alpha on this
+// TFT pipeline, so the shadow is a second rounded-rect drawn one pixel
+// down and to the right in a near-black; the body sits on top, the border
+// is a single highlight stroke, and a 4-px-wide accent stripe on the left
+// edge anchors the whole thing visually.
+//
+// Callers pass the accent color, which lets one card be cyan (wallet) and
+// another amber (info) without duplicating code.
+// ---------------------------------------------------------------------------
+void screenfxDrawCard(TFT_eSPI *tft,
+                      int16_t   x,
+                      int16_t   y,
+                      int16_t   w,
+                      int16_t   h,
+                      uint16_t  accent) {
+  // Drop shadow: slightly larger rect behind the body in near-black.
+  tft->fillRoundRect(x + 1, y + 3, w, h, 12, UI_C_BG_DEEP);
+  // Body fill.
+  tft->fillRoundRect(x, y, w, h, 12, UI_C_CARD);
+  // Highlight border — one pixel of perceived bevel.
+  tft->drawRoundRect(x, y, w, h, 12, UI_C_CARD_HI);
+  // Left accent stripe. Tall and thin so it reads as a file-folder tab.
+  tft->fillRoundRect(x + 6, y + 10, 4, h - 20, 2, accent);
+}
+
+// ---------------------------------------------------------------------------
+// 1-px horizontal divider rule in the card-highlight color. Used by info
+// and other list-style panels between sections.
+// ---------------------------------------------------------------------------
+void screenfxDivider(TFT_eSPI *tft, int16_t y) {
+  tft->fillRect(0, y, SCREENFX_W, 1, UI_C_CARD_HI);
+}
