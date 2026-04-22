@@ -18,6 +18,7 @@
 #include "esp_system.h"
 
 #include "display.h"
+#include "ui.h"
 
 static const char *TAG = "daemon";
 
@@ -47,6 +48,11 @@ void app_main(void) {
     // Bring the ST7789 online early so dead-panel failures show up in the
     // log before we start allocating for LVGL / WiFi / audio.
     ESP_ERROR_CHECK(display_init());
+
+    // LVGL on top. The navy clear drawn by display_init() above is immediately
+    // overdrawn by LVGL's first frame, but keeping it around means we still
+    // get a "display is alive" signal even if LVGL itself fails to start.
+    ESP_ERROR_CHECK(ui_init());
 
     uint32_t tick = 0;
     while (true) {

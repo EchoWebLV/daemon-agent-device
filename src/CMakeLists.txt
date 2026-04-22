@@ -8,10 +8,15 @@ idf_component_register(
     SRCS
         "app_main.c"
         "display.c"
+        "ui.c"
     INCLUDE_DIRS
         "."
     REQUIRES
         # ST7789 bring-up over SPI.
         esp_lcd
         driver
+        # LVGL + the IDF port layer that glues it to esp_lcd.
+        # Pulled in via src/idf_component.yml.
+        lvgl
+        esp_lvgl_port
 )

@@ -22,6 +22,10 @@ esp_err_t display_init(void);
 // Panel handle (NULL before display_init returns ESP_OK).
 esp_lcd_panel_handle_t display_panel(void);
 
+// Panel IO handle. esp_lvgl_port's display config takes both handles —
+// panel for the pixel draw path and IO for sending command/param bytes.
+esp_lcd_panel_io_handle_t display_io(void);
+
 #ifdef __cplusplus
 }
 #endif

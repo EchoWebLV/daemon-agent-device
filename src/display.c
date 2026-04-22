@@ -34,7 +34,8 @@ static const char *TAG = "display";
 #define LCD_CMD_BITS   8
 #define LCD_PARAM_BITS 8
 
-static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_handle_t    s_panel = NULL;
+static esp_lcd_panel_io_handle_t s_io    = NULL;
 
 esp_err_t display_init(void) {
     // ---- Backlight GPIO (off during init to hide the bring-up flash) --------
@@ -63,7 +64,6 @@ esp_err_t display_init(void) {
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     // ---- Panel IO (SPI-mode wrapper around the bus) -------------------------
-    esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num       = PIN_DC,
         .cs_gpio_num       = PIN_CS,
@@ -74,7 +74,7 @@ esp_err_t display_init(void) {
         .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
-        (esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &io_handle));
+        (esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &s_io));
 
     // ---- ST7789 panel -------------------------------------------------------
     esp_lcd_panel_dev_config_t panel_cfg = {
@@ -82,7 +82,7 @@ esp_err_t display_init(void) {
         .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_cfg, &s_panel));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(s_io, &panel_cfg, &s_panel));
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
@@ -122,4 +122,8 @@ esp_err_t display_init(void) {
 
 esp_lcd_panel_handle_t display_panel(void) {
     return s_panel;
+}
+
+esp_lcd_panel_io_handle_t display_io(void) {
+    return s_io;
 }
