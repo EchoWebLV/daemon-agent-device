@@ -55,7 +55,7 @@ static SemaphoreHandle_t s_request_sem = NULL;   // signals a pending utterance
 static char     s_pending_text[VOICE_TEXT_MAX] = "";
 static volatile bool s_playing         = false;
 static volatile bool s_stop_requested  = false;
-static volatile uint8_t s_volume_0_21  = 18;   // seed; devcfg overrides in begin()
+static volatile uint8_t s_volume_0_21  = 0;    // overwritten by devcfg in voice_begin
 
 // --- helpers ---------------------------------------------------------------
 
@@ -64,9 +64,8 @@ static bool has_eleven_key(void) {
     return k && strlen(k) >= 10 && strncmp(k, "your-", 5) != 0;
 }
 
-// Linear gain 0..21 -> 0..1.0. Keeping it linear (not log-taper) mirrors
-// the Arduino Audio library's setVolume() behaviour so the UI slider feels
-// identical.
+// Linear gain 0..21 -> 0..1.0. Linear (not log-taper) makes the low end of
+// the UI slider feel responsive on the small tabletop speaker.
 static float volume_gain(void) {
     uint8_t v = s_volume_0_21;
     if (v > 21) v = 21;
@@ -143,7 +142,9 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
     const int attack  = total / 6;
     const int release = total / 3;
 
-    int16_t buf[I2S_WRITE_FRAMES * 2];   // interleaved stereo
+    // Static: 2 KB interleaved-stereo buffer doesn't belong on the caller's
+    // (app_main) stack. Boot beeps are serialised so a shared buffer is safe.
+    static int16_t buf[I2S_WRITE_FRAMES * 2];
     int idx = 0;
     for (int s = 0; s < total; s++) {
         float env = 1.0f;
@@ -175,9 +176,8 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
 // path means every `on_data` byte is raw 16-bit PCM; we just expand to
 // stereo and push to I2S.
 typedef struct {
-    // Scratch buffer for the stereo expansion. Sized to handle any single
-    // on_data chunk the http client might deliver (cap at 8 KB mono -> 16
-    // KB stereo). Bigger chunks just loop.
+    // Scratch for mono->stereo expansion, one I2S write chunk at a time.
+    // 512 frames * 2 chan * 2 bytes = 2 KB. Bigger HTTP chunks just loop.
     int16_t stereo_scratch[I2S_WRITE_FRAMES * 2];
     // Mono accumulator: if a chunk arrives with an odd byte count (rare,
     // but possible at TCP boundaries), hold the straggler for the next
@@ -398,8 +398,8 @@ static void audio_task(void *arg) {
 bool voice_begin(void) {
     if (s_tx) return true;
 
-    // Seed volume from persisted settings so the boot beep respects the
-    // user's last choice.
+    // Seed volume from persisted settings before the first voice_speak().
+    // The boot beep below uses a fixed `amp` and ignores this.
     s_volume_0_21 = devcfg_volume();
 
     esp_err_t err = i2s_install(TTS_SAMPLE_HZ);
@@ -421,8 +421,11 @@ bool voice_begin(void) {
         return false;
     }
 
+    // 6 KB stack: mbedTLS runs heap-only in this build (see sdkconfig), so
+    // the HTTPS TTS path stays well under 4 KB of stack even during the
+    // handshake. Leaves ~2 KB margin against FreeRTOS's watermark.
     BaseType_t ok = xTaskCreatePinnedToCore(
-        audio_task, "voice_audio", 8192, NULL, 6, &s_audio_task, 0);
+        audio_task, "voice_audio", 6144, NULL, 6, &s_audio_task, 0);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "audio task create failed");
         vSemaphoreDelete(s_request_sem);
@@ -458,11 +461,6 @@ void voice_stop(void) {
 void voice_set_volume(uint8_t v) {
     if (v > 21) v = 21;
     s_volume_0_21 = v;
-}
-
-void voice_loop(void) {
-    // No periodic pumping needed; i2s_channel_write blocks until the DMA
-    // ring is ready, and the audio task drives everything.
 }
 
 bool voice_diagnose(void) {

@@ -1,11 +1,7 @@
 // ---------------------------------------------------------------------------
 //  Daemon's Solana wallet — holds the public address, polls Helius (or the
-//  public RPC) for balances, and exposes a short human-readable summary for
-//  the AI prompt.
-//
-//  Signing is stubbed until phase 4 wires in Ed25519 (needed by x402). For
-//  this phase the wallet is read-only; wallet_can_sign() always returns
-//  false and wallet_sign() returns false.
+//  public RPC) for balances, signs Ed25519 payloads for x402, and exposes a
+//  short human-readable summary for the AI prompt.
 // ---------------------------------------------------------------------------
 #pragma once
 #include <stdbool.h>
@@ -16,8 +12,7 @@
 extern "C" {
 #endif
 
-// Mint + token symbol cap mirrors the base58 max plus a small margin. 44
-// chars is the longest a mainnet Solana address can be.
+// 44 chars is the longest a mainnet Solana address can be; +1 for NUL.
 #define WALLET_MINT_MAX   45
 #define WALLET_SYM_MAX    12
 #define WALLET_MAX_TOKENS 10
@@ -39,13 +34,16 @@ const char *wallet_pubkey(void);
 // 32-byte pubkey, or NULL if the wallet wasn't initialised.
 const uint8_t *wallet_pubkey_bytes(void);
 
-// Phase-3 stub: always false. Phase 4 flips this to true once Ed25519 is
-// vendored and a 64-byte secret is present.
+// True when a 64-byte seed is loaded and the derived pubkey matches.
 bool wallet_can_sign(void);
 
-// Phase-3 stub: always returns false. Present so solana_tx can be compiled
-// against the final API surface in phase 4 without a header churn.
+// Ed25519-signs `data` into `sig_out`. False if !wallet_can_sign().
 bool wallet_sign(const uint8_t *data, size_t len, uint8_t sig_out[64]);
+
+// Writes the Solana JSON-RPC endpoint into `out` (Helius when HELIUS_API_KEY
+// is configured, otherwise the public mainnet endpoint). Pure function of
+// secrets.h — safe before wallet_begin().
+void wallet_rpc_url(char *out, size_t cap);
 
 // Blocking two-call RPC round-trip (getBalance + getTokenAccountsByOwner).
 // Safe to call from the background task.

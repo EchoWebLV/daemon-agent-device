@@ -18,6 +18,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -98,13 +99,13 @@ static SemaphoreHandle_t s_trigger = NULL;
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
-static void build_rpc_url(void) {
+void wallet_rpc_url(char *out, size_t cap) {
+    if (!out || cap == 0) return;
     const char *key = HELIUS_API_KEY;
     if (key && key[0] && strncmp(key, "PASTE-", 6) != 0 && strlen(key) >= 10) {
-        snprintf(s_rpc_url, sizeof(s_rpc_url),
-                 "https://mainnet.helius-rpc.com/?api-key=%s", key);
+        snprintf(out, cap, "https://mainnet.helius-rpc.com/?api-key=%s", key);
     } else {
-        snprintf(s_rpc_url, sizeof(s_rpc_url), "%s", SOLANA_PUBLIC_RPC);
+        snprintf(out, cap, "%s", SOLANA_PUBLIC_RPC);
     }
 }
 
@@ -151,7 +152,7 @@ bool wallet_begin(void) {
         }
     }
 
-    build_rpc_url();
+    wallet_rpc_url(s_rpc_url, sizeof(s_rpc_url));
     s_ok = true;
     ESP_LOGI(TAG, "address %s (key %d bytes, can_sign=%d)",
              s_pubkey, (int)s_secret_len, (int)wallet_can_sign());
@@ -269,11 +270,11 @@ static bool rpc_call(const char *payload, char *out, size_t out_cap) {
 // ---------------------------------------------------------------------------
 // Refresh primitives
 // ---------------------------------------------------------------------------
-// Heap-allocate the RPC response buffer — 16 KB is too big for the wallet
-// task's stack, and the two refresh calls happen serially so we only need
-// one at a time.
+// Heap-allocate the RPC response buffer from PSRAM — 16 KB is too big for
+// the wallet task's stack, and the two refresh calls happen serially so we
+// only need one at a time. PSRAM keeps internal RAM free for TLS handshakes.
 static char *alloc_rpc_buf(void) {
-    return (char *)malloc(WALLET_RSP_MAX);
+    return (char *)heap_caps_malloc(WALLET_RSP_MAX, MALLOC_CAP_SPIRAM);
 }
 
 static void refresh_sol_balance(char *buf) {
@@ -315,9 +316,11 @@ static void refresh_tokens(char *buf) {
 
     // Build a fresh list; don't mutate s_tokens until we've fully parsed so
     // a bad mid-parse doesn't leave the UI looking at partial data.
-    token_holding_t next[WALLET_MAX_TOKENS * 2];  // overshoot, sort + truncate
-    size_t          next_n = 0;
-    char            found_usdc_ata[WALLET_MINT_MAX] = {0};
+    // Static because refresh_tokens() only runs on the single wallet task,
+    // and the overshoot array is too big (~1.4 KB) for the task stack.
+    static token_holding_t next[WALLET_MAX_TOKENS * 2];
+    size_t                 next_n = 0;
+    char                   found_usdc_ata[WALLET_MINT_MAX] = {0};
 
     cJSON *acct = NULL;
     cJSON_ArrayForEach(acct, value) {
@@ -338,8 +341,8 @@ static void refresh_tokens(char *buf) {
         // address at payment time and the RPC order isn't guaranteed.
         if (strcmp(mint->valuestring, USDC_MINT) == 0 &&
             cJSON_IsString(pubkey)) {
-            strncpy(found_usdc_ata, pubkey->valuestring,
-                    sizeof(found_usdc_ata) - 1);
+            strlcpy(found_usdc_ata, pubkey->valuestring,
+                    sizeof(found_usdc_ata));
         }
 
         const cJSON *ui_amount = cJSON_GetObjectItemCaseSensitive(amt, "uiAmount");
@@ -349,9 +352,8 @@ static void refresh_tokens(char *buf) {
 
         token_holding_t *t = &next[next_n++];
         memset(t, 0, sizeof(*t));
-        strncpy(t->mint, mint->valuestring, sizeof(t->mint) - 1);
-        const char *sym = symbol_for_mint(t->mint);
-        strncpy(t->symbol, sym, sizeof(t->symbol) - 1);
+        strlcpy(t->mint, mint->valuestring, sizeof(t->mint));
+        strlcpy(t->symbol, symbol_for_mint(t->mint), sizeof(t->symbol));
         t->amount   = ui;
         t->decimals = (uint8_t)(cJSON_IsNumber(decimals) ? decimals->valueint : 0);
     }

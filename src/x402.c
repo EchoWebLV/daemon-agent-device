@@ -21,6 +21,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
@@ -54,21 +55,6 @@ static const char *USDC_MINT         = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyT
 #define X402_B64_CAP  12288   // base64 of envelope
 
 // ---------------------------------------------------------------------------
-// Helper: pick RPC URL. Mirrors wallet.c's logic (Helius if keyed, public
-// endpoint otherwise).
-// ---------------------------------------------------------------------------
-static const char *SOLANA_PUBLIC_RPC = "https://api.mainnet-beta.solana.com";
-
-static void build_rpc_url(char *out, size_t cap) {
-    const char *key = HELIUS_API_KEY;
-    if (key && key[0] && strncmp(key, "PASTE-", 6) != 0 && strlen(key) >= 10) {
-        snprintf(out, cap, "https://mainnet.helius-rpc.com/?api-key=%s", key);
-    } else {
-        snprintf(out, cap, "%s", SOLANA_PUBLIC_RPC);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Small body-only event handler, used for the two helper RPC calls
 // (getLatestBlockhash + getTokenAccountsByOwner-by-mint).
 // ---------------------------------------------------------------------------
@@ -93,7 +79,7 @@ static bool rpc_call(const char *payload, char *out, size_t out_cap) {
     out[0] = '\0';
 
     char url[160];
-    build_rpc_url(url, sizeof(url));
+    wallet_rpc_url(url, sizeof(url));
 
     rpc_body_t rb = { .buf = out, .cap = out_cap, .len = 0 };
     esp_http_client_config_t cfg = {
@@ -154,8 +140,9 @@ static bool fetch_usdc_ata(const char *owner_b58, char *out, size_t cap) {
     if (n < 0 || n >= (int)sizeof(payload)) return false;
 
     // One token account on-chain is ~1 KB of jsonParsed metadata; 4 KB is
-    // a safe upper bound for the single-account response we parse.
-    char *body = malloc(4096);
+    // a safe upper bound for the single-account response we parse. PSRAM
+    // keeps internal heap free for the concurrent TLS session.
+    char *body = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
     if (!body) return false;
     bool ok = false;
     if (rpc_call(payload, body, 4096)) {
@@ -397,7 +384,7 @@ static bool build_payment_header(const char *desc_json,
     exts_str = exts_node ? cJSON_PrintUnformatted(exts_node) : strdup("{}");
     if (!ext_str || !exts_str) goto out;
 
-    env = malloc(X402_ENV_CAP);
+    env = (char *)heap_caps_malloc(X402_ENV_CAP, MALLOC_CAP_SPIRAM);
     if (!env) goto out;
     int n = snprintf(env, X402_ENV_CAP,
         "{\"x402Version\":2,"
@@ -468,9 +455,12 @@ void x402_post(const char *url,
     }
 
     // ---- Phase 1: initial POST (capturing potential 402 headers) --------
-    char *pr  = calloc(1, X402_HDR_CAP);
-    char *xpr = calloc(1, X402_HDR_CAP);
-    char *wa  = calloc(1, X402_HDR_CAP);
+    // PSRAM: 3 × 6 KB header scratch is a big chunk of internal heap during
+    // a live TLS session. The header scratch is only touched by the event
+    // handler + the post-request decoder — no DMA, safe in PSRAM.
+    char *pr  = (char *)heap_caps_calloc(1, X402_HDR_CAP, MALLOC_CAP_SPIRAM);
+    char *xpr = (char *)heap_caps_calloc(1, X402_HDR_CAP, MALLOC_CAP_SPIRAM);
+    char *wa  = (char *)heap_caps_calloc(1, X402_HDR_CAP, MALLOC_CAP_SPIRAM);
     if (!pr || !xpr || !wa) {
         free(pr); free(xpr); free(wa);
         strlcpy(out->error, "oom", sizeof(out->error));
@@ -522,8 +512,8 @@ void x402_post(const char *url,
 
     // ---- Phase 2: if 402, build payment and retry ------------------------
     if (code1 == 402) {
-        char *desc = malloc(X402_DESC_CAP);
-        char *b64  = malloc(X402_B64_CAP);
+        char *desc = (char *)heap_caps_malloc(X402_DESC_CAP, MALLOC_CAP_SPIRAM);
+        char *b64  = (char *)heap_caps_malloc(X402_B64_CAP,  MALLOC_CAP_SPIRAM);
         if (!desc || !b64) {
             free(desc); free(b64);
             strlcpy(out->error, "oom", sizeof(out->error));

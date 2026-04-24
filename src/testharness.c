@@ -84,6 +84,21 @@ static void rtrim(char *s) {
     }
 }
 
+// The protocol is space-delimited but SSIDs can legally contain spaces,
+// so we rewrite spaces to underscores on the wire and the host reverses it.
+// Empty SSID becomes "-" so the column stays non-blank.
+static void safe_ssid(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    size_t j = 0;
+    if (src) {
+        for (size_t i = 0; src[i] && j + 1 < cap; i++) {
+            dst[j++] = (src[i] == ' ') ? '_' : src[i];
+        }
+    }
+    dst[j] = '\0';
+    if (!dst[0] && cap > 1) { dst[0] = '-'; dst[1] = '\0'; }
+}
+
 // Case-insensitive match of the first token. Returns pointer to rest-of-line
 // (after the matched token and any intermediate whitespace), or NULL if no
 // match. Empty `token` is a programming error and asserts via NULL return.
@@ -237,16 +252,8 @@ static void handle_swipe(const char *args) {
 
 static void handle_wifi_status(void) {
     if (wifi_sta_is_connected()) {
-        // SSIDs can contain spaces; the protocol is space-delimited so we
-        // mangle spaces to underscores and the host reverses it.
         char ssid[33];
-        const char *src = wifi_sta_current_ssid();
-        size_t j = 0;
-        for (size_t i = 0; src[i] && j + 1 < sizeof(ssid); i++) {
-            ssid[j++] = (src[i] == ' ') ? '_' : src[i];
-        }
-        ssid[j] = '\0';
-        if (!ssid[0]) snprintf(ssid, sizeof(ssid), "-");
+        safe_ssid(ssid, sizeof(ssid), wifi_sta_current_ssid());
         char buf[64];
         snprintf(buf, sizeof(buf), "wifi connected %s %d",
                  ssid, (int)wifi_sta_current_rssi());
@@ -269,13 +276,7 @@ static void handle_wifi_scan(void) {
     //   TEST NET <ssid> <rssi> <enc>
     for (size_t i = 0; i < n; i++) {
         char ssid[33];
-        const char *src = aps[i].ssid;
-        size_t j = 0;
-        for (size_t k = 0; src[k] && j + 1 < sizeof(ssid); k++) {
-            ssid[j++] = (src[k] == ' ') ? '_' : src[k];
-        }
-        ssid[j] = '\0';
-        if (!ssid[0]) snprintf(ssid, sizeof(ssid), "-");
+        safe_ssid(ssid, sizeof(ssid), aps[i].ssid);
         printf("TEST NET %s %d %s\n",
                ssid, (int)aps[i].rssi,
                aps[i].auth_open ? "OPEN" : "WPA");
@@ -342,11 +343,11 @@ static void handle_x402_call(const char *url) {
         body = "{}";
     }
 
-    // 4 KB response scratch. The x402 facilitators we hit reply with small
-    // JSON (chat/completions returns a few hundred bytes; Shannon returns
-    // a handful). Anything larger is the caller's problem, not ours.
-    enum { X402_SCRATCH = 4096 };
-    char *scratch = (char *)malloc(X402_SCRATCH);
+    // 4 KB response scratch from PSRAM — internal RAM is precious during an
+    // in-flight x402 round-trip (TLS handshake + Solana tx build). Facilitator
+    // replies are a few hundred bytes; anything bigger truncates.
+    #define X402_SCRATCH 4096
+    char *scratch = (char *)heap_caps_malloc(X402_SCRATCH, MALLOC_CAP_SPIRAM);
     if (!scratch) {
         resp_err("x402 scratch_oom");
         return;
@@ -482,14 +483,12 @@ static void harness_task(void *arg) {
 // ---------- public API -----------------------------------------------------
 
 bool test_harness_begin(void) {
-    // 12 KB stack: the AI PING and X402 CALL verbs synchronously drive
-    // ai_ask_one_shot() / x402_post(), both of which walk mbedTLS for an
-    // HTTPS handshake + a JSON parse + (on x402) a Solana transaction
-    // build and sign. Peak stack use during a chat round-trip lands around
-    // 7-8 KB; 12 KB keeps the FreeRTOS watermark at a safe ~4 KB.
+    // 8 KB stack. AI PING and X402 CALL drive mbedTLS + cJSON + (for x402)
+    // a Solana tx build/sign. mbedTLS is heap-only in this build, so the
+    // handshake stays in the ~4 KB range; 8 KB leaves ~2 KB of watermark.
     BaseType_t ok = xTaskCreatePinnedToCore(harness_task,
                                             "testharness",
-                                            12 * 1024,  // stack
+                                            8 * 1024,
                                             NULL,
                                             4,          // priority
                                             NULL,

@@ -51,13 +51,9 @@ bool voice_is_speaking(void);
 // nothing is playing.
 void voice_stop(void);
 
-// Software volume. 0..21 matches the Arduino API; applied as a multiplier
-// on the PCM samples before they go to I2S. 0 = mute, 21 = unity gain.
+// Software volume. 0..21, applied as a linear multiplier on the PCM samples
+// before they go to I2S. 0 = mute, 21 = unity gain.
 void voice_set_volume(uint8_t v);
-
-// Periodic pump hook. No-op today; exposed so the main loop can keep the
-// symmetry with the Arduino version's voiceLoop().
-void voice_loop(void);
 
 // One-shot HTTPS probe — POSTs a tiny utterance to ElevenLabs and logs
 // the status + first 64 bytes of the body without playing anything. Useful
