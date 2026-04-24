@@ -335,6 +335,10 @@ void ui_tick(void) {
         creature_screen_set_talking(speaking);
         if (!speaking) {
             creature_screen_set_mood(CREATURE_MOOD_IDLE);
+            // Wipe the subtitle so the face returns to a clean idle state
+            // once the audio has drained. Keeping the reply on-screen past
+            // the spoken line makes the face feel "stuck".
+            creature_screen_set_subtitle("");
         }
         last_speaking = speaking;
     }

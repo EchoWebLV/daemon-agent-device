@@ -50,6 +50,12 @@ static const char *TAG = "creature_screen";
 #define EYE_R_X        (SCR_W - EYE_L_X - EYE_W)
 #define EYE_Y          115
 
+// Shift every face block down by this much from the coordinates listed in
+// the k_* tables below. Tweak in one place to raise/lower the face without
+// touching each feature's Y column.
+#define FACE_Y_OFFSET   20
+#define SMILE_MID_Y    (205 + FACE_Y_OFFSET)    // where the talking bar centers
+
 // --- widget handles --------------------------------------------------------
 static lv_obj_t *s_scr          = NULL;
 // Top-left slot shows USDC; SOL price on the right.
@@ -167,8 +173,8 @@ static void mouth_step(void) {
     int16_t h = h_cycle[idx];
     lv_obj_set_size(s_mouth, MOUTH_W, h);
     // Re-anchor so the bar grows around its midline rather than the top
-    // edge, keeping the mouth centered in the smile slot at y≈205.
-    lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, 205 - h / 2);
+    // edge, keeping the mouth centered in the smile slot.
+    lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - h / 2);
 }
 
 static void mouth_timer_cb(lv_timer_t *t) {
@@ -224,26 +230,29 @@ bool creature_screen_init(void) {
 
     // --- eyebrows: two 5-pixel diagonal zigzags --------------------------
     for (size_t i = 0; i < sizeof(s_ant_l) / sizeof(s_ant_l[0]); i++) {
-        s_ant_l[i] = make_block(s_scr, k_ant_l[i][0], k_ant_l[i][1],
-                                PX, PX, face);
-        s_ant_r[i] = make_block(s_scr, k_ant_r[i][0], k_ant_r[i][1],
-                                PX, PX, face);
+        s_ant_l[i] = make_block(s_scr, k_ant_l[i][0],
+                                k_ant_l[i][1] + FACE_Y_OFFSET, PX, PX, face);
+        s_ant_r[i] = make_block(s_scr, k_ant_r[i][0],
+                                k_ant_r[i][1] + FACE_Y_OFFSET, PX, PX, face);
     }
 
     // --- eyes: small 30×30 blocks (no rounded corners — pixel aesthetic) -
-    s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y, EYE_W, EYE_H, face);
-    s_eye_r = make_block(s_scr, EYE_R_X, EYE_Y, EYE_W, EYE_H, face);
+    s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y + FACE_Y_OFFSET,
+                         EYE_W, EYE_H, face);
+    s_eye_r = make_block(s_scr, EYE_R_X, EYE_Y + FACE_Y_OFFSET,
+                         EYE_W, EYE_H, face);
     install_eye_pulse(s_eye_l);
     install_eye_pulse(s_eye_r);
 
-    // --- smile: 10 pixel blocks forming a curved-upward arc ---------------
+    // --- smile: 14 pixel blocks forming a wide curved-upward arc ---------
     for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
-        s_smile[i] = make_block(s_scr, k_smile[i][0], k_smile[i][1],
-                                PX, PX, face);
+        s_smile[i] = make_block(s_scr, k_smile[i][0],
+                                k_smile[i][1] + FACE_Y_OFFSET, PX, PX, face);
     }
 
     // --- talking mouth: single rectangle, hidden until talking starts -----
-    s_mouth = make_block(s_scr, (SCR_W - MOUTH_W) / 2, 203, MOUTH_W, 4, face);
+    s_mouth = make_block(s_scr, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - 2,
+                         MOUTH_W, 4, face);
     lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
 
     s_mouth_timer = lv_timer_create(mouth_timer_cb, 80, NULL);
@@ -336,7 +345,7 @@ void creature_screen_set_talking(bool on) {
         // Reset mouth bar and hide it so the smile is cleanly visible again.
         if (s_mouth) {
             lv_obj_set_size(s_mouth, MOUTH_W, 4);
-            lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, 203);
+            lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - 2);
             lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
         }
         set_smile_visible(true);
