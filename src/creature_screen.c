@@ -11,11 +11,6 @@
 //    +--------------------------------------------------+
 //    | USDC 12.34                     SOL $198.42       |
 //    +--------------------------------------------------+
-//    |  ▓             ▓     <- eyebrow tips             |
-//    |  ▓             ▓                                 |
-//    |   ▓           ▓      <- diagonal zigzag          |
-//    |   ▓           ▓                                  |
-//    |    ▓         ▓       <- bases above eyes         |
 //    |                                                  |
 //    |    ███       ███     <- eyes (30×30, pulse)      |
 //    |    ███       ███                                 |
@@ -52,8 +47,10 @@ static const char *TAG = "creature_screen";
 
 // Shift every face block down by this much from the coordinates listed in
 // the k_* tables below. Tweak in one place to raise/lower the face without
-// touching each feature's Y column.
-#define FACE_Y_OFFSET   20
+// touching each feature's Y column. Negative value pulls the face up so
+// its center lands on the 320-tall panel's midline (eye-top 115 + smile-
+// bottom 215 averages 165, so -5 lands on 160).
+#define FACE_Y_OFFSET   (-5)
 #define SMILE_MID_Y    (205 + FACE_Y_OFFSET)    // where the talking bar centers
 
 // --- widget handles --------------------------------------------------------
@@ -66,30 +63,12 @@ static lv_obj_t *s_usdc_label   = NULL;
 static lv_obj_t *s_eye_l        = NULL;
 static lv_obj_t *s_eye_r        = NULL;
 static lv_obj_t *s_mouth        = NULL;   // animated bar used while talking
-static lv_obj_t *s_ant_l[5]     = {0};    // left eyebrow (5 pixels)
-static lv_obj_t *s_ant_r[5]     = {0};    // right eyebrow (5 pixels)
 static lv_obj_t *s_smile[14]    = {0};    // 14-pixel smile shown while idle
 
 static lv_obj_t *s_subtitle     = NULL;
 
 // Pixel coordinates for static face features. Kept at module scope (not
 // lookup tables at init) so the geometry is easy to tweak in one place.
-// Eyebrows — 5-pixel diagonal-zigzag strips slanting from the outer top
-// corner down toward each eye. Two stacked pixels at the tip, one step
-// inner, two stacked below, and one more step inner at the base read as
-// a clear diagonal (matches the reference sketch).
-static const int16_t k_ant_l[5][2] = {
-    { 60, 40}, { 60, 50},     // tip, stacked outer
-    { 70, 60},                 // step inner
-    { 70, 70},                 // stacked
-    { 80, 80},                 // base — above left eye
-};
-static const int16_t k_ant_r[5][2] = {
-    {170, 40}, {170, 50},
-    {160, 60},
-    {160, 70},
-    {150, 80},
-};
 // Smile — 14-pixel arc, three rows. Outer tips rise two rows above a
 // ten-pixel base, giving the face a much wider grin than before.
 static const int16_t k_smile[14][2] = {
@@ -228,14 +207,6 @@ bool creature_screen_init(void) {
 
     lv_color_t face = SCR_COLOR_ACCENT;
 
-    // --- eyebrows: two 5-pixel diagonal zigzags --------------------------
-    for (size_t i = 0; i < sizeof(s_ant_l) / sizeof(s_ant_l[0]); i++) {
-        s_ant_l[i] = make_block(s_scr, k_ant_l[i][0],
-                                k_ant_l[i][1] + FACE_Y_OFFSET, PX, PX, face);
-        s_ant_r[i] = make_block(s_scr, k_ant_r[i][0],
-                                k_ant_r[i][1] + FACE_Y_OFFSET, PX, PX, face);
-    }
-
     // --- eyes: small 30×30 blocks (no rounded corners — pixel aesthetic) -
     s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y + FACE_Y_OFFSET,
                          EYE_W, EYE_H, face);
@@ -315,10 +286,6 @@ void creature_screen_set_mood(creature_mood_t m) {
 
     if (!lvgl_port_lock(0)) return;
     // Repaint every face block so the whole creature reads the same mood.
-    for (size_t i = 0; i < sizeof(s_ant_l) / sizeof(s_ant_l[0]); i++) {
-        if (s_ant_l[i]) lv_obj_set_style_bg_color(s_ant_l[i], c, LV_PART_MAIN);
-        if (s_ant_r[i]) lv_obj_set_style_bg_color(s_ant_r[i], c, LV_PART_MAIN);
-    }
     if (s_eye_l) lv_obj_set_style_bg_color(s_eye_l, c, LV_PART_MAIN);
     if (s_eye_r) lv_obj_set_style_bg_color(s_eye_r, c, LV_PART_MAIN);
     for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
