@@ -20,12 +20,12 @@
 //    ui_refresh_wallet() / ui_refresh_settings()
 //                                   — after a wallet refresh / settings change
 //
-//  Navigation:
-//    creature  ← swipe left  → wallet
-//    creature  ← swipe right → settings → tap Wi-Fi row → wifi screen
-//    wifi      ← swipe down (or on-connect) → settings
-//    wallet    ← swipe right → creature
-//    settings  ← swipe left  → creature
+//  Navigation (horizontal swipes only; vertical only on the wifi modal):
+//    creature  -- swipe left  --> wallet
+//    creature  -- swipe right --> settings --> tap Wi-Fi row --> wifi
+//    wallet    -- swipe right --> creature
+//    settings  -- swipe left  --> creature
+//    wifi      -- swipe down (or on-connect) --> settings
 //  Swipe handlers are installed by ui_init() on each screen's root.
 // ---------------------------------------------------------------------------
 #include <stdbool.h>

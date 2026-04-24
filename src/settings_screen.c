@@ -276,12 +276,12 @@ void settings_screen_refresh(void) {
         wifi_sta_ip_str(ip, sizeof(ip));
         const char *ssid = wifi_sta_current_ssid();
         int8_t rssi = wifi_sta_current_rssi();
-        snprintf(wifi_sub, sizeof(wifi_sub), "%s  •  %s  •  %d dBm",
+        snprintf(wifi_sub, sizeof(wifi_sub), "%s  |  %s  |  %d dBm",
                  ssid[0] ? ssid : "(unknown)",
                  ip[0] ? ip : "(no ip)",
                  (int)rssi);
     } else {
-        snprintf(wifi_sub, sizeof(wifi_sub), "not connected  •  tap to scan");
+        snprintf(wifi_sub, sizeof(wifi_sub), "not connected  |  tap to scan");
     }
 
     if (!lvgl_port_lock(0)) return;

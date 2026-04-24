@@ -261,12 +261,10 @@ def c_paint_under_budget(dev: Device) -> str:
 
 
 def c_settings_from_swipe(dev: Device) -> str:
-    """Swipe down on the creature screen; expect settings to open. On the
-    ESP-IDF build this maps to ui_inject_swipe(DOWN) — same transition the
-    LVGL gesture listener runs when the user actually swipes."""
+    """From the creature, swipe RIGHT should land on settings."""
     dev.send("TEST SCREEN FORCE creature", timeout=3.0)
     time.sleep(0.3)
-    dev.send("TEST SWIPE DOWN", timeout=2.0)
+    dev.send("TEST SWIPE RIGHT", timeout=2.0)
     time.sleep(0.3)
     got = dev.send("TEST SCREEN GET", timeout=2.0)[0].split()[-1]
     assert got == "settings", f"expected settings, got {got}"

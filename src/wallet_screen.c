@@ -1,25 +1,21 @@
 // ---------------------------------------------------------------------------
 //  Wallet screen implementation.
 //
-//  Layout:
+//  Layout (240x320 panel, half-and-half split):
 //
-//    +--------------------------------------------------+
-//    | status                       SOL $198.42         |
-//    |                              USDC 12.34          |
-//    +--------------------------------------------------+
-//    | 2pRk…C9mj                                        |
-//    |                                                  |
-//    |        12.3456 SOL                               |
-//    |        ≈ $2440.58                                |
-//    |                                                  |
-//    | ── HOLDINGS ─────────────────────────────────    |
-//    |  USDC              12.34                         |
-//    |  JUP              420.00                         |
-//    |  BONK         1,000,000                          |
-//    |  ...                                             |
-//    |                                                  |
-//    |                     swipe →                      |
-//    +--------------------------------------------------+
+//    +------------------------------------------+
+//    | wallet                                 X |  status bar (26 px)
+//    +------------------------------------------+
+//    |                                          |
+//    |            [ QR CODE 128 ]               |  top half — QR centered
+//    |                                          |
+//    |           abcd...wxyz                    |  truncated pubkey caption
+//    +------------------------------------------+
+//    |  SOL             12.3456   ~ $2440.58    |  bottom half — balances
+//    |  USDC               12.34                |  + SPL tokens in a list
+//    |  JUP               420.00                |
+//    |  BONK         1,000,000                  |
+//    +------------------------------------------+
 // ---------------------------------------------------------------------------
 #include "wallet_screen.h"
 #include "screens_common.h"
@@ -43,21 +39,18 @@ static lv_obj_t *s_status_label = NULL;
 // are kept as no-ops so ui.c can still broadcast without caring who
 // listens.
 static lv_obj_t *s_addr_label   = NULL;
-static lv_obj_t *s_sol_label    = NULL;
-static lv_obj_t *s_usd_label    = NULL;
 static lv_obj_t *s_qrcode       = NULL;    // lv_qrcode; rendered once on first refresh
 static bool      s_qr_set       = false;   // flips true after the pubkey is painted in
 static lv_obj_t *s_list         = NULL;
-static lv_obj_t *s_footer       = NULL;
 
-// Format a base58 pubkey as "abcd…wxyz" (4 chars each side). Pass a 12-byte
-// output buffer minimum; 16 bytes is plenty.
+// Format a base58 pubkey as "abcd...wxyz" (4 chars each side) using ASCII
+// ellipsis — the default Montserrat build has no Unicode ellipsis glyph
+// and prints a tofu box otherwise. 16 bytes covers it.
 static void truncate_addr(const char *full, char *out, size_t cap) {
     if (!full || !full[0]) { snprintf(out, cap, "(no wallet)"); return; }
     size_t n = strlen(full);
-    if (n <= 10 || cap < 12) { snprintf(out, cap, "%s", full); return; }
-    // U+2026 HORIZONTAL ELLIPSIS is 3 UTF-8 bytes. Hardcoded for bravity.
-    snprintf(out, cap, "%c%c%c%c\xE2\x80\xA6%s",
+    if (n <= 10 || cap < 14) { snprintf(out, cap, "%s", full); return; }
+    snprintf(out, cap, "%c%c%c%c...%s",
              full[0], full[1], full[2], full[3],
              full + n - 4);
 }
@@ -144,60 +137,30 @@ bool wallet_screen_init(void) {
 
     add_close_button(bar);
 
-    // Top block: two columns below the status bar.
-    //   Left  (≈140 px wide) — truncated address, big SOL balance, USD.
-    //   Right (≈92 px wide)  — QR code of the full base58 pubkey.
-    // The QR is what a phone wallet's "Scan to pay" flow consumes, so it
-    // has to fit a ~44-char address cleanly. 88 px with a 2-module quiet
-    // zone renders a crisp ~29-module code that scans fine from 10 cm.
-
-    // --- Left column: textual address + balances ---------------------------
-    s_addr_label = lv_label_create(s_scr);
-    lv_label_set_text(s_addr_label, "—");
-    lv_obj_set_style_text_color(s_addr_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_addr_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 8);
-
-    s_sol_label = lv_label_create(s_scr);
-    lv_label_set_text(s_sol_label, "—");
-    lv_obj_set_style_text_color(s_sol_label, SCR_COLOR_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_sol_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 32);
-
-    s_usd_label = lv_label_create(s_scr);
-    lv_label_set_text(s_usd_label, "");
-    lv_obj_set_style_text_color(s_usd_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_usd_label, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 54);
-
-    // Little caption under the left column hinting what the QR is for.
-    lv_obj_t *scan_hint = lv_label_create(s_scr);
-    lv_label_set_text(scan_hint, "scan \xE2\x86\x92");   // "scan →"
-    lv_obj_set_style_text_color(scan_hint, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(scan_hint, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 80);
-
-    // --- Right column: QR code --------------------------------------------
-    //
-    // lv_qrcode expects a light "quiet zone" around the modules to scan
-    // reliably, so we give it a white background panel slightly larger
-    // than the code itself.
+    // --- Top half: QR code + truncated address caption --------------------
+    // 128 px QR leaves a 2-module quiet zone around a 33-module code; scans
+    // cleanly from 10 cm. Centered on the top half of the panel.
     s_qrcode = lv_qrcode_create(s_scr);
-    lv_qrcode_set_size(s_qrcode, 88);
+    lv_qrcode_set_size(s_qrcode, 128);
     lv_qrcode_set_dark_color(s_qrcode, lv_color_black());
     lv_qrcode_set_light_color(s_qrcode, lv_color_white());
     // Placeholder until wallet_screen_refresh() injects the real pubkey —
     // without this, lv_qrcode renders a red "error" square.
     lv_qrcode_set_data(s_qrcode, "daemon");
-    lv_obj_align(s_qrcode, LV_ALIGN_TOP_RIGHT, -6, STATUS_BAR_H + 6);
+    lv_obj_align(s_qrcode, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 6);
 
-    // --- HOLDINGS header + list -------------------------------------------
-    // Top block is now ~106 px (status 26 + QR 88 - 8 overlap). Push the
-    // holdings section down to clear the QR + caption.
-    lv_obj_t *div = lv_label_create(s_scr);
-    lv_label_set_text(div, "HOLDINGS");
-    lv_obj_set_style_text_color(div, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(div, LV_ALIGN_TOP_LEFT, 12, STATUS_BAR_H + 104);
+    s_addr_label = lv_label_create(s_scr);
+    lv_label_set_text(s_addr_label, "");
+    lv_obj_set_style_text_color(s_addr_label, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_align(s_addr_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 6 + 128 + 4);
 
+    // --- Bottom half: balance list (SOL, USDC, SPL tokens) -----------------
+    // Starts at y=SCR_H/2 to split the screen cleanly; fills the rest minus
+    // a small bottom margin.
+    const int list_y = SCR_H / 2;
     s_list = lv_list_create(s_scr);
-    lv_obj_set_size(s_list, SCR_W - 20, SCR_H - (STATUS_BAR_H + 128) - 24);
-    lv_obj_align(s_list, LV_ALIGN_TOP_LEFT, 10, STATUS_BAR_H + 124);
+    lv_obj_set_size(s_list, SCR_W - 16, SCR_H - list_y - 6);
+    lv_obj_align(s_list, LV_ALIGN_TOP_LEFT, 8, list_y);
     lv_obj_set_style_bg_color(s_list, SCR_COLOR_PANEL, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_list, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(s_list, SCR_COLOR_DIVIDER, LV_PART_MAIN);
@@ -205,12 +168,6 @@ bool wallet_screen_init(void) {
     lv_obj_set_style_radius(s_list, 10, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_list, 4, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_list, SCR_COLOR_TEXT, LV_PART_MAIN);
-
-    // Footer hint.
-    s_footer = lv_label_create(s_scr);
-    lv_label_set_text(s_footer, "swipe for menu");
-    lv_obj_set_style_text_color(s_footer, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_footer, LV_ALIGN_BOTTOM_MID, 0, -6);
 
     lvgl_port_unlock();
     ESP_LOGI(TAG, "wallet screen built");
@@ -244,23 +201,24 @@ void wallet_screen_refresh(void) {
     char addr_short[32];
     truncate_addr(pub, addr_short, sizeof(addr_short));
 
-    double sol = wallet_sol_balance();
+    double sol          = wallet_sol_balance();
+    double usdc         = wallet_usdc_amount();
     double sol_usd_rate = price_sol_usd();
 
-    char sol_str[32];
-    char usd_str[56];
-    format_amount(sol, sol_str, sizeof(sol_str));
-
+    char sol_amt[32], sol_line[96];
+    format_amount(sol, sol_amt, sizeof(sol_amt));
     if (sol_usd_rate > 0.0) {
         char dollars[32];
         format_amount(sol * sol_usd_rate, dollars, sizeof(dollars));
-        // Prefix is U+2248 ("≈") + " $" = 5 raw bytes, so 56 comfortably
-        // covers a 31-byte `dollars` plus the prefix plus NUL. GCC's
-        // format-truncation warning was for the 32-byte case.
-        snprintf(usd_str, sizeof(usd_str), "\xE2\x89\x88 $%s", dollars);
+        snprintf(sol_line, sizeof(sol_line), "%-6s  %-12s  ~ $%s",
+                 "SOL", sol_amt, dollars);
     } else {
-        usd_str[0] = 0;
+        snprintf(sol_line, sizeof(sol_line), "%-6s  %s", "SOL", sol_amt);
     }
+
+    char usdc_amt[32], usdc_line[64];
+    format_amount(usdc, usdc_amt, sizeof(usdc_amt));
+    snprintf(usdc_line, sizeof(usdc_line), "%-6s  %s", "USDC", usdc_amt);
 
     const token_holding_t *tokens = NULL;
     size_t n = 0;
@@ -269,8 +227,6 @@ void wallet_screen_refresh(void) {
     if (!lvgl_port_lock(0)) return;
 
     lv_label_set_text(s_addr_label, addr_short);
-    lv_label_set_text_fmt(s_sol_label, "%s SOL", sol_str);
-    lv_label_set_text(s_usd_label, usd_str);
 
     // Paint the full pubkey into the QR exactly once. wallet_pubkey() doesn't
     // change at runtime, and lv_qrcode_set_data re-renders the whole bitmap,
@@ -282,26 +238,29 @@ void wallet_screen_refresh(void) {
         s_qr_set = true;
     }
 
-    // Replace the list contents. lv_list_add_text / lv_list_add_button
-    // don't expose a clear; rebuilding is simplest.
+    // Rebuild the balance list — SOL first, then USDC, then SPL tokens.
+    // lv_list doesn't expose a clear so full rebuild is simplest.
     lv_obj_clean(s_list);
-    if (n == 0) {
-        lv_obj_t *empty = lv_list_add_text(s_list, "No SPL holdings yet");
-        lv_obj_set_style_text_color(empty, SCR_COLOR_DIM, LV_PART_MAIN);
-    } else {
-        for (size_t i = 0; i < n; i++) {
-            const token_holding_t *t = &tokens[i];
-            const char *sym = (t->symbol[0]) ? t->symbol : "SPL";
-            char amt[32];
-            format_amount(t->amount, amt, sizeof(amt));
-            char line[64];
-            // Pad symbol column so amounts right-align-ish in the default
-            // font. 10 columns keeps typical 4-letter tickers aligned.
-            snprintf(line, sizeof(line), "%-6s  %s", sym, amt);
-            lv_obj_t *row = lv_list_add_text(s_list, line);
-            lv_obj_set_style_text_color(row, SCR_COLOR_TEXT, LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
-        }
+
+    lv_obj_t *sol_row = lv_list_add_text(s_list, sol_line);
+    lv_obj_set_style_text_color(sol_row, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sol_row, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    lv_obj_t *usdc_row = lv_list_add_text(s_list, usdc_line);
+    lv_obj_set_style_text_color(usdc_row, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(usdc_row, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    for (size_t i = 0; i < n; i++) {
+        const token_holding_t *t = &tokens[i];
+        // USDC already rendered above — wallet_tokens() returns it too.
+        if (t->symbol[0] && strcmp(t->symbol, "USDC") == 0) continue;
+        const char *sym = (t->symbol[0]) ? t->symbol : "SPL";
+        char amt[32], line[64];
+        format_amount(t->amount, amt, sizeof(amt));
+        snprintf(line, sizeof(line), "%-6s  %s", sym, amt);
+        lv_obj_t *row = lv_list_add_text(s_list, line);
+        lv_obj_set_style_text_color(row, SCR_COLOR_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
     }
 
     lvgl_port_unlock();

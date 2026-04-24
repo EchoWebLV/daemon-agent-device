@@ -54,25 +54,21 @@ static void nav_wifi_connected(void) {
 
 // --- swipe navigation -------------------------------------------------------
 //
-// Each screen's root gets a LV_EVENT_GESTURE listener wired to a screen-
-// specific dispatch table. We swallow the gesture with lv_indev_wait_release
-// so the swipe doesn't get interpreted as a subsequent click on whatever
-// widget happens to be under the finger when it lifts.
-
-// Mapping rationale: left/right are the canonical axes, but users reach for
-// up/down just as often ("there must be more stuff that way"). Aliasing
-// UP→LEFT and DOWN→RIGHT means every swipe from the creature lands
-// somewhere, and the back-swipe from wallet/settings accepts any direction
-// that "feels like going back".
+// Each screen's root gets a LV_EVENT_GESTURE listener. Horizontal axes
+// only for side-to-side navigation — aliasing vertical swipes into
+// horizontal screen loads made the transition animation disagree with
+// the user's finger direction, which read as a bug. Wi-Fi keeps a
+// single DOWN-to-dismiss so the modal still has an escape.
+//
+// lv_indev_wait_release swallows the gesture so the finger-lift doesn't
+// click whatever widget it lands on in the next screen.
 static void on_gesture_creature(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_LEFT:
-        case LV_DIR_TOP:    ui_show_wallet();   break;
-        case LV_DIR_RIGHT:
-        case LV_DIR_BOTTOM: ui_show_settings(); break;
+        case LV_DIR_LEFT:  ui_show_wallet();   break;
+        case LV_DIR_RIGHT: ui_show_settings(); break;
         default: break;
     }
 }
@@ -81,44 +77,21 @@ static void on_gesture_wallet(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
-    switch (d) {
-        // Any "back-ish" direction returns to the creature. Keeps the
-        // wallet from being a dead-end when the user forgets which way
-        // they came in.
-        case LV_DIR_RIGHT:
-        case LV_DIR_BOTTOM:
-        case LV_DIR_TOP:    ui_show_creature(); break;
-        default: break;
-    }
+    if (d == LV_DIR_RIGHT) ui_show_creature();
 }
 
 static void on_gesture_settings(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
-    switch (d) {
-        case LV_DIR_LEFT:
-        case LV_DIR_TOP:
-        case LV_DIR_BOTTOM: ui_show_creature(); break;
-        default: break;
-    }
+    if (d == LV_DIR_LEFT) ui_show_creature();
 }
 
 static void on_gesture_wifi(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
-    switch (d) {
-        // DOWN cancels the Wi-Fi picker and returns to settings, matching
-        // the "pull down to dismiss" modal idiom most users already know.
-        // UP/LEFT/RIGHT also exit so a lost user isn't trapped in the
-        // keyboard overlay.
-        case LV_DIR_BOTTOM:
-        case LV_DIR_TOP:
-        case LV_DIR_LEFT:
-        case LV_DIR_RIGHT: ui_show_settings(); break;
-        default: break;
-    }
+    if (d == LV_DIR_BOTTOM) ui_show_settings();
 }
 
 static void install_swipe_handlers(void) {
@@ -131,20 +104,16 @@ static void install_swipe_handlers(void) {
     }
 }
 
-// Dial the gesture threshold down from LVGL's default (50 px min distance)
-// so up/down swipes trigger with less finger travel — we're on a 240x320
-// panel where 50 px is ~15% of the vertical axis and users were reporting
-// that vertical swipes routinely failed to register. Call AFTER touch_init()
-// so the pointer indev has been created.
+// Dial the gesture threshold down from LVGL's default 50 px. 25 px is a
+// thumbnail-sized flick, still well above the CST328's sub-pixel rest
+// jitter. Velocity min stays at the default 3 px/sample so hand-jitter
+// doesn't register as phantom swipes. Call AFTER touch_init() so the
+// pointer indev exists.
 void ui_tune_gestures(void) {
     if (!lvgl_port_lock(0)) return;
     lv_indev_t *indev = NULL;
     while ((indev = lv_indev_get_next(indev)) != NULL) {
         if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
-            // 25 px ≈ thumbnail-sized flick; still well above the noise floor
-            // of the CST328, which reports sub-pixel jitter at rest. Keep the
-            // velocity minimum at its default (3 px/sample) so hand-jitter
-            // doesn't register as phantom swipes.
             lv_indev_set_gesture_min_distance(indev, 25);
         }
     }
@@ -372,30 +341,20 @@ const char *ui_current_screen_name(void) {
 }
 
 void ui_inject_swipe(int direction) {
-    // Mirrors the on_gesture_* handlers above so test-driven swipes take the
-    // same navigation path a finger would. Direction encoding matches the
-    // TEST SWIPE verb: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN.
-    //
-    // Resolve the source screen by name because the caller might invoke us
-    // from a task that doesn't hold the port lock — ui_current_screen_name()
-    // takes care of that itself, and ui_show_*() each lock internally.
+    // Mirrors the on_gesture_* handlers above. Direction encoding matches
+    // the TEST SWIPE verb: 0=LEFT, 1=RIGHT, 2=UP, 3=DOWN.
     const char *from = ui_current_screen_name();
 
     if (!strcmp(from, "creature")) {
-        // LV_DIR_LEFT / LV_DIR_TOP  -> wallet
-        // LV_DIR_RIGHT / LV_DIR_BOTTOM -> settings
-        if      (direction == 0 || direction == 2) ui_show_wallet();
-        else if (direction == 1 || direction == 3) ui_show_settings();
+        if      (direction == 0) ui_show_wallet();    // LEFT
+        else if (direction == 1) ui_show_settings();  // RIGHT
     } else if (!strcmp(from, "wallet")) {
-        // Any "back-ish" direction returns to the creature.
-        if (direction == 1 || direction == 3 || direction == 2) ui_show_creature();
+        if (direction == 1) ui_show_creature();       // RIGHT → back
     } else if (!strcmp(from, "settings")) {
-        if (direction == 0 || direction == 2 || direction == 3) ui_show_creature();
+        if (direction == 0) ui_show_creature();       // LEFT → back
     } else if (!strcmp(from, "wifi")) {
-        // Wi-Fi dismisses on any direction, per on_gesture_wifi.
-        if (direction >= 0 && direction <= 3) ui_show_settings();
+        if (direction == 3) ui_show_settings();       // DOWN → dismiss
     }
-    // Unknown source screen: no-op.
 }
 
 void ui_force_repaint(void) {

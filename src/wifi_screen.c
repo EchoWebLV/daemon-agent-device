@@ -244,7 +244,7 @@ static void repopulate_list(void) {
         char line[64];
         snprintf(line, sizeof(line), "%s%s  %d dBm",
                  s_aps[i].ssid,
-                 s_aps[i].auth_open ? "" : " \xF0\x9F\x94\x92",
+                 s_aps[i].auth_open ? "" : " *",
                  (int)s_aps[i].rssi);
         // lv_list_add_button gives us a clickable row. Passing &s_aps[i]
         // as user_data so the click handler knows which one was tapped
