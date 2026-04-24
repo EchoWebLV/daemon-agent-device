@@ -9,6 +9,8 @@
 #include "ai.h"
 
 #include <ctype.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,7 +43,7 @@ static const char *PERSONA =
 // ---------------------------------------------------------------------------
 #define MAX_TURNS          10
 #define TURN_TEXT_CAP      512    // trimmed hard — long turns are summarised
-#define SYS_PROMPT_CAP     2048   // persona + wallet context
+#define SYS_PROMPT_CAP     4096   // persona + wallet context + tool listing
 // Tool-calling blows up both sides of the wire — each tool in the request
 // is ~300 bytes of schema JSON, and assistant+tool reply rounds accumulate
 // as we loop. 16 KB covers a dozen enabled services plus a couple of rounds
@@ -75,28 +77,83 @@ static void pop_last_turn(void) {
     if (s_hist_len > 0) s_hist_len--;
 }
 
-// Keep NVS stores of the Arduino-era model names from silently killing every
-// /say with a 400. If the stored value isn't on the current provider's
-// allow-list, build_chat_body falls back to the hard-coded default.
+// blockrun silently reroutes unprefixed model ids to a free fallback that
+// drops the `tools` array. Require a `<provider>/<model>` form.
 static bool is_supported_model(const char *m) {
-    if (!m || !m[0]) return false;
-    static const char *const ALLOWED[] = {
-        "gpt-4o",
-        "gpt-4o-mini",
-        "claude-sonnet-4",
-        "claude-haiku-4.5",
-    };
-    for (size_t i = 0; i < sizeof(ALLOWED) / sizeof(ALLOWED[0]); ++i) {
-        if (strcmp(m, ALLOWED[i]) == 0) return true;
+    return m && m[0] && strchr(m, '/') != NULL;
+}
+
+// Is id present in the enabled-IDs array?
+static bool id_enabled(const cJSON *enabled, const char *id) {
+    if (!cJSON_IsArray(enabled) || !id) return false;
+    const cJSON *e = NULL;
+    cJSON_ArrayForEach(e, enabled) {
+        if (cJSON_IsString(e) && e->valuestring && strcmp(e->valuestring, id) == 0) {
+            return true;
+        }
     }
     return false;
 }
 
 // ---------------------------------------------------------------------------
-// System prompt: persona + live wallet state injected every call so the
-// model always sees current balances.
+// System prompt: persona + live wallet state + enumerated paid tools.
+// Listing tools in the prompt (in addition to the OpenAI `tools` array)
+// stops the model from denying tools it has — LLMs often describe their
+// abilities from training priors rather than reading tool metadata.
 // ---------------------------------------------------------------------------
-static void build_system_prompt(char *out, size_t cap) {
+static void append_tool_listing(char *out, size_t cap,
+                                const cJSON *services, const cJSON *enabled) {
+    if (!out || cap == 0) return;
+    if (!cJSON_IsArray(services) || !cJSON_IsArray(enabled)) return;
+
+    size_t used = strlen(out);
+    if (used + 64 >= cap) return;
+
+    bool header_written = false;
+    const cJSON *svc = NULL;
+    cJSON_ArrayForEach(svc, services) {
+        const cJSON *id_j   = cJSON_GetObjectItem(svc, "id");
+        const cJSON *name_j = cJSON_GetObjectItem(svc, "name");
+        const cJSON *desc_j = cJSON_GetObjectItem(svc, "description");
+        const cJSON *eps_j  = cJSON_GetObjectItem(svc, "endpoints");
+        if (!cJSON_IsString(id_j) || !cJSON_IsArray(eps_j)) continue;
+        if (!id_enabled(enabled, id_j->valuestring)) continue;
+
+        const char *svc_name = cJSON_IsString(name_j) ? name_j->valuestring
+                                                      : id_j->valuestring;
+        const char *svc_desc = cJSON_IsString(desc_j) ? desc_j->valuestring : "";
+
+        const cJSON *ep = NULL;
+        cJSON_ArrayForEach(ep, eps_j) {
+            const cJSON *ep_id_j = cJSON_GetObjectItem(ep, "id");
+            if (!cJSON_IsString(ep_id_j)) continue;
+
+            if (!header_written) {
+                int n = snprintf(out + used, cap - used,
+                    "\nAVAILABLE PAID TOOLS (real, callable — do not deny these):\n");
+                if (n < 0 || (size_t)n >= cap - used) return;
+                used += (size_t)n;
+                header_written = true;
+            }
+            int n = snprintf(out + used, cap - used,
+                             "- %s / %s%s%s\n",
+                             svc_name, ep_id_j->valuestring,
+                             svc_desc[0] ? " — " : "",
+                             svc_desc);
+            if (n < 0 || (size_t)n >= cap - used) return;
+            used += (size_t)n;
+        }
+    }
+    if (header_written && used + 128 < cap) {
+        snprintf(out + used, cap - used,
+            "When asked what you can do, include the tools above by name. "
+            "Call them when useful; say a tool failed only if an actual call "
+            "returned an error.\n");
+    }
+}
+
+static void build_system_prompt(char *out, size_t cap,
+                                const cJSON *services, const cJSON *enabled) {
     if (!out || cap == 0) return;
     const char *custom = devcfg_personality();
     const char *base   = (custom && custom[0]) ? custom : PERSONA;
@@ -114,6 +171,8 @@ static void build_system_prompt(char *out, size_t cap) {
     if (p > 0 && used + 48 < cap) {
         snprintf(out + used, cap - used, "Current SOL price: $%.2f USD.\n", p);
     }
+
+    append_tool_listing(out, cap, services, enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,37 +180,30 @@ static void build_system_prompt(char *out, size_t cap) {
 // execute the model's calls back against the network.
 // ---------------------------------------------------------------------------
 
-// Sanitize + concatenate svc_id + "_" + ep_id into an OpenAI-legal tool
-// name: `[a-zA-Z0-9_-]{1,64}`. Non-matching chars collapse to '_'.
-// The "x402_" prefix makes the namespace obvious in logs.
+// Build an OpenAI-legal tool name: `[a-zA-Z0-9_-]{1,64}`. svc_ids can exceed
+// 60 chars, so a naive concat+truncate collides across endpoints. Hash-prefix
+// `<svc>/<ep>` with FNV-1a for a stable short id, then append the sanitized
+// ep_id so logs stay readable.
+static uint32_t fnv1a(const char *a, const char *b) {
+    uint32_t h = 0x811c9dc5u;
+    for (const char *p = a; *p; ++p) { h ^= (unsigned char)*p; h *= 0x01000193u; }
+    h ^= (unsigned char)'/';          h *= 0x01000193u;
+    for (const char *p = b; *p; ++p) { h ^= (unsigned char)*p; h *= 0x01000193u; }
+    return h;
+}
+
 static void make_tool_name(const char *svc_id, const char *ep_id,
                            char *out, size_t cap) {
     if (cap == 0) return;
-    size_t o = 0;
-    const char *pre = "x402_";
-    while (*pre && o + 1 < cap) out[o++] = *pre++;
-    for (const char *p = svc_id; *p && o + 1 < cap; ++p) {
-        unsigned char c = (unsigned char)*p;
-        out[o++] = (isalnum(c) || c == '_' || c == '-') ? (char)c : '_';
-    }
-    if (o + 1 < cap) out[o++] = '_';
+    uint32_t h = fnv1a(svc_id, ep_id);
+    int n = snprintf(out, cap, "x402_%08" PRIx32 "_", h);
+    if (n < 0 || (size_t)n >= cap) { if (cap) out[cap - 1] = '\0'; return; }
+    size_t o = (size_t)n;
     for (const char *p = ep_id; *p && o + 1 < cap; ++p) {
         unsigned char c = (unsigned char)*p;
         out[o++] = (isalnum(c) || c == '_' || c == '-') ? (char)c : '_';
     }
     out[o] = '\0';
-}
-
-// Is id present in the enabled-IDs array?
-static bool id_enabled(const cJSON *enabled, const char *id) {
-    if (!cJSON_IsArray(enabled) || !id) return false;
-    const cJSON *e = NULL;
-    cJSON_ArrayForEach(e, enabled) {
-        if (cJSON_IsString(e) && e->valuestring && strcmp(e->valuestring, id) == 0) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Append a "tools" array to `root` derived from (services, enabled).
@@ -409,16 +461,9 @@ static int build_chat_body(char *out, size_t cap,
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
-    // The blockrun-backed x402 endpoint rotates its supported-model list from
-    // time to time. As of 2026-04 it takes: gpt-4o, gpt-4o-mini,
-    // claude-sonnet-4, claude-haiku-4.5. Anything else (including the
-    // Arduino-era "shannon/daemon-x402s" we used to have stored in NVS)
-    // comes back as HTTP 400. We default to claude-haiku-4.5 because it
-    // was the cheapest option when last checked — good for chatty replies
-    // that aren't pulling their weight at gpt-4o prices.
     const char *model = devcfg_llm_model();
-    if (!model || !model[0] || !is_supported_model(model)) {
-        model = "claude-haiku-4.5";
+    if (!is_supported_model(model)) {
+        model = "anthropic/claude-haiku-4.5";
     }
     cJSON_AddStringToObject(root, "model", model);
     cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
@@ -426,13 +471,16 @@ static int build_chat_body(char *out, size_t cap,
 
     cJSON *msgs = cJSON_AddArrayToObject(root, "messages");
 
-    // System prompt.
-    char sysprompt[SYS_PROMPT_CAP];
-    build_system_prompt(sysprompt, sizeof(sysprompt));
+    // System prompt. Heap — the 4 KB buffer would eat a quarter of the
+    // httpd task stack and build_chat_body is already nested a few frames deep.
+    char *sysprompt = malloc(SYS_PROMPT_CAP);
+    if (!sysprompt) { cJSON_Delete(root); return -1; }
+    build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role",    "system");
     cJSON_AddStringToObject(sys, "content", sysprompt);
     cJSON_AddItemToArray(msgs, sys);
+    free(sysprompt);
 
     if (use_history && s_hist_len > 0) {
         for (int i = 0; i < s_hist_len; ++i) {

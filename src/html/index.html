@@ -379,7 +379,17 @@ function renderFilters(){
   for(const [id, meta] of Object.entries(CATS)) mk(id, meta.label);
 }
 
-function allServices(){ return [...BUILTIN, ...(cfg.customServices||[])]; }
+// A built-in becomes a "custom service" on the device the moment it's
+// enabled (see toggle handler below), so the same id can appear in both
+// BUILTIN and cfg.customServices. Dedup by id, preferring the custom copy
+// (user edits live there). Built-ins take precedence in the UI layout order.
+function allServices(){
+  const seen = new Set();
+  const out = [];
+  for (const s of BUILTIN)                    { if (!seen.has(s.id)) { seen.add(s.id); out.push(s); } }
+  for (const s of (cfg.customServices||[]))   { if (!seen.has(s.id)) { seen.add(s.id); out.push(s); } }
+  return out;
+}
 
 function renderServices(){
   renderFilters();
@@ -409,10 +419,30 @@ function renderServices(){
   // wire toggles
   box.querySelectorAll('.toggle').forEach(b => b.onclick = async () => {
     const id = b.dataset.id;
-    const idx = cfg.servicesEnabled.indexOf(id);
-    if(idx>=0) cfg.servicesEnabled.splice(idx,1); else cfg.servicesEnabled.push(id);
+    const wasOn = cfg.servicesEnabled.includes(id);
+    const builtin = BUILTIN.find(s => s.id === id);
+    const payload = {};
+    if (wasOn) {
+      cfg.servicesEnabled = cfg.servicesEnabled.filter(x => x !== id);
+      // If the user is disabling a built-in, drop the materialised copy
+      // so we're not persisting tool schema the device can't invoke.
+      if (builtin) {
+        cfg.customServices = (cfg.customServices||[]).filter(s => s.id !== id);
+        payload.customServices = cfg.customServices;
+      }
+    } else {
+      cfg.servicesEnabled.push(id);
+      // BUILTIN[] is JS-only — the device never sees it. Copy the full
+      // entry into customServices so ai.c can build an OpenAI tool schema
+      // for it on the next /say.
+      if (builtin && !(cfg.customServices||[]).some(s => s.id === id)) {
+        cfg.customServices = [...(cfg.customServices||[]), builtin];
+        payload.customServices = cfg.customServices;
+      }
+    }
+    payload.servicesEnabled = cfg.servicesEnabled;
     await fetch('/config',{method:'POST',headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({servicesEnabled: cfg.servicesEnabled})});
+      body: JSON.stringify(payload)});
     renderServices();
   });
   box.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
