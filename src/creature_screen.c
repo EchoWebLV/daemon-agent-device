@@ -1,32 +1,34 @@
 // ---------------------------------------------------------------------------
-//  Creature home screen — Daemon's face.
+//  Creature home screen — Daemon's face, rendered as pixel art.
 //
-//  Layout (240x320):
+//  Retro CRT-green pixels on pure black. Each face feature is built from
+//  chunky 10×10 blocks so the whole thing reads as "analogue / Tamagotchi"
+//  rather than "smooth vector". No images or custom fonts — every pixel
+//  is its own lv_obj rectangle with radius=0, styled from the palette.
+//
+//  Layout (240×320):
 //
 //    +--------------------------------------------------+
 //    | USDC 12.34                     SOL $198.42       |
 //    +--------------------------------------------------+
+//    |  ▓             ▓     <- eyebrow tips             |
+//    |  ▓             ▓                                 |
+//    |   ▓           ▓      <- diagonal zigzag          |
+//    |   ▓           ▓                                  |
+//    |    ▓         ▓       <- bases above eyes         |
 //    |                                                  |
-//    |            \         /                           |
-//    |             \       /      <- ears (lv_line)     |
-//    |        +---+         +---+                       |
-//    |        |                  |                      |
-//    |        |   ●           ●  | <- eyes (pulse)      |
-//    |        |                  |                      |
-//    |        |       ===        | <- mouth (grows      |
-//    |        +------------------+     when talking)    |
+//    |    ███       ███     <- eyes (30×30, pulse)      |
+//    |    ███       ███                                 |
+//    |                                                  |
+//    | ▓                 ▓  <- smile tips rise wide     |
+//    |  ▓               ▓                               |
+//    |   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓     <- 10-pixel base arc        |
 //    |                                                  |
 //    |       "hello, friend"   <- subtitle              |
 //    +--------------------------------------------------+
 //
-//  Everything here is drawn with plain LVGL widgets and lv_anim_t, so the
-//  look-and-feel carries across themes (LV_COLOR_DEPTH=16 on device,
-//  32 in simulator). No pixel blitting, no fonts beyond the default.
-//
-//  Thread-safety note: all of the setters below lock the lvgl_port mutex
-//  and then mutate widgets. The tick function runs on the main loop and
-//  does the same. LVGL's own timer task runs under the same mutex, so
-//  we're safe from animation-vs-mutation races.
+//  Thread-safety note: all setters lock the lvgl_port mutex before touching
+//  widgets. LVGL's own timer task runs under the same mutex.
 // ---------------------------------------------------------------------------
 #include "creature_screen.h"
 #include "screens_common.h"
@@ -39,35 +41,69 @@
 
 static const char *TAG = "creature_screen";
 
+// Pixel size — base unit for every face feature.
+#define PX              10
+#define EYE_W           30
+#define EYE_H           30
+#define MOUTH_W         60
+#define EYE_L_X         75
+#define EYE_R_X        (SCR_W - EYE_L_X - EYE_W)
+#define EYE_Y          115
+
 // --- widget handles --------------------------------------------------------
 static lv_obj_t *s_scr          = NULL;
-// s_status_label is retired — the top-left slot now holds USDC per the user's
-// request. creature_screen_set_status() is kept as a harmless no-op so the
-// main loop doesn't have to learn about the change.
+// Top-left slot shows USDC; SOL price on the right.
 static lv_obj_t *s_price_label  = NULL;
 static lv_obj_t *s_usdc_label   = NULL;
-static lv_obj_t *s_body         = NULL;
+
+// Face layers (all children of s_scr, painted on the black root).
 static lv_obj_t *s_eye_l        = NULL;
 static lv_obj_t *s_eye_r        = NULL;
-static lv_obj_t *s_mouth        = NULL;
-static lv_obj_t *s_ear_l        = NULL;
-static lv_obj_t *s_ear_r        = NULL;
+static lv_obj_t *s_mouth        = NULL;   // animated bar used while talking
+static lv_obj_t *s_ant_l[5]     = {0};    // left eyebrow (5 pixels)
+static lv_obj_t *s_ant_r[5]     = {0};    // right eyebrow (5 pixels)
+static lv_obj_t *s_smile[14]    = {0};    // 14-pixel smile shown while idle
+
 static lv_obj_t *s_subtitle     = NULL;
 
-// Mutable line-point buffers for the ears. lv_line_set_points just stores
-// the pointer, so these must outlive the line widget — module-level is
-// the simplest correct home.
-static lv_point_precise_t s_ear_l_pts[3];
-static lv_point_precise_t s_ear_r_pts[3];
+// Pixel coordinates for static face features. Kept at module scope (not
+// lookup tables at init) so the geometry is easy to tweak in one place.
+// Eyebrows — 5-pixel diagonal-zigzag strips slanting from the outer top
+// corner down toward each eye. Two stacked pixels at the tip, one step
+// inner, two stacked below, and one more step inner at the base read as
+// a clear diagonal (matches the reference sketch).
+static const int16_t k_ant_l[5][2] = {
+    { 60, 40}, { 60, 50},     // tip, stacked outer
+    { 70, 60},                 // step inner
+    { 70, 70},                 // stacked
+    { 80, 80},                 // base — above left eye
+};
+static const int16_t k_ant_r[5][2] = {
+    {170, 40}, {170, 50},
+    {160, 60},
+    {160, 70},
+    {150, 80},
+};
+// Smile — 14-pixel arc, three rows. Outer tips rise two rows above a
+// ten-pixel base, giving the face a much wider grin than before.
+static const int16_t k_smile[14][2] = {
+    // row 0 — outermost rising tips
+    { 50, 185}, {180, 185},
+    // row 1 — inner shoulders one column in
+    { 60, 195}, {170, 195},
+    // row 2 — base of smile arc (10 pixels wide)
+    { 70, 205}, { 80, 205}, { 90, 205}, {100, 205},
+    {110, 205}, {120, 205}, {130, 205}, {140, 205},
+    {150, 205}, {160, 205},
+};
 
 // --- mood + talking state --------------------------------------------------
 static creature_mood_t s_mood    = CREATURE_MOOD_IDLE;
 static bool            s_talking = false;
 
-// Mouth animation — driven by an internal lv_timer on the LVGL task so
-// the main loop doesn't have to pump it at a particular cadence. A manual
-// tick instead of lv_anim_t lets us stop the mouth mid-open the instant
-// talking flips to false.
+// Mouth animation driven by an LVGL timer so cadence is independent of the
+// main loop. Manual stepping (not lv_anim_t) lets us halt the mouth the
+// instant talking flips off.
 static lv_timer_t *s_mouth_timer = NULL;
 static uint32_t    s_mouth_phase = 0;  // ms since talking started
 
@@ -85,9 +121,24 @@ static lv_color_t mood_color(creature_mood_t m) {
     return SCR_COLOR_ACCENT;
 }
 
-// Eye pulse animation: opacity 80 -> 255 -> 80, 2000 ms total, infinite.
-// One instance per eye so they share the same curve but each gets its own
-// timer (matches up to a single frame — good enough for a face).
+// Strip every default decoration from a fresh lv_obj and style it as a
+// hard-edged, fully-opaque rectangle. Foundation of every face pixel.
+static lv_obj_t *make_block(lv_obj_t *parent, int x, int y, int w, int h,
+                            lv_color_t color) {
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_style_radius(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(o, color, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(o, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
+// Eye pulse: opacity 120 → 255 → 120 at 1100 ms each way. Runs forever on
+// LVGL's animation timer so each eye gets its own curve instance.
 static void anim_eye_opa_cb(void *var, int32_t v) {
     lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, LV_PART_MAIN);
 }
@@ -96,7 +147,7 @@ static void install_eye_pulse(lv_obj_t *eye) {
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, eye);
-    lv_anim_set_values(&a, 120, 255);
+    lv_anim_set_values(&a, 140, 255);
     lv_anim_set_time(&a, 1100);
     lv_anim_set_playback_time(&a, 1100);
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
@@ -105,9 +156,8 @@ static void install_eye_pulse(lv_obj_t *eye) {
     lv_anim_start(&a);
 }
 
-// Mouth "chatter": four-step height cycle that reads as talking. Separate
-// from the lv_timer callback so creature_screen_tick() can advance the
-// mouth by one frame on demand without touching the timer state.
+// Four-step mouth height cycle read as talking chatter. Called from the
+// LVGL timer while s_talking is true.
 static void mouth_step(void) {
     if (!s_mouth) return;
     static const int16_t h_cycle[] = {4, 14, 22, 10};
@@ -115,40 +165,31 @@ static void mouth_step(void) {
     uint32_t idx = (s_mouth_phase / 120) %
                    (sizeof(h_cycle) / sizeof(h_cycle[0]));
     int16_t h = h_cycle[idx];
-    lv_obj_set_size(s_mouth, 60, h);
-    // Re-anchor center so height changes grow around the middle of the
-    // mouth, not the top edge.
-    lv_obj_align(s_mouth, LV_ALIGN_CENTER, 0, 36);
+    lv_obj_set_size(s_mouth, MOUTH_W, h);
+    // Re-anchor so the bar grows around its midline rather than the top
+    // edge, keeping the mouth centered in the smile slot at y≈205.
+    lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, 205 - h / 2);
 }
 
-// lv_timer callback. Runs on the LVGL task with the port mutex held, so
-// no explicit lock here.
 static void mouth_timer_cb(lv_timer_t *t) {
     (void)t;
-    if (!s_talking) return;   // defensive — paused timer shouldn't fire
+    if (!s_talking) return;
     mouth_step();
 }
 
-// Build a rounded-rect widget styled as "creature chrome" — panel fill,
-// accent-hi border, radius baked in. Used for the body and the mouth rail.
-static lv_obj_t *make_panel(lv_obj_t *parent, int w, int h, int radius,
-                            lv_color_t border_color, int border_width) {
-    lv_obj_t *o = lv_obj_create(parent);
-    lv_obj_set_size(o, w, h);
-    lv_obj_set_style_radius(o, radius, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(o, SCR_COLOR_PANEL, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(o, border_color, LV_PART_MAIN);
-    lv_obj_set_style_border_width(o, border_width, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(o, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-    return o;
+// Show/hide the static smile block. Called from set_talking().
+static void set_smile_visible(bool visible) {
+    for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
+        if (!s_smile[i]) continue;
+        if (visible) lv_obj_remove_flag(s_smile[i], LV_OBJ_FLAG_HIDDEN);
+        else         lv_obj_add_flag   (s_smile[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // --- public API ------------------------------------------------------------
 
 bool creature_screen_init(void) {
-    if (s_scr) return true;   // already built
+    if (s_scr) return true;
 
     if (!lvgl_port_lock(0)) {
         ESP_LOGE(TAG, "lvgl_port_lock failed");
@@ -159,10 +200,7 @@ bool creature_screen_init(void) {
     s_scr = lv_obj_create(NULL);
     scr_apply_bg(s_scr);
 
-    // --- status bar: one row — USDC (left) and SOL price (right). Both
-    //     labels are vertically centred so a 26-pixel bar is plenty; the
-    //     earlier two-line stacking was what made the SOL ticker appear
-    //     to "leak" down into the creature's space.
+    // --- status bar: USDC (left), SOL price (right) -----------------------
     lv_obj_t *bar = lv_obj_create(s_scr);
     lv_obj_set_size(bar, SCR_W, STATUS_BAR_H);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -182,83 +220,34 @@ bool creature_screen_init(void) {
     lv_obj_set_style_text_color(s_price_label, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
     lv_obj_align(s_price_label, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    // --- creature container (ears live above it, so we carve out space
-    //     for them between the status bar and the body) -------------------
-    //     ears: y ~ 40..90
-    //     body: y ~ 90..250 (160 tall, 180 wide)
-    //     subtitle: y ~ 260..315
+    lv_color_t face = SCR_COLOR_ACCENT;
 
-    // Body rounded rect: 180×160, centered horizontally, under ears.
-    s_body = make_panel(s_scr, 180, 160, 60,
-                        SCR_COLOR_ACCENT_HI, 3);
-    lv_obj_align(s_body, LV_ALIGN_TOP_MID, 0, 88);
+    // --- eyebrows: two 5-pixel diagonal zigzags --------------------------
+    for (size_t i = 0; i < sizeof(s_ant_l) / sizeof(s_ant_l[0]); i++) {
+        s_ant_l[i] = make_block(s_scr, k_ant_l[i][0], k_ant_l[i][1],
+                                PX, PX, face);
+        s_ant_r[i] = make_block(s_scr, k_ant_r[i][0], k_ant_r[i][1],
+                                PX, PX, face);
+    }
 
-    // Ears: two 3-point polylines forming triangles above the body.
-    // Left ear roots at (60, 90) -> peak (70, 40) -> inner (90, 90).
-    // Right ear mirrors. All coords are in screen space (parent = scr).
-    s_ear_l_pts[0].x =  60; s_ear_l_pts[0].y =  95;
-    s_ear_l_pts[1].x =  74; s_ear_l_pts[1].y =  40;
-    s_ear_l_pts[2].x =  98; s_ear_l_pts[2].y =  95;
-
-    s_ear_r_pts[0].x = 142; s_ear_r_pts[0].y =  95;
-    s_ear_r_pts[1].x = 166; s_ear_r_pts[1].y =  40;
-    s_ear_r_pts[2].x = 180; s_ear_r_pts[2].y =  95;
-
-    s_ear_l = lv_line_create(s_scr);
-    lv_line_set_points(s_ear_l, s_ear_l_pts, 3);
-    lv_obj_set_style_line_color(s_ear_l, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_set_style_line_width(s_ear_l, 4, LV_PART_MAIN);
-    lv_obj_set_style_line_rounded(s_ear_l, true, LV_PART_MAIN);
-
-    s_ear_r = lv_line_create(s_scr);
-    lv_line_set_points(s_ear_r, s_ear_r_pts, 3);
-    lv_obj_set_style_line_color(s_ear_r, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_set_style_line_width(s_ear_r, 4, LV_PART_MAIN);
-    lv_obj_set_style_line_rounded(s_ear_r, true, LV_PART_MAIN);
-
-    // Eyes: circles as children of the body so they stay aligned if the
-    // body moves later. 22px diameter, radius=50% for a perfect circle.
-    s_eye_l = lv_obj_create(s_body);
-    lv_obj_set_size(s_eye_l, 22, 22);
-    lv_obj_set_style_radius(s_eye_l, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_eye_l, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_eye_l, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_eye_l, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(s_eye_l, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(s_eye_l, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(s_eye_l, LV_ALIGN_CENTER, -38, -18);
-
-    s_eye_r = lv_obj_create(s_body);
-    lv_obj_set_size(s_eye_r, 22, 22);
-    lv_obj_set_style_radius(s_eye_r, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_eye_r, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_eye_r, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_eye_r, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(s_eye_r, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(s_eye_r, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(s_eye_r, LV_ALIGN_CENTER, 38, -18);
-
+    // --- eyes: small 30×30 blocks (no rounded corners — pixel aesthetic) -
+    s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y, EYE_W, EYE_H, face);
+    s_eye_r = make_block(s_scr, EYE_R_X, EYE_Y, EYE_W, EYE_H, face);
     install_eye_pulse(s_eye_l);
     install_eye_pulse(s_eye_r);
 
-    // Mouth timer fires at 80 ms while talking; paused otherwise. Running
-    // on LVGL's own timer loop means the mouth animates smoothly regardless
-    // of main-loop cadence, and we don't need the port mutex inside the
-    // callback (LVGL already holds it).
+    // --- smile: 10 pixel blocks forming a curved-upward arc ---------------
+    for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
+        s_smile[i] = make_block(s_scr, k_smile[i][0], k_smile[i][1],
+                                PX, PX, face);
+    }
+
+    // --- talking mouth: single rectangle, hidden until talking starts -----
+    s_mouth = make_block(s_scr, (SCR_W - MOUTH_W) / 2, 203, MOUTH_W, 4, face);
+    lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+
     s_mouth_timer = lv_timer_create(mouth_timer_cb, 80, NULL);
     lv_timer_pause(s_mouth_timer);
-
-    // Mouth: short horizontal bar at rest; creature_screen_tick() resizes
-    // it while talking. Child of body, aligned lower third.
-    s_mouth = lv_obj_create(s_body);
-    lv_obj_set_size(s_mouth, 60, 4);
-    lv_obj_set_style_radius(s_mouth, 3, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_mouth, SCR_COLOR_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_mouth, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_mouth, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(s_mouth, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(s_mouth, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(s_mouth, LV_ALIGN_CENTER, 0, 36);
 
     // --- subtitle ---------------------------------------------------------
     s_subtitle = lv_label_create(s_scr);
@@ -271,20 +260,19 @@ bool creature_screen_init(void) {
 
     // Apply the initial mood tint.
     creature_mood_t m = s_mood;
-    s_mood = (creature_mood_t)-1;  // force set path
+    s_mood = (creature_mood_t)-1;   // force set path on first call
     lvgl_port_unlock();
     creature_screen_set_mood(m);
 
-    ESP_LOGI(TAG, "creature screen built");
+    ESP_LOGI(TAG, "creature screen built (pixel face)");
     return true;
 }
 
 lv_obj_t *creature_screen(void) { return s_scr; }
 
 void creature_screen_set_status(const char *s) {
-    // Intentional no-op. The top-left slot now shows USDC; IP-on-screen
-    // was demoted to the serial log. The setter stays so the main loop's
-    // ui_set_status(ip) call remains harmless.
+    // Intentional no-op. USDC lives in the top-left slot now; IP moved
+    // to the serial log. Kept so ui_set_status(ip) remains harmless.
     (void)s;
 }
 
@@ -314,17 +302,20 @@ void creature_screen_set_mood(creature_mood_t m) {
     if (m == s_mood) return;
     s_mood = m;
 
-    lv_color_t border = mood_color(m);
+    lv_color_t c = mood_color(m);
 
     if (!lvgl_port_lock(0)) return;
-    // Body border + eyes + mouth + ears all follow mood colour so the face
-    // reads at a glance.
-    lv_obj_set_style_border_color(s_body, border, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_eye_l, border, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_eye_r, border, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_mouth, border, LV_PART_MAIN);
-    lv_obj_set_style_line_color(s_ear_l, border, LV_PART_MAIN);
-    lv_obj_set_style_line_color(s_ear_r, border, LV_PART_MAIN);
+    // Repaint every face block so the whole creature reads the same mood.
+    for (size_t i = 0; i < sizeof(s_ant_l) / sizeof(s_ant_l[0]); i++) {
+        if (s_ant_l[i]) lv_obj_set_style_bg_color(s_ant_l[i], c, LV_PART_MAIN);
+        if (s_ant_r[i]) lv_obj_set_style_bg_color(s_ant_r[i], c, LV_PART_MAIN);
+    }
+    if (s_eye_l) lv_obj_set_style_bg_color(s_eye_l, c, LV_PART_MAIN);
+    if (s_eye_r) lv_obj_set_style_bg_color(s_eye_r, c, LV_PART_MAIN);
+    for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
+        if (s_smile[i]) lv_obj_set_style_bg_color(s_smile[i], c, LV_PART_MAIN);
+    }
+    if (s_mouth) lv_obj_set_style_bg_color(s_mouth, c, LV_PART_MAIN);
     lvgl_port_unlock();
 }
 
@@ -334,23 +325,28 @@ void creature_screen_set_talking(bool on) {
 
     if (!lvgl_port_lock(0)) return;
     if (on) {
+        // Hide the smile and reveal the animated bar. Timer drives height.
+        set_smile_visible(false);
+        lv_obj_remove_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
         s_mouth_phase = 0;
         if (s_mouth_timer) lv_timer_resume(s_mouth_timer);
     } else {
         if (s_mouth_timer) lv_timer_pause(s_mouth_timer);
         s_mouth_phase = 0;
+        // Reset mouth bar and hide it so the smile is cleanly visible again.
         if (s_mouth) {
-            lv_obj_set_size(s_mouth, 60, 4);
-            lv_obj_align(s_mouth, LV_ALIGN_CENTER, 0, 36);
+            lv_obj_set_size(s_mouth, MOUTH_W, 4);
+            lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, 203);
+            lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
         }
+        set_smile_visible(true);
     }
     lvgl_port_unlock();
 }
 
-// Retained for API completeness + future callers (e.g. an integration
-// layer that wants to force a redraw between timer ticks). The mouth's
-// regular cadence is now driven by the internal lv_timer installed in
-// creature_screen_init(), so this is a no-op when talking is off.
+// Retained so an integration layer can force a mouth frame between timer
+// ticks. The regular cadence is already driven by the lv_timer installed
+// in creature_screen_init(), so this is a no-op when talking is off.
 void creature_screen_tick(void) {
     if (!s_talking || !s_mouth) return;
     if (!lvgl_port_lock(0)) return;

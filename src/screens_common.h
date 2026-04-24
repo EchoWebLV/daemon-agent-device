@@ -20,18 +20,19 @@ extern "C" {
 #define SCR_H            320
 #define STATUS_BAR_H      26
 
-// Palette. Uses the Daemon-blue family from the Arduino build, re-tuned
-// for LVGL's 24-bit color space. The TFT_eSPI RGB565 constants don't map
-// directly, so we just pick visually-matching full-precision colors.
-#define SCR_COLOR_BG         lv_color_hex(0x001428)   // dark navy
-#define SCR_COLOR_PANEL      lv_color_hex(0x0B1E3A)   // card background
-#define SCR_COLOR_ACCENT     lv_color_hex(0x4DA6FF)   // Daemon blue
-#define SCR_COLOR_ACCENT_HI  lv_color_hex(0x7AD8FF)   // cyan rim
-#define SCR_COLOR_TEXT       lv_color_hex(0xE6E6FA)   // near white
-#define SCR_COLOR_DIM        lv_color_hex(0x6F8AB8)   // muted blue
-#define SCR_COLOR_DIVIDER    lv_color_hex(0x1E3A5F)   // separator line
-#define SCR_COLOR_GOOD       lv_color_hex(0x3EE07A)   // "connected" green
-#define SCR_COLOR_WARN       lv_color_hex(0xFFB84D)   // warning amber
+// Palette — pixel-art CRT green on pure black. The creature face is
+// rendered as chunky square blocks for that analogue/Game Boy feel, so
+// the rest of the UI follows suit: no anti-aliased gradients, just
+// bright green text/chrome on black.
+#define SCR_COLOR_BG         lv_color_hex(0x000000)   // pure black
+#define SCR_COLOR_PANEL      lv_color_hex(0x041A08)   // very dark green (cards)
+#define SCR_COLOR_ACCENT     lv_color_hex(0x2BFF4A)   // CRT green
+#define SCR_COLOR_ACCENT_HI  lv_color_hex(0x66FF80)   // brighter green (highlights)
+#define SCR_COLOR_TEXT       lv_color_hex(0x2BFF4A)   // same green for text
+#define SCR_COLOR_DIM        lv_color_hex(0x0D5A1A)   // dim green (placeholders)
+#define SCR_COLOR_DIVIDER    lv_color_hex(0x0A3311)   // dark green divider
+#define SCR_COLOR_GOOD       lv_color_hex(0x66FF80)   // bright green
+#define SCR_COLOR_WARN       lv_color_hex(0xFFB84D)   // warning amber (unchanged)
 
 // Dark fill applied to any screen root. Call right after lv_obj_create().
 static inline void scr_apply_bg(lv_obj_t *scr) {
