@@ -12,7 +12,7 @@
 //    | USDC 12.34                     SOL $198.42       |
 //    +--------------------------------------------------+
 //    |                                                  |
-//    |    ███       ███     <- eyes (30×30, pulse)      |
+//    |    ███       ███     <- eyes (30×30, blink)      |
 //    |    ███       ███                                 |
 //    |                                                  |
 //    | ▓                 ▓  <- smile tips rise wide     |
@@ -33,6 +33,7 @@
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_random.h"
 
 static const char *TAG = "creature_screen";
 
@@ -47,30 +48,29 @@ static const char *TAG = "creature_screen";
 
 // Shift every face block down by this much from the coordinates listed in
 // the k_* tables below. Tweak in one place to raise/lower the face without
-// touching each feature's Y column. Negative value pulls the face up so
-// its center lands on the 320-tall panel's midline (eye-top 115 + smile-
-// bottom 215 averages 165, so -5 lands on 160).
+// touching each feature's Y column.
 #define FACE_Y_OFFSET   (-5)
-#define SMILE_MID_Y    (205 + FACE_Y_OFFSET)    // where the talking bar centers
+#define SMILE_MID_Y    (205 + FACE_Y_OFFSET)    // where the talking mouth centers
 
 // --- widget handles --------------------------------------------------------
 static lv_obj_t *s_scr          = NULL;
-// Top-left slot shows USDC; SOL price on the right.
 static lv_obj_t *s_price_label  = NULL;
 static lv_obj_t *s_usdc_label   = NULL;
 
-// Face layers (all children of s_scr, painted on the black root).
 static lv_obj_t *s_eye_l        = NULL;
 static lv_obj_t *s_eye_r        = NULL;
-static lv_obj_t *s_mouth        = NULL;   // animated bar used while talking
-static lv_obj_t *s_smile[14]    = {0};    // 14-pixel smile shown while idle
 
+// Talking mouth — 6 cols × 3 rows of 10×10 pixel blocks. Each frame toggles
+// a subset visible to build up a sprite. Blocks are pre-created hidden and
+// only flipped via LV_OBJ_FLAG_HIDDEN at runtime so no widgets churn.
+#define MOUTH_COLS      6
+#define MOUTH_ROWS      3
+static lv_obj_t *s_mouth_grid[MOUTH_ROWS][MOUTH_COLS] = {0};
+
+static lv_obj_t *s_smile[14]    = {0};   // 14-pixel smile shown while idle
 static lv_obj_t *s_subtitle     = NULL;
 
-// Pixel coordinates for static face features. Kept at module scope (not
-// lookup tables at init) so the geometry is easy to tweak in one place.
-// Smile — 14-pixel arc, three rows. Outer tips rise two rows above a
-// ten-pixel base, giving the face a much wider grin than before.
+// Pixel coordinates for static face features.
 static const int16_t k_smile[14][2] = {
     // row 0 — outermost rising tips
     { 50, 185}, {180, 185},
@@ -86,11 +86,67 @@ static const int16_t k_smile[14][2] = {
 static creature_mood_t s_mood    = CREATURE_MOOD_IDLE;
 static bool            s_talking = false;
 
-// Mouth animation driven by an LVGL timer so cadence is independent of the
-// main loop. Manual stepping (not lv_anim_t) lets us halt the mouth the
-// instant talking flips off.
+// --- talking mouth: sprite frames ------------------------------------------
+// Three visually distinct sprites — each row-major within a 6×3 bounding box
+// with 1 = pixel visible. The silhouettes are chosen so frame transitions
+// read as discrete sprite swaps (flat bar → hollow O → filled block) rather
+// than a bar growing in height.
+static const uint8_t MOUTH_FRAMES[3][MOUTH_ROWS][MOUTH_COLS] = {
+    // F0 — closed (horizontal bar across the middle row)
+    { {0,0,0,0,0,0},
+      {1,1,1,1,1,1},
+      {0,0,0,0,0,0} },
+    // F1 — "o" (hollow ring — top + bottom arc, side pixels)
+    { {0,1,1,1,1,0},
+      {1,0,0,0,0,1},
+      {0,1,1,1,1,0} },
+    // F2 — wide open (filled block)
+    { {1,1,1,1,1,1},
+      {1,1,1,1,1,1},
+      {1,1,1,1,1,1} },
+};
+// Cycle through the sprites without bouncing — each frame is a hard swap
+// into a different silhouette so the animation doesn't read as a bar sliding.
+static const uint8_t MOUTH_CYCLE[] = {0, 1, 2, 1, 0, 2};
+#define MOUTH_FRAME_MS      150
+
 static lv_timer_t *s_mouth_timer = NULL;
-static uint32_t    s_mouth_phase = 0;  // ms since talking started
+static int         s_mouth_cyc   = 0;
+
+// --- idle blink state machine ----------------------------------------------
+// Each blink is a sequence of frames describing which eyes are closed and
+// for how long. Frame with ms == 0 is the terminator. Between sequences the
+// timer idles for blink_wait_ms(), which is randomised so blinks don't feel
+// mechanical. A weighted roll at the idle boundary picks the next type:
+// most blinks are single; occasional doubles and single-eye winks mix it up.
+#define EYE_CLOSED_L    0x1
+#define EYE_CLOSED_R    0x2
+#define EYE_CLOSED_BOTH (EYE_CLOSED_L | EYE_CLOSED_R)
+
+typedef struct { uint8_t eyes; uint16_t ms; } blink_frame_t;
+
+static const blink_frame_t BLINK_SINGLE[] = {
+    { EYE_CLOSED_BOTH, 120 },
+    { 0, 0 },
+};
+static const blink_frame_t BLINK_DOUBLE[] = {
+    { EYE_CLOSED_BOTH, 90 },
+    { 0,                90 },
+    { EYE_CLOSED_BOTH, 90 },
+    { 0, 0 },
+};
+static const blink_frame_t BLINK_WINK_L[] = {
+    { EYE_CLOSED_L, 220 },
+    { 0, 0 },
+};
+static const blink_frame_t BLINK_WINK_R[] = {
+    { EYE_CLOSED_R, 220 },
+    { 0, 0 },
+};
+
+static lv_timer_t          *s_blink_timer = NULL;
+static const blink_frame_t *s_blink_seq   = NULL;  // NULL = idling between blinks
+static int                  s_blink_step  = 0;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -122,53 +178,94 @@ static lv_obj_t *make_block(lv_obj_t *parent, int x, int y, int w, int h,
     return o;
 }
 
-// Eye pulse: opacity 120 → 255 → 120 at 1100 ms each way. Runs forever on
-// LVGL's animation timer so each eye gets its own curve instance.
-static void anim_eye_opa_cb(void *var, int32_t v) {
-    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, LV_PART_MAIN);
+// --- talking mouth painters ------------------------------------------------
+
+static void mouth_paint_frame(int frame) {
+    if (frame < 0 || frame >= (int)(sizeof(MOUTH_FRAMES)/sizeof(MOUTH_FRAMES[0]))) return;
+    for (int r = 0; r < MOUTH_ROWS; r++) {
+        for (int c = 0; c < MOUTH_COLS; c++) {
+            lv_obj_t *p = s_mouth_grid[r][c];
+            if (!p) continue;
+            if (MOUTH_FRAMES[frame][r][c]) lv_obj_remove_flag(p, LV_OBJ_FLAG_HIDDEN);
+            else                           lv_obj_add_flag   (p, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
-static void install_eye_pulse(lv_obj_t *eye) {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, eye);
-    lv_anim_set_values(&a, 140, 255);
-    lv_anim_set_time(&a, 1100);
-    lv_anim_set_playback_time(&a, 1100);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-    lv_anim_set_exec_cb(&a, anim_eye_opa_cb);
-    lv_anim_start(&a);
-}
-
-// Four-step mouth height cycle read as talking chatter. Called from the
-// LVGL timer while s_talking is true.
-static void mouth_step(void) {
-    if (!s_mouth) return;
-    static const int16_t h_cycle[] = {4, 14, 22, 10};
-    s_mouth_phase += 80;
-    uint32_t idx = (s_mouth_phase / 120) %
-                   (sizeof(h_cycle) / sizeof(h_cycle[0]));
-    int16_t h = h_cycle[idx];
-    lv_obj_set_size(s_mouth, MOUTH_W, h);
-    // Re-anchor so the bar grows around its midline rather than the top
-    // edge, keeping the mouth centered in the smile slot.
-    lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - h / 2);
+static void mouth_hide_all(void) {
+    for (int r = 0; r < MOUTH_ROWS; r++) {
+        for (int c = 0; c < MOUTH_COLS; c++) {
+            if (s_mouth_grid[r][c]) lv_obj_add_flag(s_mouth_grid[r][c], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void mouth_timer_cb(lv_timer_t *t) {
     (void)t;
     if (!s_talking) return;
-    mouth_step();
+    mouth_paint_frame(MOUTH_CYCLE[s_mouth_cyc]);
+    s_mouth_cyc = (s_mouth_cyc + 1) % (sizeof(MOUTH_CYCLE)/sizeof(MOUTH_CYCLE[0]));
 }
 
-// Show/hide the static smile block. Called from set_talking().
+// Show/hide the static smile block.
 static void set_smile_visible(bool visible) {
     for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
         if (!s_smile[i]) continue;
         if (visible) lv_obj_remove_flag(s_smile[i], LV_OBJ_FLAG_HIDDEN);
         else         lv_obj_add_flag   (s_smile[i], LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+// --- blink painters --------------------------------------------------------
+
+// Resize + reposition each eye so a "closed" eye renders as a 10-px slit
+// at the bottom edge of where the open eye was. Snapping between the two
+// extremes (no tweening) keeps the motion feeling pixel-art.
+static void blink_paint(uint8_t eyes) {
+    int16_t open_y   = EYE_Y + FACE_Y_OFFSET;
+    int16_t closed_y = EYE_Y + FACE_Y_OFFSET + EYE_H - PX;
+    bool lc = (eyes & EYE_CLOSED_L) != 0;
+    bool rc = (eyes & EYE_CLOSED_R) != 0;
+    if (s_eye_l) {
+        lv_obj_set_size(s_eye_l, EYE_W, lc ? PX : EYE_H);
+        lv_obj_set_pos (s_eye_l, EYE_L_X, lc ? closed_y : open_y);
+    }
+    if (s_eye_r) {
+        lv_obj_set_size(s_eye_r, EYE_W, rc ? PX : EYE_H);
+        lv_obj_set_pos (s_eye_r, EYE_R_X, rc ? closed_y : open_y);
+    }
+}
+
+static uint32_t blink_wait_ms(void) {
+    // 2500–6500 ms gap between blinks.
+    return 2500u + (esp_random() % 4000u);
+}
+
+static void blink_pick_next(void) {
+    uint32_t r = esp_random() % 100u;
+    if      (r < 55u) s_blink_seq = BLINK_SINGLE;   // most of the time: a normal blink
+    else if (r < 80u) s_blink_seq = BLINK_DOUBLE;   // occasional double
+    else if (r < 90u) s_blink_seq = BLINK_WINK_L;   // sometimes a left wink
+    else              s_blink_seq = BLINK_WINK_R;   // rarely a right wink
+    s_blink_step = 0;
+    blink_paint(s_blink_seq[0].eyes);
+    if (s_blink_timer) lv_timer_set_period(s_blink_timer, s_blink_seq[0].ms);
+}
+
+static void blink_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!s_blink_seq) { blink_pick_next(); return; }
+    s_blink_step++;
+    uint16_t ms = s_blink_seq[s_blink_step].ms;
+    if (ms == 0) {
+        // End of sequence — eyes back open, schedule next blink.
+        s_blink_seq = NULL;
+        blink_paint(0);
+        if (s_blink_timer) lv_timer_set_period(s_blink_timer, blink_wait_ms());
+        return;
+    }
+    blink_paint(s_blink_seq[s_blink_step].eyes);
+    if (s_blink_timer) lv_timer_set_period(s_blink_timer, ms);
 }
 
 // --- public API ------------------------------------------------------------
@@ -207,13 +304,11 @@ bool creature_screen_init(void) {
 
     lv_color_t face = SCR_COLOR_ACCENT;
 
-    // --- eyes: small 30×30 blocks (no rounded corners — pixel aesthetic) -
-    s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y + FACE_Y_OFFSET,
-                         EYE_W, EYE_H, face);
-    s_eye_r = make_block(s_scr, EYE_R_X, EYE_Y + FACE_Y_OFFSET,
-                         EYE_W, EYE_H, face);
-    install_eye_pulse(s_eye_l);
-    install_eye_pulse(s_eye_r);
+    // --- eyes: 30×30 blocks (no rounded corners — pixel aesthetic) -------
+    // Liveness comes from the blink state machine rather than opacity pulse,
+    // so no install_eye_pulse() here.
+    s_eye_l = make_block(s_scr, EYE_L_X, EYE_Y + FACE_Y_OFFSET, EYE_W, EYE_H, face);
+    s_eye_r = make_block(s_scr, EYE_R_X, EYE_Y + FACE_Y_OFFSET, EYE_W, EYE_H, face);
 
     // --- smile: 14 pixel blocks forming a wide curved-upward arc ---------
     for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
@@ -221,13 +316,27 @@ bool creature_screen_init(void) {
                                 k_smile[i][1] + FACE_Y_OFFSET, PX, PX, face);
     }
 
-    // --- talking mouth: single rectangle, hidden until talking starts -----
-    s_mouth = make_block(s_scr, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - 2,
-                         MOUTH_W, 4, face);
-    lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
+    // --- talking mouth grid: 6×3 pixel sprite, hidden until talking ------
+    {
+        int origin_x = (SCR_W - MOUTH_COLS * PX) / 2;
+        int origin_y = SMILE_MID_Y - (MOUTH_ROWS * PX) / 2;
+        for (int r = 0; r < MOUTH_ROWS; r++) {
+            for (int c = 0; c < MOUTH_COLS; c++) {
+                lv_obj_t *p = make_block(s_scr,
+                                         origin_x + c * PX,
+                                         origin_y + r * PX,
+                                         PX, PX, face);
+                lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+                s_mouth_grid[r][c] = p;
+            }
+        }
+    }
 
-    s_mouth_timer = lv_timer_create(mouth_timer_cb, 80, NULL);
+    s_mouth_timer = lv_timer_create(mouth_timer_cb, MOUTH_FRAME_MS, NULL);
     lv_timer_pause(s_mouth_timer);
+
+    // --- blink timer: idle-wait until first blink, then state machine ----
+    s_blink_timer = lv_timer_create(blink_timer_cb, blink_wait_ms(), NULL);
 
     // --- subtitle ---------------------------------------------------------
     s_subtitle = lv_label_create(s_scr);
@@ -282,16 +391,21 @@ void creature_screen_set_mood(creature_mood_t m) {
     if (m == s_mood) return;
     s_mood = m;
 
-    lv_color_t c = mood_color(m);
+    lv_color_t col = mood_color(m);
 
     if (!lvgl_port_lock(0)) return;
     // Repaint every face block so the whole creature reads the same mood.
-    if (s_eye_l) lv_obj_set_style_bg_color(s_eye_l, c, LV_PART_MAIN);
-    if (s_eye_r) lv_obj_set_style_bg_color(s_eye_r, c, LV_PART_MAIN);
+    if (s_eye_l) lv_obj_set_style_bg_color(s_eye_l, col, LV_PART_MAIN);
+    if (s_eye_r) lv_obj_set_style_bg_color(s_eye_r, col, LV_PART_MAIN);
     for (size_t i = 0; i < sizeof(s_smile) / sizeof(s_smile[0]); i++) {
-        if (s_smile[i]) lv_obj_set_style_bg_color(s_smile[i], c, LV_PART_MAIN);
+        if (s_smile[i]) lv_obj_set_style_bg_color(s_smile[i], col, LV_PART_MAIN);
     }
-    if (s_mouth) lv_obj_set_style_bg_color(s_mouth, c, LV_PART_MAIN);
+    for (int r = 0; r < MOUTH_ROWS; r++) {
+        for (int c = 0; c < MOUTH_COLS; c++) {
+            if (s_mouth_grid[r][c])
+                lv_obj_set_style_bg_color(s_mouth_grid[r][c], col, LV_PART_MAIN);
+        }
+    }
     lvgl_port_unlock();
 }
 
@@ -301,33 +415,23 @@ void creature_screen_set_talking(bool on) {
 
     if (!lvgl_port_lock(0)) return;
     if (on) {
-        // Hide the smile and reveal the animated bar. Timer drives height.
+        // Hide static smile and reveal the animated sprite. Timer drives frames.
         set_smile_visible(false);
-        lv_obj_remove_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
-        s_mouth_phase = 0;
+        s_mouth_cyc = 0;
+        mouth_paint_frame(MOUTH_CYCLE[0]);
         if (s_mouth_timer) lv_timer_resume(s_mouth_timer);
     } else {
         if (s_mouth_timer) lv_timer_pause(s_mouth_timer);
-        s_mouth_phase = 0;
-        // Reset mouth bar and hide it so the smile is cleanly visible again.
-        if (s_mouth) {
-            lv_obj_set_size(s_mouth, MOUTH_W, 4);
-            lv_obj_set_pos(s_mouth, (SCR_W - MOUTH_W) / 2, SMILE_MID_Y - 2);
-            lv_obj_add_flag(s_mouth, LV_OBJ_FLAG_HIDDEN);
-        }
+        mouth_hide_all();
         set_smile_visible(true);
     }
     lvgl_port_unlock();
 }
 
-// Retained so an integration layer can force a mouth frame between timer
-// ticks. The regular cadence is already driven by the lv_timer installed
-// in creature_screen_init(), so this is a no-op when talking is off.
+// Mouth and blink animation both run off lv_timers inside the LVGL task, so
+// this hook has nothing to do. Retained so existing integration points keep
+// compiling and can poke a frame between ticks if they ever need to.
 void creature_screen_tick(void) {
-    if (!s_talking || !s_mouth) return;
-    if (!lvgl_port_lock(0)) return;
-    mouth_step();
-    lvgl_port_unlock();
 }
 
 // ---- shake ------------------------------------------------------------------

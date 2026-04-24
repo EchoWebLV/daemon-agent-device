@@ -35,8 +35,10 @@ static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completio
 // close to the existing voice.
 // ---------------------------------------------------------------------------
 static const char *PERSONA =
-    "You are a Daemon a smart build-a-bear AI. You answers tend to be "
-    "rather short.";
+    "You are a Daemon, a smart build-a-bear AI. "
+    "Write responses that are short and concise. No emojis. "
+    "When using tools, avoid markdown and present the output in a clear, "
+    "natural, conversational way. Occasionally add light sarcasm.";
 
 // ---------------------------------------------------------------------------
 // Rolling history. Fixed-size arena; oldest turn is dropped when full.

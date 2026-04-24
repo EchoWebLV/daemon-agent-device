@@ -136,15 +136,23 @@ static void set_body_expanded(lv_obj_t *body, lv_obj_t *chev, bool expanded) {
     }
 }
 
-// Each click handler swallows the rest of the current touch via
-// lv_indev_wait_release. Without it the accordion re-flows under the
-// user's still-down finger, the new row lands where the finger is, and
-// the finger-lift fires a second click on that row — which looks to the
-// user like the accordion opens and closes itself. Same trick the
-// ui.c gesture handlers use.
+// Debounce repeat clicks — CST328 occasionally reports a press-release
+// flicker during a single hold, which made the accordion look like it
+// was opening and closing itself. 300 ms is well below human tap cadence
+// but above the jitter window.
+#define CLICK_DEBOUNCE_MS 300
+static uint32_t s_last_click_ms = 0;
+
+static bool debounce_ok(void) {
+    uint32_t now = lv_tick_get();
+    if (now - s_last_click_ms < CLICK_DEBOUNCE_MS) return false;
+    s_last_click_ms = now;
+    return true;
+}
+
 static void model_header_clicked(lv_event_t *e) {
     (void)e;
-    lv_indev_wait_release(lv_indev_active());
+    if (!debounce_ok()) return;
     if (!lvgl_port_lock(0)) return;
     bool will_expand = lv_obj_has_flag(s_model_body, LV_OBJ_FLAG_HIDDEN);
     set_body_expanded(s_model_body, s_model_chev, will_expand);
@@ -154,7 +162,7 @@ static void model_header_clicked(lv_event_t *e) {
 
 static void voice_header_clicked(lv_event_t *e) {
     (void)e;
-    lv_indev_wait_release(lv_indev_active());
+    if (!debounce_ok()) return;
     if (!lvgl_port_lock(0)) return;
     bool will_expand = lv_obj_has_flag(s_voice_body, LV_OBJ_FLAG_HIDDEN);
     set_body_expanded(s_voice_body, s_voice_chev, will_expand);
@@ -165,7 +173,7 @@ static void voice_header_clicked(lv_event_t *e) {
 static void model_row_clicked(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= MODEL_COUNT) return;
-    lv_indev_wait_release(lv_indev_active());
+    if (!debounce_ok()) return;
     devcfg_set_llm_model(MODELS[idx].id);
     if (!lvgl_port_lock(0)) return;
     update_title(s_model_title, "MODEL", MODELS, MODEL_COUNT, MODELS[idx].id);
@@ -178,7 +186,7 @@ static void model_row_clicked(lv_event_t *e) {
 static void voice_row_clicked(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= VOICE_COUNT) return;
-    lv_indev_wait_release(lv_indev_active());
+    if (!debounce_ok()) return;
     devcfg_set_voice_id(VOICES[idx].id);
     if (!lvgl_port_lock(0)) return;
     update_title(s_voice_title, "VOICE", VOICES, VOICE_COUNT, VOICES[idx].id);
