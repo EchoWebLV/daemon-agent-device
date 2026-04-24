@@ -55,6 +55,10 @@ void creature_screen_set_talking(bool on);
 // Tick called from the app main loop — drives mouth animation.
 void creature_screen_tick(void);
 
+// Jitter the face left/right for ~1.2 s. No-op if a shake is already in
+// flight. Safe from any task — takes the lvgl_port lock internally.
+void creature_screen_shake(void);
+
 #ifdef __cplusplus
 }
 #endif

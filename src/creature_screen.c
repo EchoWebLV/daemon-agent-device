@@ -329,3 +329,43 @@ void creature_screen_tick(void) {
     mouth_step();
     lvgl_port_unlock();
 }
+
+// ---- shake ------------------------------------------------------------------
+// Jitters the whole screen root via translate_x. Runs off an lv_timer so the
+// animation is driven on the LVGL task with no external scheduling. Frame
+// cadence (40 ms) and step count (24) give ~960 ms of shake with a ramp-down
+// tail so the motion settles instead of snapping back to centre.
+#define SHAKE_FRAME_MS   40
+#define SHAKE_FRAMES     24
+#define SHAKE_FADE_AT    18
+#define SHAKE_AMPLITUDE  10
+
+static lv_timer_t *s_shake_timer = NULL;
+static int         s_shake_frame = 0;
+
+static void shake_cb(lv_timer_t *t) {
+    if (!s_scr) { lv_timer_delete(t); s_shake_timer = NULL; return; }
+    s_shake_frame++;
+    if (s_shake_frame >= SHAKE_FRAMES) {
+        lv_obj_set_style_translate_x(s_scr, 0, LV_PART_MAIN);
+        lv_timer_delete(t);
+        s_shake_timer = NULL;
+        return;
+    }
+    int amp = SHAKE_AMPLITUDE;
+    if (s_shake_frame >= SHAKE_FADE_AT) {
+        amp = SHAKE_AMPLITUDE * (SHAKE_FRAMES - s_shake_frame) / (SHAKE_FRAMES - SHAKE_FADE_AT);
+    }
+    int offset = (s_shake_frame & 1) ? amp : -amp;
+    lv_obj_set_style_translate_x(s_scr, offset, LV_PART_MAIN);
+}
+
+void creature_screen_shake(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    if (!s_shake_timer) {
+        s_shake_frame = 0;
+        s_shake_timer = lv_timer_create(shake_cb, SHAKE_FRAME_MS, NULL);
+    }
+    lvgl_port_unlock();
+}

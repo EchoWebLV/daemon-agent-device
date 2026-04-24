@@ -20,8 +20,10 @@
 #include "nvs_flash.h"
 
 #include "ai.h"
+#include "creature_screen.h"
 #include "devcfg.h"
 #include "display.h"
+#include "imu.h"
 #include "price.h"
 #include "server.h"
 #include "testharness.h"
@@ -44,6 +46,24 @@ static void say_with_ui(const char *user, char *reply_out, size_t reply_cap) {
     if (reply_out && reply_out[0]) {
         ui_deliver_reply(reply_out);
     }
+}
+
+// Fired by the IMU task when it detects a shake. Plays one of three
+// complaint lines through the normal ui_deliver_reply path (subtitle +
+// TALK mouth + voice_speak) and jitters the creature screen for feedback.
+static void on_shake(void) {
+    static const char *LINES[] = {
+        "Please stop shaking me!",
+        "Please stop this!",
+        "Come on, stop it!",
+    };
+    static uint8_t idx = 0;
+    // Rotate through the phrases. esp_random() works too but a round-robin
+    // avoids two shakes in a row picking the same line.
+    const char *line = LINES[idx];
+    idx = (idx + 1) % (sizeof(LINES) / sizeof(LINES[0]));
+    creature_screen_shake();
+    ui_deliver_reply(line);
 }
 
 static void log_boot_banner(void) {
@@ -138,6 +158,16 @@ void app_main(void) {
     // rest of the app is useful without audio.
     if (!voice_begin()) {
         ESP_LOGW(TAG, "voice_begin failed; continuing muted");
+    }
+
+    // QMI8658C on the same I2C bus as the touch panel. Only the accel is
+    // enabled; the polling task calls on_shake() whenever the user gives the
+    // board a good rattle. Not fatal — a board revision without the IMU
+    // simply leaves the face un-shakable.
+    if (imu_begin()) {
+        imu_set_shake_cb(on_shake);
+    } else {
+        ESP_LOGW(TAG, "imu_begin failed; shake-to-talk disabled");
     }
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the

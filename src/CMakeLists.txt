@@ -12,6 +12,7 @@ idf_component_register(
         "creature_screen.c"
         "devcfg.c"
         "display.c"
+        "imu.c"
         "price.c"
         "server.c"
         "settings_screen.c"
