@@ -53,6 +53,11 @@ void        devcfg_clear_wifi(void);
 const char *devcfg_llm_model(void);
 void        devcfg_set_llm_model(const char *model);
 
+// ElevenLabs voice id (e.g. "pFZP5JQG7iQjIQuC4Bku"). Empty string means
+// "fall back to ELEVENLABS_VOICE_ID from secrets.h".
+const char *devcfg_voice_id(void);
+void        devcfg_set_voice_id(const char *voice_id);
+
 // Custom personality. Empty means "use the built-in persona in ai.c".
 // The string is injected at the head of the AI system prompt on every
 // chat round-trip.

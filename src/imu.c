@@ -15,10 +15,11 @@ static const char *TAG = "imu";
 // Per the Waveshare ESP32-S3-Touch-LCD-2.8 pinout: the QMI8658 sits on a
 // different I2C bus than the CST328 touch controller. Touch uses port 0 on
 // GPIO1/3; the IMU is on port 1 at GPIO10/11.
-#define IMU_I2C_PORT   I2C_NUM_1
-#define IMU_PIN_SDA    11
-#define IMU_PIN_SCL    10
-#define IMU_I2C_HZ     400000
+#define IMU_I2C_PORT        I2C_NUM_1
+#define IMU_PIN_SDA         11
+#define IMU_PIN_SCL         10
+#define IMU_I2C_HZ          400000
+#define IMU_I2C_TIMEOUT_MS  100
 
 // QMI8658C register map (subset — see QST QMI8658 datasheet rev 1.2).
 #define QMI8658_REG_WHO_AM_I   0x00
@@ -51,19 +52,19 @@ static imu_shake_cb_t          s_cb     = NULL;
 static volatile bool           s_ready  = false;
 
 static esp_err_t read_regs(uint8_t reg, uint8_t *buf, size_t n) {
-    return i2c_master_transmit_receive(s_dev, &reg, 1, buf, n, 100);
+    return i2c_master_transmit_receive(s_dev, &reg, 1, buf, n, IMU_I2C_TIMEOUT_MS);
 }
 
 static esp_err_t write_reg(uint8_t reg, uint8_t val) {
     uint8_t pkt[2] = { reg, val };
-    return i2c_master_transmit(s_dev, pkt, 2, 100);
+    return i2c_master_transmit(s_dev, pkt, 2, IMU_I2C_TIMEOUT_MS);
 }
 
 static bool probe_addr(i2c_master_bus_handle_t bus, uint8_t addr) {
     const i2c_device_config_t cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = addr,
-        .scl_speed_hz    = 400000,
+        .scl_speed_hz    = IMU_I2C_HZ,
     };
     if (i2c_master_bus_add_device(bus, &cfg, &s_dev) != ESP_OK) return false;
 
@@ -76,8 +77,7 @@ static bool probe_addr(i2c_master_bus_handle_t bus, uint8_t addr) {
     return true;
 }
 
-// Converts the six raw accel bytes into floating-point g on x/y/z. Registers
-// are little-endian int16; CTRL1 bit 5 (BE) is left at 0 to match.
+// Raw bytes are little-endian int16 because CTRL1 bit 5 (BE) is left at 0.
 static void decode_accel(const uint8_t *raw, float *ax, float *ay, float *az) {
     int16_t x = (int16_t)((raw[1] << 8) | raw[0]);
     int16_t y = (int16_t)((raw[3] << 8) | raw[2]);
@@ -145,7 +145,7 @@ bool imu_begin(void) {
     if (!probe_addr(bus, QMI8658_ADDR_PRIMARY) &&
         !probe_addr(bus, QMI8658_ADDR_ALT)) {
         ESP_LOGW(TAG, "QMI8658 not found at 0x6A/0x6B");
-        return false;
+        goto fail;
     }
 
     // CTRL1 = 0x40 → auto-increment on multi-byte reads, little-endian, INTs off.
@@ -155,19 +155,27 @@ bool imu_begin(void) {
         write_reg(QMI8658_REG_CTRL2, 0x27) != ESP_OK ||
         write_reg(QMI8658_REG_CTRL7, 0x01) != ESP_OK) {
         ESP_LOGE(TAG, "QMI8658 config write failed");
-        return false;
+        goto fail;
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(
         imu_task, "imu", 3072, NULL, 4, NULL, tskNO_AFFINITY);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "imu task create failed");
-        return false;
+        goto fail;
     }
 
     s_ready = true;
     ESP_LOGI(TAG, "QMI8658 up (accel ±8g @62.5Hz, shake-only)");
     return true;
+
+fail:
+    if (s_dev) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
+    }
+    i2c_del_master_bus(bus);
+    return false;
 }
 
 void imu_set_shake_cb(imu_shake_cb_t cb) {

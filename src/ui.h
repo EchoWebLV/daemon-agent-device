@@ -20,11 +20,15 @@
 //    ui_refresh_wallet() / ui_refresh_settings()
 //                                   — after a wallet refresh / settings change
 //
-//  Navigation (horizontal swipes only; vertical only on the wifi modal):
-//    creature  -- swipe left  --> wallet
-//    creature  -- swipe right --> settings --> tap Wi-Fi row --> wifi
-//    wallet    -- swipe right --> creature
-//    settings  -- swipe left  --> creature
+//  Navigation (vertical swipes only):
+//    creature  -- swipe up    --> menu  (Wallet / Info / Config)
+//    creature  -- swipe down  --> settings --> tap Wi-Fi row --> wifi
+//    menu      -- swipe down  --> creature
+//                  -- tap row --> wallet | info | config
+//    wallet    -- swipe down  --> menu
+//    info      -- swipe down  --> menu
+//    config    -- swipe down  --> menu
+//    settings  -- swipe up    --> creature
 //    wifi      -- swipe down (or on-connect) --> settings
 //  Swipe handlers are installed by ui_init() on each screen's root.
 // ---------------------------------------------------------------------------
@@ -51,7 +55,10 @@ void ui_tune_gestures(void);
 // implied by the semantic screen layout (wallet←creature→settings, wifi
 // below settings). Safe to call from the main loop.
 void ui_show_creature(void);
+void ui_show_menu(void);
 void ui_show_wallet(void);
+void ui_show_info(void);
+void ui_show_config(void);
 void ui_show_settings(void);
 void ui_show_wifi(void);
 
@@ -95,6 +102,8 @@ void ui_force_repaint(void);
 // to call on the usual 30-60 s wallet/price cadence.
 void ui_refresh_wallet(void);
 void ui_refresh_settings(void);
+void ui_refresh_info(void);
+void ui_refresh_config(void);
 
 // Called by the AI /say handler once a reply is ready. Updates the
 // creature's subtitle + mood, triggers voice_speak(), and stays on the

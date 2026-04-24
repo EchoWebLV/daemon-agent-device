@@ -2,14 +2,16 @@
 // ---------------------------------------------------------------------------
 //  QMI8658C 6-axis IMU driver + shake detector.
 //
-//  The Waveshare ESP32-S3-Touch-LCD-2.8 carries a QST QMI8658C on the same
-//  I2C bus as the CST328 touch controller. We only use the accelerometer —
-//  the gyro is left disabled to save power.
+//  The Waveshare ESP32-S3-Touch-LCD-2.8 carries a QST QMI8658C on its own
+//  I2C bus (port 1, SDA=11, SCL=10) — separate from the CST328 touch
+//  controller on port 0. We only use the accelerometer; the gyro is left
+//  disabled to save power.
 //
-//  imu_begin() expects touch_init() to have run first (we borrow its bus).
-//  After init, a background task polls the accelerometer at ~50 Hz and
-//  invokes the registered shake callback when it sees vigorous movement.
-//  The callback runs on the IMU task and must not block for long.
+//  imu_begin() owns its own bus, so there's no ordering dependency on
+//  touch_init(). After init, a background task polls the accelerometer
+//  at ~50 Hz and invokes the registered shake callback when it sees
+//  vigorous movement. The callback runs on the IMU task and must not
+//  block for long.
 // ---------------------------------------------------------------------------
 #include <stdbool.h>
 

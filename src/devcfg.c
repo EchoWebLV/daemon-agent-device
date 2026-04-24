@@ -33,6 +33,7 @@ static const char *TAG = "devcfg";
 #define KEY_WIFI_SSID       "wf_ssid"
 #define KEY_WIFI_PASSWORD   "wf_pass"
 #define KEY_LLM_MODEL       "llm_model"
+#define KEY_VOICE_ID        "voice_id"
 #define KEY_PERSONALITY     "persona"
 #define KEY_SVC_CUSTOM      "svc_custom"
 #define KEY_SVC_ENABLED     "svc_enabled"
@@ -45,6 +46,8 @@ static const char *TAG = "devcfg";
 // personality is free-form user-written text that shows up in the AI
 // system prompt — bound it to 1 KB so we can't blow past the chat body cap.
 #define LLM_MODEL_MAX       96
+// ElevenLabs voice ids are 20-char alphanumeric tokens; 32 + NUL is plenty.
+#define VOICE_ID_MAX        48
 #define PERSONALITY_MAX     1024
 // customServices is the full JSON array of user-added services; enabled
 // is a JSON array of ID strings. Sized so typical usage (~8 services) fits
@@ -61,6 +64,7 @@ static bool    s_bluetooth   = false;
 static char    s_ssid[SSID_MAX];
 static char    s_password[PASSWORD_MAX];
 static char    s_llm_model[LLM_MODEL_MAX];
+static char    s_voice_id[VOICE_ID_MAX];
 static char    s_personality[PERSONALITY_MAX];
 static char    s_svc_custom[SVC_CUSTOM_MAX];
 static char    s_svc_enabled[SVC_ENABLED_MAX];
@@ -157,6 +161,7 @@ esp_err_t devcfg_init(void) {
     load_str (h, KEY_WIFI_SSID,     s_ssid,        sizeof(s_ssid));
     load_str (h, KEY_WIFI_PASSWORD, s_password,    sizeof(s_password));
     load_str (h, KEY_LLM_MODEL,     s_llm_model,   sizeof(s_llm_model));
+    load_str (h, KEY_VOICE_ID,      s_voice_id,    sizeof(s_voice_id));
     load_str (h, KEY_PERSONALITY,   s_personality, sizeof(s_personality));
     load_str (h, KEY_SVC_CUSTOM,    s_svc_custom,  sizeof(s_svc_custom));
     load_str (h, KEY_SVC_ENABLED,   s_svc_enabled, sizeof(s_svc_enabled));
@@ -223,6 +228,14 @@ void devcfg_set_llm_model(const char *model) {
     if (model == NULL) model = "";
     strlcpy(s_llm_model, model, sizeof(s_llm_model));
     save_str(KEY_LLM_MODEL, s_llm_model);
+}
+
+const char *devcfg_voice_id(void) { return s_voice_id; }
+
+void devcfg_set_voice_id(const char *voice_id) {
+    if (voice_id == NULL) voice_id = "";
+    strlcpy(s_voice_id, voice_id, sizeof(s_voice_id));
+    save_str(KEY_VOICE_ID, s_voice_id);
 }
 
 void devcfg_set_personality(const char *persona) {

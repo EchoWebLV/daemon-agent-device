@@ -3,19 +3,23 @@
 //
 //  Owns:
 //    • esp_lvgl_port startup + display attach
-//    • the four Daemon screens (creature / wallet / settings / wifi)
+//    • every screen (creature / menu / wallet / info / config / settings / wifi)
 //    • the cross-screen broadcast of status/price/usdc labels
 //
-//  Navigation today is limited: boot shows creature, settings' Wi-Fi row
-//  navigates to wifi_screen, and a successful connect returns to settings.
-//  Swipe-based screen cycling comes with the phase-7 integration pass.
+//  Navigation (see screen_anim_to for the semantic grid):
+//    creature  ←left→ menu              creature  ←right→ settings  ↓ wifi
+//    menu      taps:  Wallet / Info / Config (all swipe-right back to menu)
+//  Swipes are installed on each screen's root in install_swipe_handlers().
 // ---------------------------------------------------------------------------
 #include "ui.h"
-#include "display.h"
+#include "config_screen.h"
 #include "creature_screen.h"
-#include "wallet_screen.h"
+#include "display.h"
+#include "info_screen.h"
+#include "menu_screen.h"
 #include "settings_screen.h"
 #include "voice.h"
+#include "wallet_screen.h"
 #include "wifi_screen.h"
 
 #include <inttypes.h>
@@ -54,11 +58,11 @@ static void nav_wifi_connected(void) {
 
 // --- swipe navigation -------------------------------------------------------
 //
-// Each screen's root gets a LV_EVENT_GESTURE listener. Horizontal axes
-// only for side-to-side navigation — aliasing vertical swipes into
-// horizontal screen loads made the transition animation disagree with
-// the user's finger direction, which read as a bug. Wi-Fi keeps a
-// single DOWN-to-dismiss so the modal still has an escape.
+// Vertical axes only. Swipe UP reveals the menu from the bottom; swipe
+// DOWN reveals settings from the top. The leaves (wallet / info / config)
+// return to the menu with swipe DOWN; the menu returns to the creature
+// the same way. Settings returns to creature with swipe UP. Wi-Fi keeps
+// its DOWN-to-dismiss so the modal still has an escape.
 //
 // lv_indev_wait_release swallows the gesture so the finger-lift doesn't
 // click whatever widget it lands on in the next screen.
@@ -67,24 +71,34 @@ static void on_gesture_creature(lv_event_t *e) {
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_LEFT:  ui_show_wallet();   break;
-        case LV_DIR_RIGHT: ui_show_settings(); break;
+        case LV_DIR_TOP:    ui_show_menu();     break;  // swipe up
+        case LV_DIR_BOTTOM: ui_show_settings(); break;  // swipe down
         default: break;
     }
 }
 
-static void on_gesture_wallet(lv_event_t *e) {
+// Menu + its three leaf screens (wallet / info / config) all swipe DOWN
+// to go "back". The leaves return to the menu; the menu itself returns to
+// the creature so the home-swipe is reachable in at most two gestures.
+static void on_gesture_menu(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
-    if (d == LV_DIR_RIGHT) ui_show_creature();
+    if (d == LV_DIR_BOTTOM) ui_show_creature();
+}
+
+static void on_gesture_back_to_menu(lv_event_t *e) {
+    (void)e;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
+    if (d == LV_DIR_BOTTOM) ui_show_menu();
 }
 
 static void on_gesture_settings(lv_event_t *e) {
     (void)e;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
-    if (d == LV_DIR_LEFT) ui_show_creature();
+    if (d == LV_DIR_TOP) ui_show_creature();  // swipe up → back
 }
 
 static void on_gesture_wifi(lv_event_t *e) {
@@ -96,10 +110,13 @@ static void on_gesture_wifi(lv_event_t *e) {
 
 static void install_swipe_handlers(void) {
     if (lvgl_port_lock(0)) {
-        lv_obj_add_event_cb(creature_screen(), on_gesture_creature, LV_EVENT_GESTURE, NULL);
-        lv_obj_add_event_cb(wallet_screen(),   on_gesture_wallet,   LV_EVENT_GESTURE, NULL);
-        lv_obj_add_event_cb(settings_screen(), on_gesture_settings, LV_EVENT_GESTURE, NULL);
-        lv_obj_add_event_cb(wifi_screen(),     on_gesture_wifi,     LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(creature_screen(), on_gesture_creature,     LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(menu_screen(),     on_gesture_menu,         LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(wallet_screen(),   on_gesture_back_to_menu, LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(info_screen(),     on_gesture_back_to_menu, LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(config_screen(),   on_gesture_back_to_menu, LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(settings_screen(), on_gesture_settings,     LV_EVENT_GESTURE, NULL);
+        lv_obj_add_event_cb(wifi_screen(),     on_gesture_wifi,         LV_EVENT_GESTURE, NULL);
         lvgl_port_unlock();
     }
 }
@@ -155,7 +172,10 @@ esp_err_t ui_init(void) {
     // --- Screens. Each module locks the port mutex itself; we just call
     //     the init entry points in order and load the creature on top. -----
     ESP_RETURN_ON_FALSE(creature_screen_init(), ESP_FAIL, TAG, "creature_screen_init");
+    ESP_RETURN_ON_FALSE(menu_screen_init(),     ESP_FAIL, TAG, "menu_screen_init");
     ESP_RETURN_ON_FALSE(wallet_screen_init(),   ESP_FAIL, TAG, "wallet_screen_init");
+    ESP_RETURN_ON_FALSE(info_screen_init(),     ESP_FAIL, TAG, "info_screen_init");
+    ESP_RETURN_ON_FALSE(config_screen_init(),   ESP_FAIL, TAG, "config_screen_init");
     ESP_RETURN_ON_FALSE(settings_screen_init(), ESP_FAIL, TAG, "settings_screen_init");
     ESP_RETURN_ON_FALSE(wifi_screen_init(),     ESP_FAIL, TAG, "wifi_screen_init");
 
@@ -190,35 +210,44 @@ esp_err_t ui_init(void) {
 // ui_init() drops the creature on top as the very first load.
 static const char *s_last_screen = "creature";
 
-// Semantic layout (think of it as a 2-axis grid):
+// Semantic layout — the stack is now vertical, matching the swipe axis:
 //
-//     wallet  <——  creature  ——>  settings
-//                                     |
-//                                     v
-//                                   wifi
+//     (swipe up)       menu / wallet / info / config
+//                                    ↑
+//                                 creature
+//                                    ↓
+//     (swipe down)              settings  →  wifi
 //
-// Horizontal moves: target on the right  → MOVE_LEFT  (new enters from right)
-//                   target on the left   → MOVE_RIGHT (new enters from left)
-// Vertical moves  : wifi pops up from the bottom of settings, drops back down
-//                   to dismiss. Off-axis jumps (shouldn't happen today but
-//                   cheap to handle) fade instead of sliding in a weird
-//                   direction.
+// Two animation families: "swipe up" slides everything up and brings the
+// new screen in from below (MOVE_TOP). "swipe down" slides everything down
+// and brings the new screen in from above (MOVE_BOTTOM). Menu→leaf is a
+// tap (no swipe direction to honour) so it fades in place.
 static lv_screen_load_anim_t screen_anim_to(const char *from, const char *to) {
-    if (!strcmp(from, "settings") && !strcmp(to, "wifi"))     return LV_SCR_LOAD_ANIM_MOVE_TOP;
-    if (!strcmp(from, "wifi")     && !strcmp(to, "settings")) return LV_SCR_LOAD_ANIM_MOVE_BOTTOM;
-
-    // wallet(0) < creature(1) < settings(2). Anything else drops through
-    // to the fade fallback below.
-    int fpos = -1, tpos = -1;
-    if      (!strcmp(from, "wallet"))   fpos = 0;
-    else if (!strcmp(from, "creature")) fpos = 1;
-    else if (!strcmp(from, "settings")) fpos = 2;
-    if      (!strcmp(to, "wallet"))     tpos = 0;
-    else if (!strcmp(to, "creature"))   tpos = 1;
-    else if (!strcmp(to, "settings"))   tpos = 2;
-    if (fpos >= 0 && tpos >= 0) {
-        if (tpos > fpos) return LV_SCR_LOAD_ANIM_MOVE_LEFT;
-        if (tpos < fpos) return LV_SCR_LOAD_ANIM_MOVE_RIGHT;
+    // Explicit per-pair table. Easier to reason about than position math
+    // once the stack has multiple leaves.
+    static const struct {
+        const char *from, *to;
+        lv_screen_load_anim_t anim;
+    } TABLE[] = {
+        // creature <-> menu (menu reveals from bottom, dismisses upward)
+        { "creature", "menu",     LV_SCR_LOAD_ANIM_MOVE_TOP    },
+        { "menu",     "creature", LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+        // creature <-> settings (settings reveals from top, dismisses down)
+        { "creature", "settings", LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+        { "settings", "creature", LV_SCR_LOAD_ANIM_MOVE_TOP    },
+        // settings <-> wifi (wifi pops up from the bottom, drops back down)
+        { "settings", "wifi",     LV_SCR_LOAD_ANIM_MOVE_TOP    },
+        { "wifi",     "settings", LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+        // leaf → menu via swipe-down. Menu → leaf uses the fade fallback
+        // so the tap doesn't fight a non-existent swipe direction.
+        { "wallet",   "menu",     LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+        { "info",     "menu",     LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+        { "config",   "menu",     LV_SCR_LOAD_ANIM_MOVE_BOTTOM },
+    };
+    for (size_t i = 0; i < sizeof(TABLE)/sizeof(TABLE[0]); i++) {
+        if (!strcmp(from, TABLE[i].from) && !strcmp(to, TABLE[i].to)) {
+            return TABLE[i].anim;
+        }
     }
     return LV_SCR_LOAD_ANIM_FADE_IN;
 }
@@ -242,9 +271,23 @@ void ui_show_creature(void) {
     load_screen_anim(creature_screen(), "creature");
 }
 
+void ui_show_menu(void) {
+    load_screen_anim(menu_screen(), "menu");
+}
+
 void ui_show_wallet(void) {
     load_screen_anim(wallet_screen(), "wallet");
     wallet_screen_refresh();
+}
+
+void ui_show_info(void) {
+    load_screen_anim(info_screen(), "info");
+    info_screen_refresh();
+}
+
+void ui_show_config(void) {
+    load_screen_anim(config_screen(), "config");
+    config_screen_refresh();
 }
 
 void ui_show_settings(void) {
@@ -260,21 +303,30 @@ void ui_show_wifi(void) {
 
 void ui_set_status(const char *s) {
     creature_screen_set_status(s);
+    menu_screen_set_status(s);
     wallet_screen_set_status(s);
+    info_screen_set_status(s);
+    config_screen_set_status(s);
     settings_screen_set_status(s);
     wifi_screen_set_status(s);
 }
 
 void ui_set_price(const char *s) {
     creature_screen_set_price(s);
+    menu_screen_set_price(s);
     wallet_screen_set_price(s);
+    info_screen_set_price(s);
+    config_screen_set_price(s);
     settings_screen_set_price(s);
     wifi_screen_set_price(s);
 }
 
 void ui_set_usdc(const char *s) {
     creature_screen_set_usdc(s);
+    menu_screen_set_usdc(s);
     wallet_screen_set_usdc(s);
+    info_screen_set_usdc(s);
+    config_screen_set_usdc(s);
     settings_screen_set_usdc(s);
     wifi_screen_set_usdc(s);
 }
@@ -321,18 +373,29 @@ void ui_refresh_settings(void) {
     settings_screen_refresh();
 }
 
+void ui_refresh_info(void) {
+    info_screen_refresh();
+}
+
+void ui_refresh_config(void) {
+    config_screen_refresh();
+}
+
 // --- Test-harness bridges --------------------------------------------------
 
 const char *ui_current_screen_name(void) {
-    // Compare the active screen pointer to each of the four cached screen
-    // roots. Reads lv_screen_active() under the port lock so we never race
-    // the LVGL task mid-transition. Returns a literal — the comparison is
-    // only needed while we hold the lock.
+    // Compare the active screen pointer to each of the cached screen roots.
+    // Reads lv_screen_active() under the port lock so we never race the LVGL
+    // task mid-transition. Returns a literal — the comparison is only needed
+    // while we hold the lock.
     const char *name = "unknown";
     if (lvgl_port_lock(0)) {
         lv_obj_t *a = lv_screen_active();
         if      (a == creature_screen()) name = "creature";
+        else if (a == menu_screen())     name = "menu";
         else if (a == wallet_screen())   name = "wallet";
+        else if (a == info_screen())     name = "info";
+        else if (a == config_screen())   name = "config";
         else if (a == settings_screen()) name = "settings";
         else if (a == wifi_screen())     name = "wifi";
         lvgl_port_unlock();
@@ -346,12 +409,16 @@ void ui_inject_swipe(int direction) {
     const char *from = ui_current_screen_name();
 
     if (!strcmp(from, "creature")) {
-        if      (direction == 0) ui_show_wallet();    // LEFT
-        else if (direction == 1) ui_show_settings();  // RIGHT
-    } else if (!strcmp(from, "wallet")) {
-        if (direction == 1) ui_show_creature();       // RIGHT → back
+        if      (direction == 2) ui_show_menu();      // UP
+        else if (direction == 3) ui_show_settings();  // DOWN
+    } else if (!strcmp(from, "menu")) {
+        if (direction == 3) ui_show_creature();       // DOWN → back
+    } else if (!strcmp(from, "wallet") ||
+               !strcmp(from, "info")   ||
+               !strcmp(from, "config")) {
+        if (direction == 3) ui_show_menu();           // DOWN → back to menu
     } else if (!strcmp(from, "settings")) {
-        if (direction == 0) ui_show_creature();       // LEFT → back
+        if (direction == 2) ui_show_creature();       // UP → back
     } else if (!strcmp(from, "wifi")) {
         if (direction == 3) ui_show_settings();       // DOWN → dismiss
     }

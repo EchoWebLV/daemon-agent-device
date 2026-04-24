@@ -323,11 +323,13 @@ static bool tts_perform(const char *text) {
 
     // pcm_22050 = 22050 Hz 16-bit signed little-endian mono, matching our
     // I2S clock. No decoder needed — bytes stream straight to DMA.
+    const char *voice_id = devcfg_voice_id();
+    if (!voice_id || !voice_id[0]) voice_id = ELEVENLABS_VOICE_ID;
     char url[256];
     snprintf(url, sizeof(url),
              "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
              "?output_format=pcm_22050&optimize_streaming_latency=3",
-             ELEVENLABS_VOICE_ID);
+             voice_id);
 
     tts_ctx_t ctx = {0};
 
@@ -473,11 +475,13 @@ bool voice_diagnose(void) {
         return false;
     }
 
+    const char *voice_id = devcfg_voice_id();
+    if (!voice_id || !voice_id[0]) voice_id = ELEVENLABS_VOICE_ID;
     char url[256];
     snprintf(url, sizeof(url),
              "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
              "?output_format=pcm_22050",
-             ELEVENLABS_VOICE_ID);
+             voice_id);
 
     // Minimal body: one-word text, no voice settings.
     const char *body = "{\"text\":\"hi\",\"model_id\":\"" ELEVENLABS_MODEL "\"}";

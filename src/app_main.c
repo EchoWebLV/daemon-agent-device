@@ -57,9 +57,8 @@ static void on_shake(void) {
         "Please stop this!",
         "Come on, stop it!",
     };
+    // Round-robin so two shakes in a row never pick the same line.
     static uint8_t idx = 0;
-    // Rotate through the phrases. esp_random() works too but a round-robin
-    // avoids two shakes in a row picking the same line.
     const char *line = LINES[idx];
     idx = (idx + 1) % (sizeof(LINES) / sizeof(LINES[0]));
     creature_screen_shake();
