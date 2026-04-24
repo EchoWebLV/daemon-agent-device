@@ -86,6 +86,12 @@ void app_main(void) {
     // Device settings (backlight PWM comes online here at the stored duty).
     ESP_ERROR_CHECK(devcfg_init());
 
+    // TEMP: wipe any stored custom personality so the built-in PERSONA wins.
+    // A stale prompt (possibly from a previous build) was overriding ai.c's
+    // PERSONA and the model kept slipping into Claude's default refusal. Once
+    // confirmed, delete this line — it clears any future persona on boot.
+    devcfg_set_personality("");
+
     // Bring the ST7789 online early so dead-panel failures show up in the
     // log before we start allocating for LVGL / WiFi / audio.
     ESP_ERROR_CHECK(display_init());
