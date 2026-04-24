@@ -23,13 +23,25 @@ typedef struct {
     size_t body_len;     // bytes of response body actually captured
 } x402_result_t;
 
-// POST `json_body` to `url`. If the first response is 402, build and sign
-// a Solana USDC payment per the returned payment-required description and
-// retry. Writes the final response body into `body_buf` (NUL-terminated,
-// truncated on overflow).
+// Issue an HTTP request to `url` with `method` ("GET", "POST", "PUT",
+// "PATCH", "DELETE" — case-sensitive, NULL treated as "POST"). If the first
+// response is 402, build + sign a Solana USDC payment per the returned
+// payment-required description and retry with a PAYMENT-SIGNATURE header.
+// Writes the final response body into `body_buf` (NUL-terminated, truncated
+// on overflow).
 //
-// `auth_bearer`, if non-NULL and non-empty, is sent as
-// "Authorization: Bearer <value>".
+// `json_body` is ignored for methods that don't carry a body (GET, DELETE);
+// pass NULL in that case. `auth_bearer`, if non-NULL and non-empty, is sent
+// as "Authorization: Bearer <value>".
+void x402_call(const char *method,
+               const char *url,
+               const char *json_body,
+               const char *auth_bearer,
+               char       *body_buf,
+               size_t      body_cap,
+               x402_result_t *out);
+
+// Back-compat shim — equivalent to x402_call("POST", ...).
 void x402_post(const char *url,
                const char *json_body,
                const char *auth_bearer,

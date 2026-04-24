@@ -59,6 +59,19 @@ void        devcfg_set_llm_model(const char *model);
 const char *devcfg_personality(void);
 void        devcfg_set_personality(const char *persona);
 
+// Custom x402 services library + enabled-service IDs. Both are stored as
+// raw JSON strings so the phone UI (and chrome-ext, if it syncs later) can
+// round-trip them without the device needing to re-serialise. Getters
+// always return a valid JSON string — "[]" when nothing has been saved.
+//
+// customServices is capped at 4096 bytes (≈8 services of typical size);
+// servicesEnabled at 512 bytes. Over-cap writes are rejected silently.
+const char *devcfg_custom_services(void);
+void        devcfg_set_custom_services(const char *json);
+
+const char *devcfg_services_enabled(void);
+void        devcfg_set_services_enabled(const char *json);
+
 #ifdef __cplusplus
 }
 #endif

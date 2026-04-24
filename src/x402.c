@@ -435,7 +435,20 @@ out:
 // ---------------------------------------------------------------------------
 // Public entry point.
 // ---------------------------------------------------------------------------
-void x402_post(const char *url,
+// Map an HTTP-method string to the esp_http_client enum. Unknown/NULL → POST
+// so callers that have never thought about methods keep their old behaviour.
+static esp_http_client_method_t method_from_str(const char *m, bool *has_body) {
+    if (has_body) *has_body = true;
+    if (!m || !m[0]) return HTTP_METHOD_POST;
+    if (strcasecmp(m, "GET")    == 0) { if (has_body) *has_body = false; return HTTP_METHOD_GET;    }
+    if (strcasecmp(m, "DELETE") == 0) { if (has_body) *has_body = false; return HTTP_METHOD_DELETE; }
+    if (strcasecmp(m, "PUT")    == 0) return HTTP_METHOD_PUT;
+    if (strcasecmp(m, "PATCH")  == 0) return HTTP_METHOD_PATCH;
+    return HTTP_METHOD_POST;
+}
+
+void x402_call(const char *method,
+               const char *url,
                const char *json_body,
                const char *auth_bearer,
                char       *body_buf,
@@ -445,7 +458,15 @@ void x402_post(const char *url,
     memset(out, 0, sizeof(*out));
     if (body_buf && body_cap) body_buf[0] = '\0';
 
-    if (!url || !json_body || !body_buf || body_cap == 0) {
+    bool has_body = true;
+    esp_http_client_method_t http_method = method_from_str(method, &has_body);
+
+    if (!url || !body_buf || body_cap == 0) {
+        strlcpy(out->error, "bad args", sizeof(out->error));
+        return;
+    }
+    // GET/DELETE don't carry a body; POST/PUT/PATCH need one.
+    if (has_body && !json_body) {
         strlcpy(out->error, "bad args", sizeof(out->error));
         return;
     }
@@ -474,7 +495,7 @@ void x402_post(const char *url,
 
     esp_http_client_config_t cfg1 = {
         .url               = url,
-        .method            = HTTP_METHOD_POST,
+        .method            = http_method,
         .transport_type    = HTTP_TRANSPORT_OVER_SSL,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler     = on_x402_event,
@@ -493,13 +514,13 @@ void x402_post(const char *url,
         strlcpy(out->error, "client init", sizeof(out->error));
         goto done;
     }
-    esp_http_client_set_header(h1, "Content-Type", "application/json");
+    if (has_body) esp_http_client_set_header(h1, "Content-Type", "application/json");
     if (auth_bearer && auth_bearer[0]) {
         char h[160];
         snprintf(h, sizeof(h), "Bearer %s", auth_bearer);
         esp_http_client_set_header(h1, "Authorization", h);
     }
-    esp_http_client_set_post_field(h1, json_body, (int)strlen(json_body));
+    if (has_body) esp_http_client_set_post_field(h1, json_body, (int)strlen(json_body));
 
     esp_err_t err1 = esp_http_client_perform(h1);
     int       code1 = esp_http_client_get_status_code(h1);
@@ -547,7 +568,7 @@ void x402_post(const char *url,
 
         esp_http_client_config_t cfg2 = {
             .url               = url,
-            .method            = HTTP_METHOD_POST,
+            .method            = http_method,
             .transport_type    = HTTP_TRANSPORT_OVER_SSL,
             .crt_bundle_attach = esp_crt_bundle_attach,
             .event_handler     = on_x402_event,
@@ -568,14 +589,14 @@ void x402_post(const char *url,
             free(b64);
             goto done;
         }
-        esp_http_client_set_header(h2, "Content-Type",      "application/json");
+        if (has_body) esp_http_client_set_header(h2, "Content-Type", "application/json");
         esp_http_client_set_header(h2, "PAYMENT-SIGNATURE", b64);
         if (auth_bearer && auth_bearer[0]) {
             char h[160];
             snprintf(h, sizeof(h), "Bearer %s", auth_bearer);
             esp_http_client_set_header(h2, "Authorization", h);
         }
-        esp_http_client_set_post_field(h2, json_body, (int)strlen(json_body));
+        if (has_body) esp_http_client_set_post_field(h2, json_body, (int)strlen(json_body));
 
         esp_err_t err2  = esp_http_client_perform(h2);
         int       code2 = esp_http_client_get_status_code(h2);
@@ -605,4 +626,10 @@ void x402_post(const char *url,
 
 done:
     free(pr); free(xpr); free(wa);
+}
+
+void x402_post(const char *url, const char *json_body,
+               const char *auth_bearer, char *body_buf, size_t body_cap,
+               x402_result_t *out) {
+    x402_call("POST", url, json_body, auth_bearer, body_buf, body_cap, out);
 }

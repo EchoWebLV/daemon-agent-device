@@ -34,6 +34,8 @@ static const char *TAG = "devcfg";
 #define KEY_WIFI_PASSWORD   "wf_pass"
 #define KEY_LLM_MODEL       "llm_model"
 #define KEY_PERSONALITY     "persona"
+#define KEY_SVC_CUSTOM      "svc_custom"
+#define KEY_SVC_ENABLED     "svc_enabled"
 
 // Upper bounds on strings we persist. WPA2 passwords cap at 63 chars + NUL;
 // SSIDs at 32 + NUL. We round up for headroom (hidden SSIDs / WPA3).
@@ -44,6 +46,12 @@ static const char *TAG = "devcfg";
 // system prompt — bound it to 1 KB so we can't blow past the chat body cap.
 #define LLM_MODEL_MAX       96
 #define PERSONALITY_MAX     1024
+// customServices is the full JSON array of user-added services; enabled
+// is a JSON array of ID strings. Sized so typical usage (~8 services) fits
+// comfortably; the HTTP /config POST cap in server.c must match or exceed
+// the custom-services bound or the library saves will silently truncate.
+#define SVC_CUSTOM_MAX      4096
+#define SVC_ENABLED_MAX      512
 
 // ---- Module state -----------------------------------------------------------
 static bool    s_ready       = false;
@@ -54,6 +62,8 @@ static char    s_ssid[SSID_MAX];
 static char    s_password[PASSWORD_MAX];
 static char    s_llm_model[LLM_MODEL_MAX];
 static char    s_personality[PERSONALITY_MAX];
+static char    s_svc_custom[SVC_CUSTOM_MAX];
+static char    s_svc_enabled[SVC_ENABLED_MAX];
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -148,6 +158,8 @@ esp_err_t devcfg_init(void) {
     load_str (h, KEY_WIFI_PASSWORD, s_password,    sizeof(s_password));
     load_str (h, KEY_LLM_MODEL,     s_llm_model,   sizeof(s_llm_model));
     load_str (h, KEY_PERSONALITY,   s_personality, sizeof(s_personality));
+    load_str (h, KEY_SVC_CUSTOM,    s_svc_custom,  sizeof(s_svc_custom));
+    load_str (h, KEY_SVC_ENABLED,   s_svc_enabled, sizeof(s_svc_enabled));
 
     if (h != 0) nvs_close(h);
 
@@ -217,4 +229,41 @@ void devcfg_set_personality(const char *persona) {
     if (persona == NULL) persona = "";
     strlcpy(s_personality, persona, sizeof(s_personality));
     save_str(KEY_PERSONALITY, s_personality);
+}
+
+const char *devcfg_custom_services(void) {
+    // Callers (system prompt builder, /config GET responder) expect a valid
+    // JSON array on every read. An empty cache means "user hasn't saved
+    // anything yet" — return a literal "[]" so downstream JSON embedding
+    // stays well-formed.
+    return s_svc_custom[0] ? s_svc_custom : "[]";
+}
+
+void devcfg_set_custom_services(const char *json) {
+    if (json == NULL) json = "";
+    // Over-cap writes are dropped — the caller is expected to have
+    // rejected the POST with 413 before getting here. Silent drop is a
+    // safety net, not a fallback, so we log it loud.
+    if (strlen(json) >= sizeof(s_svc_custom)) {
+        ESP_LOGW(TAG, "customServices write rejected: %u > %u",
+                 (unsigned)strlen(json), (unsigned)sizeof(s_svc_custom) - 1);
+        return;
+    }
+    strlcpy(s_svc_custom, json, sizeof(s_svc_custom));
+    save_str(KEY_SVC_CUSTOM, s_svc_custom);
+}
+
+const char *devcfg_services_enabled(void) {
+    return s_svc_enabled[0] ? s_svc_enabled : "[]";
+}
+
+void devcfg_set_services_enabled(const char *json) {
+    if (json == NULL) json = "";
+    if (strlen(json) >= sizeof(s_svc_enabled)) {
+        ESP_LOGW(TAG, "servicesEnabled write rejected: %u > %u",
+                 (unsigned)strlen(json), (unsigned)sizeof(s_svc_enabled) - 1);
+        return;
+    }
+    strlcpy(s_svc_enabled, json, sizeof(s_svc_enabled));
+    save_str(KEY_SVC_ENABLED, s_svc_enabled);
 }

@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cJSON.h"
+#include "devcfg.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -25,7 +27,10 @@ extern const size_t index_html_len;
 // --- Module state ------------------------------------------------------------
 #define STATUS_MAX 64
 #define REPLY_MAX  1024
-#define BODY_MAX   4096
+// Bumped past devcfg's SVC_CUSTOM_MAX (4096) so a worst-case saveSettings
+// POST — full custom-services JSON plus a few small fields — fits with
+// room to spare for the surrounding JSON envelope.
+#define BODY_MAX   8192
 
 static httpd_handle_t         s_httpd   = NULL;
 static server_say_handler_t   s_on_say  = NULL;
@@ -127,23 +132,92 @@ static esp_err_t handle_say(httpd_req_t *req) {
     return send_json(req, 200, body);
 }
 
-// Phase-2 stubs for /config so the web UI's loadCfg() / saveSettings() /
-// service toggles don't 404 loudly. Real implementation lands in phase 4
-// once devcfg exposes persona/model/services.
+// /config exposes the persisted settings the phone UI needs: LLM model,
+// personality, custom x402 services library and the subset enabled. The
+// two service fields are stored as raw JSON strings in NVS so we embed
+// them directly in the response envelope rather than re-parsing just to
+// serialise again — devcfg guarantees "[]" when nothing has been saved.
 static esp_err_t handle_config_get(httpd_req_t *req) {
-    return send_json(req, 200,
-        "{\"model\":\"\",\"personality\":\"\","
-        "\"servicesEnabled\":[],\"customServices\":[]}");
-}
-static esp_err_t handle_config_post(httpd_req_t *req) {
-    // Drain the body so the socket stays happy.
-    char scratch[256];
-    int remaining = req->content_len;
-    while (remaining > 0) {
-        int r = httpd_req_recv(req, scratch, sizeof(scratch));
-        if (r <= 0) break;
-        remaining -= r;
+    const char *model    = devcfg_llm_model();
+    const char *persona  = devcfg_personality();
+    const char *svc_all  = devcfg_custom_services();
+    const char *svc_on   = devcfg_services_enabled();
+
+    // Worst-case JSON escape is 6x (a run of control bytes encoded as
+    // \uXXXX). Personality is up to 1024 chars so a stack buffer would
+    // be ~6 KB — the httpd task has 16 KB of stack but /say uses most
+    // of it for TLS, so keep this off the stack.
+    char *model_esc   = malloc(96 * 6 + 1);
+    char *persona_esc = malloc(1024 * 6 + 1);
+    char *body        = malloc(BODY_MAX);
+    if (!model_esc || !persona_esc || !body) {
+        free(model_esc); free(persona_esc); free(body);
+        return send_json(req, 500, "{\"error\":\"oom\"}");
     }
+    json_escape(model,   model_esc,   96 * 6 + 1);
+    json_escape(persona, persona_esc, 1024 * 6 + 1);
+
+    int n = snprintf(body, BODY_MAX,
+                     "{\"model\":\"%s\",\"personality\":\"%s\","
+                     "\"servicesEnabled\":%s,\"customServices\":%s}",
+                     model_esc, persona_esc, svc_on, svc_all);
+    esp_err_t err = (n > 0 && n < BODY_MAX)
+        ? send_json(req, 200, body)
+        : send_json(req, 500, "{\"error\":\"body too large\"}");
+    free(model_esc);
+    free(persona_esc);
+    free(body);
+    return err;
+}
+
+// Phone UI POSTs a partial-update JSON object — any combination of
+// model, personality, customServices (array), servicesEnabled (array).
+// Arrays are re-serialised back to a string before hitting NVS so the
+// storage layer stays opaque to cJSON.
+static esp_err_t handle_config_post(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > BODY_MAX) {
+        // Drain partial body so the client gets a clean 400 instead of a
+        // stalled connection reset.
+        char scratch[256];
+        int remaining = req->content_len;
+        while (remaining > 0) {
+            int r = httpd_req_recv(req, scratch,
+                                   remaining < (int)sizeof(scratch)
+                                       ? remaining : (int)sizeof(scratch));
+            if (r <= 0) break;
+            remaining -= r;
+        }
+        return send_json(req, 400, "{\"error\":\"bad body\"}");
+    }
+
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int n = read_body(req, buf, req->content_len + 1);
+    if (n < 0) { free(buf); return send_json(req, 400, "{\"error\":\"recv\"}"); }
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"json\"}");
+
+    const cJSON *j_model   = cJSON_GetObjectItemCaseSensitive(root, "model");
+    const cJSON *j_persona = cJSON_GetObjectItemCaseSensitive(root, "personality");
+    const cJSON *j_svc_all = cJSON_GetObjectItemCaseSensitive(root, "customServices");
+    const cJSON *j_svc_on  = cJSON_GetObjectItemCaseSensitive(root, "servicesEnabled");
+
+    if (cJSON_IsString(j_model))   devcfg_set_llm_model(j_model->valuestring);
+    if (cJSON_IsString(j_persona)) devcfg_set_personality(j_persona->valuestring);
+
+    // cJSON_PrintUnformatted allocates — free before falling through.
+    if (cJSON_IsArray(j_svc_all)) {
+        char *s = cJSON_PrintUnformatted(j_svc_all);
+        if (s) { devcfg_set_custom_services(s); cJSON_free(s); }
+    }
+    if (cJSON_IsArray(j_svc_on)) {
+        char *s = cJSON_PrintUnformatted(j_svc_on);
+        if (s) { devcfg_set_services_enabled(s); cJSON_free(s); }
+    }
+
+    cJSON_Delete(root);
     return send_json(req, 200, "{\"ok\":true}");
 }
 
