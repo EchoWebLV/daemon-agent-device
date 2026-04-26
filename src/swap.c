@@ -29,6 +29,7 @@
 #include "mbedtls/base64.h"
 
 #include "ed25519.h"
+#include "refill.h"
 #include "swap_screen.h"
 #include "wallet.h"
 #include "wifi_sta.h"
@@ -385,9 +386,31 @@ bool swap_request(const char *from_sym,
         s_in_progress = false; return false;
     }
     if (!has_balance(&a, amount_ui)) {
-        out->status = SWAP_ERR_INSUFFICIENT;
-        strlcpy(out->error_msg, "insufficient_balance", sizeof(out->error_msg));
-        s_in_progress = false; return false;
+        // For USDC swaps, our daemon's spend-account model keeps only a small
+        // float on the device; the bulk lives in the vault. Try a synchronous
+        // refill from vault → device USDC ATA before giving up. SOL / SPLs
+        // don't have a refill path yet — they fail straight through.
+        bool retried = false;
+        if (strcmp(a.sym, "USDC") == 0) {
+            uint64_t need_micro    = (uint64_t)(amount_ui * 1e6 + 0.5);
+            uint64_t current_micro = (uint64_t)(wallet_usdc_amount() * 1e6 + 0.5);
+            if (need_micro > current_micro) {
+                uint64_t to_refill = need_micro - current_micro + 100000ULL; // +$0.10 cushion
+                char rftxid[96];
+                ESP_LOGI(TAG, "swap: USDC short by %.6f; refilling %llu micro-USDC from vault",
+                         (double)(need_micro - current_micro) / 1e6,
+                         (unsigned long long)to_refill);
+                if (refill_run_and_wait(to_refill, rftxid, sizeof rftxid)) {
+                    ESP_LOGI(TAG, "swap: refill confirmed (%.16s); retrying balance check", rftxid);
+                    retried = true;
+                }
+            }
+        }
+        if (!retried || !has_balance(&a, amount_ui)) {
+            out->status = SWAP_ERR_INSUFFICIENT;
+            strlcpy(out->error_msg, "insufficient_balance", sizeof(out->error_msg));
+            s_in_progress = false; return false;
+        }
     }
 
     uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));

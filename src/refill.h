@@ -36,6 +36,13 @@ bool refill_check_and_maybe_run(char *out_txid, size_t txid_cap);
 // balance. Used by the test harness verb TEST VAULT REFILL.
 bool refill_run_amount(uint64_t amount_atomic, char *out_txid, size_t txid_cap);
 
+// Synchronous variant: submit, then poll getSignatureStatuses every ~800 ms
+// up to ~30 s for confirmation, then trigger a wallet_refresh so that
+// wallet_usdc_amount() reflects the new balance. Used by the swap path —
+// when the device's USDC ATA is short, we top up out of the vault and wait
+// for confirmation before deciding the swap can proceed.
+bool refill_run_and_wait(uint64_t amount_atomic, char *out_txid, size_t txid_cap);
+
 #ifdef __cplusplus
 }
 #endif

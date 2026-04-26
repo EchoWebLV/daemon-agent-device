@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "agent_pda.h"
 #include "base58.h"
@@ -188,4 +189,46 @@ bool refill_check_and_maybe_run(char *out_txid, size_t txid_cap)
     ESP_LOGI(TAG, "device USDC %.6f below threshold; refilling %llu micro-USDC",
              usdc, (unsigned long long)need);
     return refill_run_amount(need, out_txid, txid_cap);
+}
+
+// ---------------------------------------------------------------------------
+//  Synchronous wait — getSignatureStatuses poll, ~30 s ceiling.
+//  Mirrors swap.c::rpc_wait_for_confirm but uses the public rpc_call helper.
+// ---------------------------------------------------------------------------
+static bool wait_for_confirm(const char *txid) {
+    if (!txid || !txid[0]) return false;
+    for (int i = 0; i < 38; i++) {
+        char req[256];
+        snprintf(req, sizeof req,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignatureStatuses\","
+            "\"params\":[[\"%s\"],{\"searchTransactionHistory\":false}]}",
+            txid);
+        char rsp[1024];
+        if (rpc_call(req, rsp, sizeof rsp)) {
+            cJSON *root = cJSON_Parse(rsp);
+            if (root) {
+                const cJSON *result = cJSON_GetObjectItem(root, "result");
+                const cJSON *value  = result ? cJSON_GetObjectItem(result, "value") : NULL;
+                bool landed = false;
+                if (cJSON_IsArray(value) && cJSON_GetArraySize(value) > 0) {
+                    const cJSON *st = cJSON_GetArrayItem(value, 0);
+                    if (cJSON_IsObject(st)) landed = true;
+                }
+                cJSON_Delete(root);
+                if (landed) return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    ESP_LOGW(TAG, "wait confirm timeout %.16s...", txid);
+    return false;
+}
+
+bool refill_run_and_wait(uint64_t amount_atomic, char *out_txid, size_t txid_cap)
+{
+    if (!refill_run_amount(amount_atomic, out_txid, txid_cap)) return false;
+    if (!wait_for_confirm(out_txid)) return false;
+    // Refresh the cached balances so callers can immediately re-check.
+    wallet_refresh();
+    return true;
 }
