@@ -40,6 +40,17 @@ const uint8_t *wallet_pubkey_bytes(void);
 const uint8_t *wallet_owner_pubkey_bytes(void);
 const char    *wallet_owner_pubkey(void);
 
+// On-chain vault PDA derived from the owner pubkey. NULL if OWNER_PUBKEY is
+// unset. The bytes never change between boots — derivation happens once at
+// wallet_begin() and the result is cached.
+const uint8_t *wallet_vault_pda_bytes(void);
+const char    *wallet_vault_pda(void);
+
+// Canonical USDC ATA owned by the vault PDA. Same caching rules as the vault
+// PDA itself — this is where x402 payments now draw from.
+const uint8_t *wallet_vault_usdc_ata_bytes(void);
+const char    *wallet_vault_usdc_ata(void);
+
 // True when a 64-byte seed is loaded and the derived pubkey matches.
 bool wallet_can_sign(void);
 

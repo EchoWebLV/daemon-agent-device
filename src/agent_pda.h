@@ -23,6 +23,16 @@ extern const uint8_t AGENT_PROGRAM_ID[32];
 // SPL Token program ID (base58: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 extern const uint8_t SPL_TOKEN_PROGRAM_ID[32];
 
+// SPL Associated Token Account program ID (base58: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").
+extern const uint8_t SPL_ATA_PROGRAM_ID[32];
+
+// Derive the canonical Associated Token Account for `owner` holding `mint`.
+// ATA = find_program_address([owner, TOKEN_PROGRAM_ID, mint], ATA_PROGRAM_ID).
+// Returns the bump on success, -1 on failure (vanishingly unlikely).
+int agent_pda_derive_ata(const uint8_t owner[32],
+                         const uint8_t mint[32],
+                         uint8_t       out_ata[32]);
+
 // Account-meta input/output for instruction-building APIs.
 // `pubkey` is non-owning; the caller must keep the pointed-to bytes alive
 // until the resulting tx has been serialized.

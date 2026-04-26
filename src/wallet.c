@@ -27,6 +27,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "agent_pda.h"
 #include "base58.h"
 #include "ed25519.h"
 #include "secrets.h"
@@ -82,6 +83,15 @@ static char    s_pubkey[45]            = {0};     // base58, NUL-terminated
 static bool    s_owner_ok              = false;
 static uint8_t s_owner_pubkey_bytes[32] = {0};
 static char    s_owner_pubkey[45]      = {0};
+
+// Cached PDAs / ATAs — derived at wallet_begin() once we have both the
+// owner key and the device key in hand. ata derivation runs ~8 sha256
+// rounds on average so caching matters for the x402 hot path.
+static bool    s_chain_ok              = false;
+static uint8_t s_vault_pda_bytes[32]   = {0};
+static char    s_vault_pda[45]         = {0};
+static uint8_t s_vault_usdc_ata_bytes[32] = {0};
+static char    s_vault_usdc_ata[45]    = {0};
 
 // orlp/ed25519 signs with an "expanded" 64-byte private key that is *not*
 // Solana's `[seed || pub]` layout — it's `[a || prefix]` where both halves
@@ -182,6 +192,7 @@ bool wallet_begin(void) {
     // the placeholder, the wallet still works for read-only ops; only
     // vault_execute paths need it.
     s_owner_ok = false;
+    s_chain_ok = false;
     const char *owner_raw = OWNER_PUBKEY;
     if (owner_raw && owner_raw[0] && strncmp(owner_raw, "REPLACE_ME", 10) != 0) {
         uint8_t obuf[32];
@@ -191,6 +202,25 @@ bool wallet_begin(void) {
             snprintf(s_owner_pubkey, sizeof s_owner_pubkey, "%s", owner_raw);
             s_owner_ok = true;
             ESP_LOGI(TAG, "owner_pubkey %s", s_owner_pubkey);
+
+            // Cache the agent_root → vault → vault_usdc_ata chain. None of
+            // these depend on network state — they're pure cryptographic
+            // derivations from the owner pubkey + USDC mint constant.
+            uint8_t agent_root[32], usdc_mint[32];
+            if (base58_decode(USDC_MINT, usdc_mint, 32) == 32 &&
+                agent_pda_derive_root(s_owner_pubkey_bytes, agent_root) >= 0 &&
+                agent_pda_derive_vault(agent_root, s_vault_pda_bytes) >= 0 &&
+                agent_pda_derive_ata(s_vault_pda_bytes, usdc_mint,
+                                     s_vault_usdc_ata_bytes) >= 0)
+            {
+                base58_encode(s_vault_pda_bytes, 32, s_vault_pda, sizeof s_vault_pda);
+                base58_encode(s_vault_usdc_ata_bytes, 32, s_vault_usdc_ata, sizeof s_vault_usdc_ata);
+                s_chain_ok = true;
+                ESP_LOGI(TAG, "vault          %s", s_vault_pda);
+                ESP_LOGI(TAG, "vault_usdc_ata %s", s_vault_usdc_ata);
+            } else {
+                ESP_LOGW(TAG, "vault PDA derivation failed");
+            }
         } else {
             ESP_LOGW(TAG, "OWNER_PUBKEY decode failed (%d bytes, want 32)", on);
         }
@@ -220,6 +250,11 @@ const uint8_t *wallet_pubkey_bytes(void)        { return s_ok ? s_pubkey_bytes :
 
 const uint8_t *wallet_owner_pubkey_bytes(void)  { return s_owner_ok ? s_owner_pubkey_bytes : NULL; }
 const char    *wallet_owner_pubkey(void)        { return s_owner_ok ? s_owner_pubkey : ""; }
+
+const uint8_t *wallet_vault_pda_bytes(void)        { return s_chain_ok ? s_vault_pda_bytes : NULL; }
+const char    *wallet_vault_pda(void)              { return s_chain_ok ? s_vault_pda : ""; }
+const uint8_t *wallet_vault_usdc_ata_bytes(void)   { return s_chain_ok ? s_vault_usdc_ata_bytes : NULL; }
+const char    *wallet_vault_usdc_ata(void)         { return s_chain_ok ? s_vault_usdc_ata : ""; }
 
 double wallet_sol_balance(void)                 { return s_sol_balance; }
 

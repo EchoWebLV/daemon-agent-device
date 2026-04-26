@@ -35,10 +35,19 @@ const uint8_t SPL_TOKEN_PROGRAM_ID[32] = {
     0x3a, 0x8c, 0xf5, 0x85, 0x7e, 0xff, 0x00, 0xa9,
 };
 
+// Decoded base58 of "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".
+const uint8_t SPL_ATA_PROGRAM_ID[32] = {
+    0x8c, 0x97, 0x25, 0x8f, 0x4e, 0x24, 0x89, 0xf1,
+    0xbb, 0x3d, 0x10, 0x29, 0x14, 0x8e, 0x0d, 0x83,
+    0x0b, 0x5a, 0x13, 0x99, 0xda, 0xff, 0x10, 0x84,
+    0x04, 0x8e, 0x7b, 0xd8, 0xdb, 0xe9, 0xf8, 0x59,
+};
+
 // One PDA candidate: sha256(seeds || bump || program_id || marker), then
 // reject if it lands on the Ed25519 curve (would collide with a real keypair).
 // Returns 1 if `out` is a valid (off-curve) PDA, 0 otherwise.
 static int try_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds,
+                   const uint8_t program_id[32],
                    uint8_t bump, uint8_t out[32])
 {
     mbedtls_sha256_context c;
@@ -48,7 +57,7 @@ static int try_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds
         mbedtls_sha256_update(&c, seeds[i], seed_lens[i]);
     }
     mbedtls_sha256_update(&c, &bump, 1);
-    mbedtls_sha256_update(&c, AGENT_PROGRAM_ID, 32);
+    mbedtls_sha256_update(&c, program_id, 32);
     mbedtls_sha256_update(&c, (const uint8_t *)PDA_MARKER, sizeof(PDA_MARKER) - 1);
     mbedtls_sha256_finish(&c, out);
     mbedtls_sha256_free(&c);
@@ -58,10 +67,10 @@ static int try_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds
 // Grind down from 255 to 0 to find the canonical bump (matching Anchor's
 // `find_program_address`). Returns the bump on success, -1 on failure.
 static int find_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds,
-                    uint8_t out[32])
+                    const uint8_t program_id[32], uint8_t out[32])
 {
     for (int bump = 255; bump >= 0; bump--) {
-        if (try_pda(seeds, seed_lens, nseeds, (uint8_t)bump, out)) {
+        if (try_pda(seeds, seed_lens, nseeds, program_id, (uint8_t)bump, out)) {
             return bump;
         }
     }
@@ -72,14 +81,22 @@ int agent_pda_derive_root(const uint8_t owner[32], uint8_t out_root[32]) {
     static const uint8_t SEED_TAG[] = "agent";
     const uint8_t *seeds[]     = { SEED_TAG,            owner };
     const size_t   seed_lens[] = { sizeof SEED_TAG - 1, 32    };
-    return find_pda(seeds, seed_lens, 2, out_root);
+    return find_pda(seeds, seed_lens, 2, AGENT_PROGRAM_ID, out_root);
 }
 
 int agent_pda_derive_vault(const uint8_t agent_root[32], uint8_t out_vault[32]) {
     static const uint8_t SEED_TAG[] = "vault";
     const uint8_t *seeds[]     = { SEED_TAG,            agent_root };
     const size_t   seed_lens[] = { sizeof SEED_TAG - 1, 32         };
-    return find_pda(seeds, seed_lens, 2, out_vault);
+    return find_pda(seeds, seed_lens, 2, AGENT_PROGRAM_ID, out_vault);
+}
+
+int agent_pda_derive_ata(const uint8_t owner[32], const uint8_t mint[32],
+                         uint8_t out_ata[32])
+{
+    const uint8_t *seeds[]     = { owner, SPL_TOKEN_PROGRAM_ID, mint };
+    const size_t   seed_lens[] = { 32,    32,                   32   };
+    return find_pda(seeds, seed_lens, 3, SPL_ATA_PROGRAM_ID, out_ata);
 }
 
 // Anchor instruction discriminator: first 8 bytes of sha256("global:<name>").
