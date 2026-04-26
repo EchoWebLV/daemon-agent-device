@@ -20,6 +20,7 @@
 
 #include "devcfg.h"
 #include "price.h"
+#include "swap.h"
 #include "wallet.h"
 #include "x402.h"
 
@@ -219,6 +220,14 @@ static void build_system_prompt(char *out, size_t cap,
         snprintf(out + used, cap - used, "Current SOL price: $%.2f USD.\n", p);
     }
 
+    n = strlen(out);
+    snprintf(out + n, cap - n,
+        "Built-in capability: swap_tokens(from, to, amount, max_slippage_bps?). "
+        "Calls Jupiter on Solana for any pair among SOL, USDC, and the SPLs "
+        "the wallet already holds. Every call shows an approval screen the "
+        "user must hold for 3 seconds. Suggest swaps when useful; the user "
+        "stays in control.\n");
+
     append_tool_listing(out, cap, services, enabled);
 }
 
@@ -327,6 +336,47 @@ static int attach_tools(cJSON *root, const cJSON *services, const cJSON *enabled
             count++;
         }
     }
+
+    // Built-in synthetic tool: on-device swap. Always exposed regardless
+    // of which x402 services are enabled.
+    if (!tools) tools = cJSON_AddArrayToObject(root, "tools");
+    {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "type", "function");
+        cJSON *fn = cJSON_AddObjectToObject(t, "function");
+        cJSON_AddStringToObject(fn, "name", "swap_tokens");
+        cJSON_AddStringToObject(fn, "description",
+            "Propose an on-device Solana swap between SOL, USDC, or any SPL "
+            "token currently in the wallet. The user must physically hold "
+            "the device touchscreen for 3 seconds to authorize. You cannot "
+            "swap autonomously.");
+        cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+        cJSON_AddStringToObject(p, "type", "object");
+        cJSON *props = cJSON_AddObjectToObject(p, "properties");
+        cJSON *pf = cJSON_AddObjectToObject(props, "from");
+        cJSON_AddStringToObject(pf, "type", "string");
+        cJSON_AddStringToObject(pf, "description",
+            "Source token symbol — SOL, USDC, or a wallet SPL ticker.");
+        cJSON *pt = cJSON_AddObjectToObject(props, "to");
+        cJSON_AddStringToObject(pt, "type", "string");
+        cJSON_AddStringToObject(pt, "description",
+            "Destination token symbol — SOL, USDC, or a wallet SPL ticker.");
+        cJSON *pa = cJSON_AddObjectToObject(props, "amount");
+        cJSON_AddStringToObject(pa, "type", "number");
+        cJSON_AddStringToObject(pa, "description",
+            "Amount of `from` token in UI units (e.g. 0.5 = half a SOL).");
+        cJSON *ps = cJSON_AddObjectToObject(props, "max_slippage_bps");
+        cJSON_AddStringToObject(ps, "type", "integer");
+        cJSON_AddStringToObject(ps, "description",
+            "Optional max slippage in basis points (10..500). Omit for the default.");
+        cJSON *req = cJSON_AddArrayToObject(p, "required");
+        cJSON_AddItemToArray(req, cJSON_CreateString("from"));
+        cJSON_AddItemToArray(req, cJSON_CreateString("to"));
+        cJSON_AddItemToArray(req, cJSON_CreateString("amount"));
+        cJSON_AddItemToArray(tools, t);
+        count++;
+    }
+
     return count;
 }
 
@@ -420,6 +470,35 @@ static void param_to_string(const cJSON *v, char *out, size_t cap) {
 static void execute_tool(const cJSON *services, const cJSON *enabled,
                          const char *tool_name, const char *args_json,
                          char *out, size_t cap) {
+    // Synthetic built-ins first.
+    if (strcmp(tool_name, "swap_tokens") == 0) {
+        cJSON *args = args_json ? cJSON_Parse(args_json) : NULL;
+        const cJSON *jf = args ? cJSON_GetObjectItem(args, "from")   : NULL;
+        const cJSON *jt = args ? cJSON_GetObjectItem(args, "to")     : NULL;
+        const cJSON *ja = args ? cJSON_GetObjectItem(args, "amount") : NULL;
+        const cJSON *js = args ? cJSON_GetObjectItem(args, "max_slippage_bps") : NULL;
+        if (!cJSON_IsString(jf) || !cJSON_IsString(jt) || !cJSON_IsNumber(ja)) {
+            snprintf(out, cap, "{\"ok\":false,\"error\":\"bad_args\"}");
+            if (args) cJSON_Delete(args);
+            return;
+        }
+        uint16_t slip = cJSON_IsNumber(js) ? (uint16_t)js->valuedouble : 0;
+        swap_result_t r;
+        bool ok = swap_request(jf->valuestring, jt->valuestring,
+                                ja->valuedouble, slip, &r);
+        if (ok) {
+            snprintf(out, cap,
+                "{\"ok\":true,\"txid\":\"%s\",\"received\":%.6f,"
+                "\"from\":\"%s\",\"to\":\"%s\"}",
+                r.txid, r.amount_out, r.from_sym, r.to_sym);
+        } else {
+            snprintf(out, cap, "{\"ok\":false,\"error\":\"%s\"}", r.error_msg);
+        }
+        if (args) cJSON_Delete(args);
+        return;
+    }
+
+    // Existing x402 service dispatch.
     char url[512], method[12];
     if (!resolve_tool(services, enabled, tool_name,
                       url, sizeof(url), method, sizeof(method))) {
