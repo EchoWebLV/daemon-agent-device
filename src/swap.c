@@ -527,7 +527,11 @@ static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char 
         "\"preflightCommitment\":\"processed\"}]}",
         signed_tx_b64);
 
-    char rsp[512];
+    // 4 KB rsp: a successful reply is ~130 bytes, but a preflight failure
+    // returns the full simulator log under error.data.logs[] which routinely
+    // runs 1-3 KB. https_post_json rejects truncation as failure, so a
+    // small buffer would swallow the most useful debugging signal.
+    char rsp[4096];
     char url[160];
     wallet_rpc_url(url, sizeof(url));
     bool ok = https_post_json(url, req, rsp, sizeof(rsp));
@@ -535,10 +539,10 @@ static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char 
     if (!ok) return false;
 
     cJSON *root = cJSON_Parse(rsp);
-    if (!root) return false;
+    if (!root) { ESP_LOGW(TAG, "send: parse fail"); return false; }
     bool got = false;
     const cJSON *result = cJSON_GetObjectItem(root, "result");
-    if (cJSON_IsString(result)) {
+    if (cJSON_IsString(result) && result->valuestring && result->valuestring[0]) {
         strlcpy(txid_out, result->valuestring, cap);
         got = true;
     } else {
@@ -555,6 +559,7 @@ static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char 
 // Polls getSignatureStatuses every 800 ms up to 30 s. Returns true once
 // the tx has a non-null status; false on timeout.
 static bool __attribute__((unused)) rpc_wait_for_confirm(const char *txid) {
+    ESP_LOGI(TAG, "wait confirm %.16s...", txid ? txid : "(null)");
     char url[160];
     wallet_rpc_url(url, sizeof(url));
     for (int i = 0; i < 38; ++i) {
@@ -569,10 +574,12 @@ static bool __attribute__((unused)) rpc_wait_for_confirm(const char *txid) {
             if (root) {
                 const cJSON *result = cJSON_GetObjectItem(root, "result");
                 const cJSON *value  = result ? cJSON_GetObjectItem(result, "value") : NULL;
+                // Cluster has seen the tx as soon as value[0] is an object;
+                // err vs success is the caller's concern.
                 bool landed = false;
                 if (cJSON_IsArray(value) && cJSON_GetArraySize(value) > 0) {
                     const cJSON *st = cJSON_GetArrayItem(value, 0);
-                    if (cJSON_IsObject(st)) landed = true;        // any status = landed
+                    if (cJSON_IsObject(st)) landed = true;
                 }
                 cJSON_Delete(root);
                 if (landed) return true;
@@ -580,5 +587,6 @@ static bool __attribute__((unused)) rpc_wait_for_confirm(const char *txid) {
         }
         vTaskDelay(pdMS_TO_TICKS(800));
     }
+    ESP_LOGW(TAG, "wait confirm timeout %.16s...", txid ? txid : "(null)");
     return false;
 }
