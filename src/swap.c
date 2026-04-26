@@ -24,7 +24,9 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "freertos/semphr.h"
 
+#include "swap_screen.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -279,4 +281,23 @@ bool swap_request(const char *from_sym,
     strlcpy(out->error_msg, "not_implemented", sizeof(out->error_msg));
     ESP_LOGW(TAG, "swap_request stub — not implemented yet");
     return false;
+}
+
+const char *swap_show_demo_for_test(void) {
+    static const char *S[] = {
+        "confirm", "cancel_release", "cancel_swipe", "cancel_timeout"
+    };
+    swap_screen_args_t args = {
+        .from_sym = "USDC", .to_sym = "SOL",
+        .amount_in = 5.0, .amount_out = 0.0431, .min_out = 0.0429,
+        .slippage_bps = 50, .fee_sol = 0.00001,
+    };
+    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    if (!sem) return "no_sem";
+    swap_ui_result_t r = SWAP_UI_CANCEL_TIMEOUT;
+    swap_screen_open(&args, sem, &r);
+    xSemaphoreTake(sem, pdMS_TO_TICKS(35000));
+    vSemaphoreDelete(sem);
+    if (r >= 0 && r < (int)(sizeof(S)/sizeof(S[0]))) return S[r];
+    return "unknown";
 }

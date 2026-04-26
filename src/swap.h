@@ -56,6 +56,10 @@ bool swap_request(const char *from_sym,
 // resolves; on success writes "<mint>:<decimals>" into `out`.
 bool swap_resolve_for_test(const char *sym, char *out, size_t cap);
 
+// Diagnostic — opens the approval modal with hard-coded numbers and
+// reports the resolution. Used by the host harness only.
+const char *swap_show_demo_for_test(void);
+
 #ifdef __cplusplus
 }
 #endif

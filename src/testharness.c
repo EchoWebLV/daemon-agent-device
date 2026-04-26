@@ -457,6 +457,12 @@ static void dispatch_line(const char *line) {
         return;
     }
 
+    // SWAP_DEMO  →  TEST OK confirm | cancel_release | cancel_swipe | cancel_timeout
+    if ((rest = match_token(after_test, "SWAP_DEMO"))) {
+        resp_ok(swap_show_demo_for_test());
+        return;
+    }
+
     // Echo enough of the bad line to be useful but cap it so a giant paste
     // can't blow the output buffer.
     char msg[64];
