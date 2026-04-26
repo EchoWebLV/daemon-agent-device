@@ -44,6 +44,7 @@
 #include "agent_pda.h"
 #include "ai.h"
 #include "base58.h"
+#include "refill.h"
 #include "solana_tx.h"
 #include "swap.h"
 #include "ui.h"
@@ -469,6 +470,21 @@ static void handle_vault_transfer(const char *args) {
     resp_ok(buf);
 }
 
+// Force a refill from vault → device USDC ATA. Argv: micro-USDC amount.
+// Returns the resulting tx signature on success.
+static void handle_vault_refill(const char *args) {
+    uint64_t amount = strtoull(args, NULL, 10);
+    if (amount == 0) { resp_err("refill bad_amount"); return; }
+    char txid[96];
+    if (!refill_run_amount(amount, txid, sizeof txid)) {
+        resp_err("refill failed");
+        return;
+    }
+    char buf[128];
+    snprintf(buf, sizeof buf, "txid %s", txid);
+    resp_ok(buf);
+}
+
 // Encodes an empty vault_execute payload to expose the Anchor discriminator
 // in hex. Must match sha256("global:vault_execute")[0..8] = b2c50da89714ae28.
 static void handle_vault_disc(void) {
@@ -626,12 +642,13 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- VAULT PDA / VAULT DISC / VAULT TRANSFER <amount> --- (Phase 2a-x402)
+    // --- VAULT PDA / DISC / TRANSFER <amount> / REFILL <amount> --- (Phase 2a)
     if ((rest = match_token(after_test, "VAULT"))) {
         const char *args;
         if (match_token(rest, "PDA"))  { handle_vault_pda();  return; }
         if (match_token(rest, "DISC")) { handle_vault_disc(); return; }
         if ((args = match_token(rest, "TRANSFER"))) { handle_vault_transfer(args); return; }
+        if ((args = match_token(rest, "REFILL")))   { handle_vault_refill(args);   return; }
         resp_err("vault bad_subverb");
         return;
     }

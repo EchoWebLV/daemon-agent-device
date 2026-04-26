@@ -30,6 +30,7 @@
 #include "agent_pda.h"
 #include "base58.h"
 #include "ed25519.h"
+#include "refill.h"
 #include "secrets.h"
 #include "wifi_sta.h"
 
@@ -520,6 +521,13 @@ void wallet_refresh(void) {
 
     ESP_LOGI(TAG, "refresh done — %.4f SOL, %u tokens",
              s_sol_balance, (unsigned)s_tokens_n);
+
+    // After balances settle, top up the device's USDC float from the vault
+    // if it's run low. Refill is a separate tx (vault_execute → SPL
+    // TransferChecked); it can take a few hundred ms but doesn't block the
+    // foreground because the wallet refresh runs on its own task.
+    char refill_txid[96];
+    refill_check_and_maybe_run(refill_txid, sizeof refill_txid);
 }
 
 // ---------------------------------------------------------------------------

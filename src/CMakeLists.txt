@@ -18,6 +18,7 @@ idf_component_register(
         "info_screen.c"
         "menu_screen.c"
         "price.c"
+        "refill.c"
         "server.c"
         "settings_screen.c"
         "solana_tx.c"
