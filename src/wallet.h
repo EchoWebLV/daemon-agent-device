@@ -34,6 +34,12 @@ const char *wallet_pubkey(void);
 // 32-byte pubkey, or NULL if the wallet wasn't initialised.
 const uint8_t *wallet_pubkey_bytes(void);
 
+// Recovery-authority pubkey decoded from secrets.h's OWNER_PUBKEY. NULL if
+// OWNER_PUBKEY is unset, malformed, or still the placeholder. The on-chain
+// agent_root PDA is derived from this pubkey, not from the device key.
+const uint8_t *wallet_owner_pubkey_bytes(void);
+const char    *wallet_owner_pubkey(void);
+
 // True when a 64-byte seed is loaded and the derived pubkey matches.
 bool wallet_can_sign(void);
 

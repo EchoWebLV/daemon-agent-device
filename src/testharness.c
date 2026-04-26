@@ -37,7 +37,9 @@
 // Subsystem APIs the verbs drive. Keep this list tight — the harness is
 // the only caller that needs to see all of these together, so we intentionally
 // fan-in the dependencies here rather than in a public header.
+#include "agent_pda.h"
 #include "ai.h"
+#include "base58.h"
 #include "swap.h"
 #include "ui.h"
 #include "wallet.h"
@@ -296,6 +298,28 @@ static void handle_wallet_pubkey(void) {
     resp_ok(buf);
 }
 
+// Derives agent_root + vault PDAs from the OWNER pubkey (recovery_authority,
+// configured in secrets.h as OWNER_PUBKEY) and prints both in base58.
+// Cross-check against `setup-test-vault.ts` output for the same owner —
+// they must match exactly.
+static void handle_vault_pda(void) {
+    const uint8_t *owner = wallet_owner_pubkey_bytes();
+    if (!owner) { resp_err("vault no_owner_pubkey"); return; }
+
+    uint8_t root[32], vault[32];
+    int rb = agent_pda_derive_root(owner, root);
+    if (rb < 0) { resp_err("vault root_derive_failed"); return; }
+    int vb = agent_pda_derive_vault(root, vault);
+    if (vb < 0) { resp_err("vault vault_derive_failed"); return; }
+
+    char rs[64], vs[64], buf[200];
+    base58_encode(root,  32, rs, sizeof rs);
+    base58_encode(vault, 32, vs, sizeof vs);
+    snprintf(buf, sizeof buf, "agent_root %s vault %s root_bump %d vault_bump %d",
+             rs, vs, rb, vb);
+    resp_ok(buf);
+}
+
 static void handle_wallet_balance(void) {
     // Force a fresh two-call RPC round-trip so the host isn't reading a
     // minute-old cache. wallet_refresh() blocks; that's fine — the harness
@@ -428,6 +452,13 @@ static void dispatch_line(const char *line) {
         if (match_token(rest, "PUBKEY"))  { handle_wallet_pubkey();  return; }
         if (match_token(rest, "BALANCE")) { handle_wallet_balance(); return; }
         resp_err("wallet bad_subverb");
+        return;
+    }
+
+    // --- VAULT PDA --- (Phase 2a-x402)
+    if ((rest = match_token(after_test, "VAULT"))) {
+        if (match_token(rest, "PDA")) { handle_vault_pda(); return; }
+        resp_err("vault bad_subverb");
         return;
     }
 

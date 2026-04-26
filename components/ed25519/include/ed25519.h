@@ -30,6 +30,11 @@ int ED25519_DECLSPEC ed25519_verify(const unsigned char *signature, const unsign
 void ED25519_DECLSPEC ed25519_add_scalar(unsigned char *public_key, unsigned char *private_key, const unsigned char *scalar);
 void ED25519_DECLSPEC ed25519_key_exchange(unsigned char *shared_secret, const unsigned char *public_key, const unsigned char *private_key);
 
+// 1 if the 32-byte pubkey decodes to a valid Edwards point (i.e. could be a
+// real keypair). 0 if it's off-curve — the criterion Solana uses to accept a
+// PDA candidate.
+int ED25519_DECLSPEC ed25519_pk_is_on_curve(const unsigned char pk[32]);
+
 
 #ifdef __cplusplus
 }

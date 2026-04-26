@@ -9,7 +9,11 @@
 // ---------------------------------------------------------------------------
 #include "agent_pda.h"
 
+#include <string.h>
+
+#include "ed25519.h"
 #include "esp_log.h"
+#include "mbedtls/sha256.h"
 
 static const char *TAG = "agent_pda";
 
@@ -33,17 +37,51 @@ const uint8_t SPL_TOKEN_PROGRAM_ID[32] = {
     0x3a, 0x8c, 0xf5, 0x85, 0x7e, 0xff, 0x00, 0xa9,
 };
 
-// Implemented in Task 3 (next commit).
-int agent_pda_derive_root(const uint8_t owner[32], uint8_t out_root[32]) {
-    (void)owner; (void)out_root;
-    ESP_LOGE(TAG, "agent_pda_derive_root: NOT IMPLEMENTED (Task 3)");
+// One PDA candidate: sha256(seeds || bump || program_id || marker), then
+// reject if it lands on the Ed25519 curve (would collide with a real keypair).
+// Returns 1 if `out` is a valid (off-curve) PDA, 0 otherwise.
+static int try_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds,
+                   uint8_t bump, uint8_t out[32])
+{
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    for (size_t i = 0; i < nseeds; i++) {
+        mbedtls_sha256_update(&c, seeds[i], seed_lens[i]);
+    }
+    mbedtls_sha256_update(&c, &bump, 1);
+    mbedtls_sha256_update(&c, AGENT_PROGRAM_ID, 32);
+    mbedtls_sha256_update(&c, (const uint8_t *)PDA_MARKER, sizeof(PDA_MARKER) - 1);
+    mbedtls_sha256_finish(&c, out);
+    mbedtls_sha256_free(&c);
+    return ed25519_pk_is_on_curve(out) ? 0 : 1;
+}
+
+// Grind down from 255 to 0 to find the canonical bump (matching Anchor's
+// `find_program_address`). Returns the bump on success, -1 on failure.
+static int find_pda(const uint8_t **seeds, const size_t *seed_lens, size_t nseeds,
+                    uint8_t out[32])
+{
+    for (int bump = 255; bump >= 0; bump--) {
+        if (try_pda(seeds, seed_lens, nseeds, (uint8_t)bump, out)) {
+            return bump;
+        }
+    }
     return -1;
 }
 
+int agent_pda_derive_root(const uint8_t owner[32], uint8_t out_root[32]) {
+    static const uint8_t SEED_TAG[] = "agent";
+    const uint8_t *seeds[]     = { SEED_TAG,            owner };
+    const size_t   seed_lens[] = { sizeof SEED_TAG - 1, 32    };
+    return find_pda(seeds, seed_lens, 2, out_root);
+}
+
 int agent_pda_derive_vault(const uint8_t agent_root[32], uint8_t out_vault[32]) {
-    (void)agent_root; (void)out_vault;
-    ESP_LOGE(TAG, "agent_pda_derive_vault: NOT IMPLEMENTED (Task 3)");
-    return -1;
+    static const uint8_t SEED_TAG[] = "vault";
+    const uint8_t *seeds[]     = { SEED_TAG,            agent_root };
+    const size_t   seed_lens[] = { sizeof SEED_TAG - 1, 32         };
+    return find_pda(seeds, seed_lens, 2, out_vault);
 }
 
 int agent_pda_build_vault_execute_ix(
@@ -69,5 +107,3 @@ int agent_pda_build_vault_execute_ix(
     return -1;
 }
 
-// Suppress unused-static warnings until Task 3 wires this in.
-__attribute__((unused)) static const char *_pda_marker(void) { return PDA_MARKER; }

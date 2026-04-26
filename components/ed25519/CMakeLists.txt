@@ -10,6 +10,7 @@ idf_component_register(
         "src/fe.c"
         "src/ge.c"
         "src/keypair.c"
+        "src/pk_on_curve.c"
         "src/sc.c"
         "src/sha512.c"
         "src/sign.c"

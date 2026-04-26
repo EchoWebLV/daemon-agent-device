@@ -76,6 +76,13 @@ static size_t  s_secret_len            = 0;       // 32 or 64
 static uint8_t s_pubkey_bytes[32]      = {0};
 static char    s_pubkey[45]            = {0};     // base58, NUL-terminated
 
+// Recovery-authority pubkey, decoded from secrets.h's OWNER_PUBKEY at
+// wallet_begin() time. Used to derive the on-chain agent_root PDA. The
+// device never needs the matching seed — only the pubkey.
+static bool    s_owner_ok              = false;
+static uint8_t s_owner_pubkey_bytes[32] = {0};
+static char    s_owner_pubkey[45]      = {0};
+
 // orlp/ed25519 signs with an "expanded" 64-byte private key that is *not*
 // Solana's `[seed || pub]` layout — it's `[a || prefix]` where both halves
 // come from SHA-512(seed). We derive it at wallet_begin() time so every
@@ -169,6 +176,28 @@ bool wallet_begin(void) {
         }
     }
 
+    // Decode OWNER_PUBKEY (recovery_authority) from secrets.h. This is
+    // separate from the device key — it's the user's CLI / Phantom pubkey
+    // that owns the on-chain agent_root PDA. Optional: if missing or still
+    // the placeholder, the wallet still works for read-only ops; only
+    // vault_execute paths need it.
+    s_owner_ok = false;
+    const char *owner_raw = OWNER_PUBKEY;
+    if (owner_raw && owner_raw[0] && strncmp(owner_raw, "REPLACE_ME", 10) != 0) {
+        uint8_t obuf[32];
+        int on = base58_decode(owner_raw, obuf, sizeof obuf);
+        if (on == 32) {
+            memcpy(s_owner_pubkey_bytes, obuf, 32);
+            snprintf(s_owner_pubkey, sizeof s_owner_pubkey, "%s", owner_raw);
+            s_owner_ok = true;
+            ESP_LOGI(TAG, "owner_pubkey %s", s_owner_pubkey);
+        } else {
+            ESP_LOGW(TAG, "OWNER_PUBKEY decode failed (%d bytes, want 32)", on);
+        }
+    } else {
+        ESP_LOGI(TAG, "OWNER_PUBKEY not configured — vault paths disabled");
+    }
+
     wallet_rpc_url(s_rpc_url, sizeof(s_rpc_url));
     s_ok = true;
     ESP_LOGI(TAG, "address %s (key %d bytes, can_sign=%d)",
@@ -188,6 +217,9 @@ bool wallet_sign(const uint8_t *data, size_t len, uint8_t sig_out[64]) {
 
 const char *wallet_pubkey(void)                 { return s_ok ? s_pubkey : ""; }
 const uint8_t *wallet_pubkey_bytes(void)        { return s_ok ? s_pubkey_bytes : NULL; }
+
+const uint8_t *wallet_owner_pubkey_bytes(void)  { return s_owner_ok ? s_owner_pubkey_bytes : NULL; }
+const char    *wallet_owner_pubkey(void)        { return s_owner_ok ? s_owner_pubkey : ""; }
 
 double wallet_sol_balance(void)                 { return s_sol_balance; }
 
