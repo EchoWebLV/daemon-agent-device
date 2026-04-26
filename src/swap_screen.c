@@ -21,8 +21,10 @@
 //
 //  Hold detection: an LVGL timer at 50 Hz reads the touch indev. The
 //  fill-arc reaches 100% after 3000 ms of continuous contact; release
-//  before then = CANCEL_RELEASE. Any swipe gesture the LVGL indev
-//  reports = CANCEL_SWIPE. 30 s with no touch at all = CANCEL_TIMEOUT.
+//  before then = CANCEL_RELEASE. 30 s with no touch at all =
+//  CANCEL_TIMEOUT. Swipe-gesture cancellation was removed because the
+//  CTP panel reports capacitive jitter as a gesture during a static
+//  hold, dismissing the modal before the arc can fill.
 // ---------------------------------------------------------------------------
 #include "swap_screen.h"
 #include "screens_common.h"
@@ -87,11 +89,6 @@ static void close_modal(swap_ui_result_t result) {
     if (s_ctx.out_result) *s_ctx.out_result = result;
     if (s_ctx.done_sem)   xSemaphoreGive(s_ctx.done_sem);
     s_ctx.done_sem = NULL;
-}
-
-static void on_swipe(lv_event_t *e) {
-    (void)e;
-    close_modal(SWAP_UI_CANCEL_SWIPE);
 }
 
 static void poll_tick(lv_timer_t *t) {
@@ -201,8 +198,6 @@ static void build_ui(void) {
     lv_label_set_text(hint, "hold to confirm");
     lv_obj_set_style_text_color(hint, SCR_COLOR_DIM, LV_PART_MAIN);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
-
-    lv_obj_add_event_cb(s_ctx.scr, on_swipe, LV_EVENT_GESTURE, NULL);
 }
 
 static void open_on_lvgl(void *arg) {
