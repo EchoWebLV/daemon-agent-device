@@ -271,6 +271,16 @@ Audit (external, on the Anchor program) is a separate ~2-week wall-clock item th
 - **Body-swap drill**: scripted "lose your device" simulation — kill power on device A, rotate from Phantom, boot device B with the new keypair, confirm A's next tx fails and B operates normally.
 - **Wipe-on-fail**: 5 wrong PINs in succession on real hardware → confirm `nvs_secure` is erased and the device prompts for fresh provisioning.
 
+## Performance impact
+
+- **Chat reply latency:** unchanged. Vault wrapper adds ~5–8k CU (validator-side); device-side wrap is microseconds. Memory PDA writes happen async after the reply lands.
+- **Swap latency:** unchanged. Wrapping Jupiter instructions adds ~1–2 ms of ESP32 CPU. Submit + confirm timing identical.
+- **Cold boot:** +2–4 s. Argon2id PIN unlock is intentionally slow (~1–3 s) for brute-force resistance; PDA state fetch (`getMultipleAccounts` for identity + memory + vault) adds ~200–400 ms. Idle re-lock (default 30 min) keeps the device warm during normal use.
+- **Body resume on fresh hardware:** identity + recent-turns ready in <1 s; full archive walk from Shadow Drive is lazy / background.
+- **Recovery from theft:** *faster* — Phantom + recovery dApp completes in seconds vs. minutes for seed-import.
+
+Implementation discipline: boot fetches must be parallelized (`getMultipleAccounts`, not sequential), the existing ATA cache in `x402.c` extends to the vault's source ATA, and memory writes batch every N turns or 30 s idle to keep tx volume low.
+
 ## Risks and open decisions
 
 - **Tx size with Jupiter wrappers.** Solana's 1232-byte limit already pinches deep Jupiter routes; the vault wrapper adds ~50 bytes. Mitigation: probe at phase 2 and, if real routes break, route through Jupiter's "compact" mode or fall back to single-pool routes. Worst case: detect oversize, decline the swap with a clear error.
