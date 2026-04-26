@@ -709,6 +709,7 @@ static bool rpc_wait_for_confirm(const char *txid) {
 bool swap_dry_run_for_test(const char *from_sym, const char *to_sym,
                            double amount_ui, uint16_t slippage_bps,
                            char *out_json, size_t cap) {
+    if (!out_json || cap == 0) return false;
     swap_token_t a, b;
     if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
         snprintf(out_json, cap, "{\"error\":\"unknown_symbol\"}"); return false;
