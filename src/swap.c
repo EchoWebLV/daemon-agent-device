@@ -265,6 +265,13 @@ typedef struct {
 static bool __attribute__((unused)) jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
                            jup_swap_t *out) {
     memset(out, 0, sizeof(*out));
+    // Bound the user_pubkey before splicing into the JSON body. A real
+    // base58 Solana pubkey is 32-44 ASCII chars and never contains "
+    // or \, but the function takes a const char * with no documented
+    // contract — refuse anything outside that range.
+    if (!q || !user_pubkey) return false;
+    size_t pk_len = strlen(user_pubkey);
+    if (pk_len < 32 || pk_len > 44) return false;
 
     // body = { quoteResponse: <verbatim quote JSON>, userPublicKey, ... }
     // We hand-build the body so we don't pay an extra parse+serialize round
@@ -298,6 +305,9 @@ static bool __attribute__((unused)) jup_build_swap(const jup_quote_t *q, const c
     }
     out->tx_b64 = strdup(tx->valuestring);
     const cJSON *pri = cJSON_GetObjectItem(root, "prioritizationFeeLamports");
+    // Mirror the floor we requested in the body. A response without the
+    // field (or with a non-number) means the server didn't inflate, so 1
+    // lamport is what will actually settle.
     out->priority_lamports = cJSON_IsNumber(pri) ? (uint64_t)pri->valuedouble : 1;
     cJSON_Delete(root);
     free(rsp);
