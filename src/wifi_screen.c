@@ -176,7 +176,7 @@ static void scan_clicked(lv_event_t *e) {
     if (s_scan_in_flight) return;
     s_scan_in_flight = true;
     lv_label_set_text(s_status_label, "scanning...");
-    xTaskCreate(scan_task, "wifi_scan", 5120, NULL, 5, NULL);
+    xTaskCreate(scan_task, "wifi_scan", 8192, NULL, 5, NULL);
 }
 
 // Passed as user_data on the row's CLICKED event. Points into s_aps, which
@@ -419,7 +419,7 @@ void wifi_screen_kick_scan(void) {
         lv_label_set_text(s_status_label, "scanning...");
         lvgl_port_unlock();
     }
-    xTaskCreate(scan_task, "wifi_scan", 5120, NULL, 5, NULL);
+    xTaskCreate(scan_task, "wifi_scan", 8192, NULL, 5, NULL);
 }
 
 void wifi_screen_on_connected(wifi_screen_connected_cb_t cb) {

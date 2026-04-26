@@ -70,6 +70,19 @@ static lv_obj_t *s_mouth_grid[MOUTH_ROWS][MOUTH_COLS] = {0};
 static lv_obj_t *s_smile[14]    = {0};   // 14-pixel smile shown while idle
 static lv_obj_t *s_subtitle     = NULL;
 
+// Subtitle pagination — long replies get split into ≤2-line pages and
+// rotated through on a timer so the viewer can read along instead of
+// being hit with the whole wall of text. Budget of 52 chars fits two
+// wrapped lines of the default Montserrat 14 font at a 216 px label width;
+// 3200 ms dwell lands roughly in step with ElevenLabs' speaking cadence.
+#define SUB_PAGE_CHARS      52
+#define SUB_MAX_PAGES       12
+#define SUB_PAGE_MS         3200
+static char        s_sub_pages[SUB_MAX_PAGES][SUB_PAGE_CHARS + 1];
+static int         s_sub_page_count = 0;
+static int         s_sub_page_idx   = 0;
+static lv_timer_t *s_sub_timer      = NULL;
+
 // Pixel coordinates for static face features.
 static const int16_t k_smile[14][2] = {
     // row 0 — outermost rising tips
@@ -379,10 +392,89 @@ void creature_screen_set_usdc(const char *s) {
     lvgl_port_unlock();
 }
 
+// Break `text` into ≤ SUB_MAX_PAGES chunks of ≤ SUB_PAGE_CHARS. Breaks on
+// the last space inside each window; falls back to a hard cut when a single
+// word exceeds the page budget. Trailing spaces are stripped so the visible
+// line doesn't end in weird whitespace.
+static void sub_split_pages(const char *text) {
+    s_sub_page_count = 0;
+    if (!text) return;
+    size_t len = strlen(text);
+    size_t i = 0;
+    while (i < len && s_sub_page_count < SUB_MAX_PAGES) {
+        while (i < len && text[i] == ' ') i++;
+        if (i >= len) break;
+        size_t remaining = len - i;
+        size_t take;
+        if (remaining <= SUB_PAGE_CHARS) {
+            take = remaining;
+        } else {
+            size_t k = i + SUB_PAGE_CHARS;
+            while (k > i && text[k] != ' ') k--;
+            take = (k == i) ? SUB_PAGE_CHARS : (k - i);
+        }
+        size_t copy = take;
+        while (copy > 0 && text[i + copy - 1] == ' ') copy--;
+        if (copy > SUB_PAGE_CHARS) copy = SUB_PAGE_CHARS;
+        memcpy(s_sub_pages[s_sub_page_count], text + i, copy);
+        s_sub_pages[s_sub_page_count][copy] = '\0';
+        s_sub_page_count++;
+        i += take;
+    }
+}
+
+static void sub_show_page(int idx) {
+    if (!s_subtitle || idx < 0 || idx >= s_sub_page_count) return;
+    lv_label_set_text(s_subtitle, s_sub_pages[idx]);
+}
+
+// Advance to the next page; freeze on the last one so the tail of the
+// message stays on screen until the next subtitle arrives.
+static void sub_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (s_sub_page_count == 0) return;
+    if (s_sub_page_idx + 1 >= s_sub_page_count) {
+        if (s_sub_timer) lv_timer_pause(s_sub_timer);
+        return;
+    }
+    s_sub_page_idx++;
+    sub_show_page(s_sub_page_idx);
+}
+
 void creature_screen_set_subtitle(const char *text) {
     if (!s_subtitle) return;
     if (!lvgl_port_lock(0)) return;
-    lv_label_set_text(s_subtitle, text ? text : "");
+
+    if (s_sub_timer) lv_timer_pause(s_sub_timer);
+    s_sub_page_count = 0;
+    s_sub_page_idx   = 0;
+
+    if (!text || !text[0]) {
+        lv_label_set_text(s_subtitle, "");
+        lvgl_port_unlock();
+        return;
+    }
+
+    sub_split_pages(text);
+    if (s_sub_page_count == 0) {
+        // Degenerate split (shouldn't hit, but fall back to raw text).
+        lv_label_set_text(s_subtitle, text);
+        lvgl_port_unlock();
+        return;
+    }
+
+    sub_show_page(0);
+
+    if (s_sub_page_count > 1) {
+        if (!s_sub_timer) {
+            s_sub_timer = lv_timer_create(sub_timer_cb, SUB_PAGE_MS, NULL);
+        } else {
+            lv_timer_set_period(s_sub_timer, SUB_PAGE_MS);
+            lv_timer_resume(s_sub_timer);
+        }
+        lv_timer_reset(s_sub_timer);
+    }
+
     lvgl_port_unlock();
 }
 

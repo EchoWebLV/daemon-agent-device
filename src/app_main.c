@@ -48,6 +48,35 @@ static void say_with_ui(const char *user, char *reply_out, size_t reply_cap) {
     }
 }
 
+// Fired by the wallet task whenever a positive balance delta crosses the
+// threshold (> 0.01 SOL, > 0.1 USDC, > 0.1 for other SPL tokens). Runs a
+// one-shot AI prompt so Daemon reacts in character, then delivers the line
+// through the usual ui_deliver_reply path (subtitle + TALK mouth + TTS).
+// Skipped when offline — ai_ask_one_shot and voice_speak both need Wi-Fi.
+// Uses a canned fallback line if the AI call fails so the user still gets
+// audible confirmation that a transfer landed.
+static void on_wallet_incoming(const char *symbol, double amount) {
+    if (!wifi_sta_is_connected()) return;
+
+    char prompt[256];
+    snprintf(prompt, sizeof(prompt),
+             "Your Solana wallet just received %.4f %s. "
+             "React in one short sentence, in character. "
+             "No emoji. No markdown.",
+             amount, symbol ? symbol : "tokens");
+
+    char reply[256] = {0};
+    if (ai_ask_one_shot(prompt, reply, sizeof(reply)) && reply[0]) {
+        ui_deliver_reply(reply);
+    } else {
+        char line[96];
+        snprintf(line, sizeof(line),
+                 "Incoming — %.4f %s just landed.", amount,
+                 symbol ? symbol : "tokens");
+        ui_deliver_reply(line);
+    }
+}
+
 // Fired by the IMU task when it detects a shake. Plays one of three
 // complaint lines through the normal ui_deliver_reply path (subtitle +
 // TALK mouth + voice_speak) and jitters the creature screen for feedback.
@@ -173,6 +202,12 @@ void app_main(void) {
     // wallet just decodes the static key, and price_begin() is a no-op.
     // Refreshes only attempt network traffic when wifi_sta_is_connected().
     wallet_begin();
+    // React when incoming SOL / USDC / SPL crosses the announcement threshold.
+    // Must be installed before the first refresh so the baseline snapshot
+    // happens with the callback already set (the cb itself is skipped on the
+    // first refresh; installing late would still work but this keeps ordering
+    // obvious).
+    wallet_set_incoming_cb(on_wallet_incoming);
     price_begin();
     if (wifi_err == ESP_OK) {
         wallet_request_refresh();

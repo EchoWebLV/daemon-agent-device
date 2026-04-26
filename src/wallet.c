@@ -89,6 +89,23 @@ static size_t           s_tokens_n     = 0;
 static char             s_usdc_ata[WALLET_MINT_MAX] = {0};
 static int64_t          s_last_refresh_us = 0;    // esp_timer_get_time()
 
+// Previous snapshot — used at the tail of wallet_refresh() to detect
+// positive balance deltas and fire s_incoming_cb. s_prev_seeded stays false
+// until the very first refresh completes so the starting balance never
+// announces itself as "received".
+static double               s_prev_sol      = 0.0;
+static token_holding_t      s_prev_tokens[WALLET_MAX_TOKENS];
+static size_t               s_prev_tokens_n = 0;
+static bool                 s_prev_seeded   = false;
+static wallet_incoming_cb_t s_incoming_cb   = NULL;
+
+// Minimum positive delta to announce. Tuned so refresh-to-refresh rounding
+// or tiny reward dust doesn't trigger the AI/TTS path (each announcement
+// costs a chat round-trip and therefore a USDC micropayment).
+static const double INCOMING_SOL_MIN  = 0.01;
+static const double INCOMING_USDC_MIN = 0.10;
+static const double INCOMING_SPL_MIN  = 0.10;
+
 // Endpoint buffer sized for https + helius domain + ?api-key=...
 static char             s_rpc_url[160] = {0};
 
@@ -375,6 +392,43 @@ static void refresh_tokens(char *buf) {
     memcpy(s_usdc_ata, found_usdc_ata, sizeof(s_usdc_ata));
 }
 
+void wallet_set_incoming_cb(wallet_incoming_cb_t cb) { s_incoming_cb = cb; }
+
+// Compare the freshly-refreshed balances against the previous snapshot and
+// fire s_incoming_cb for each positive delta above the configured minimum.
+// Tokens are matched by mint — a token newly appearing in the list counts
+// as prev=0, so a fresh SPL arrival is announced as a full-balance delta.
+static void detect_incoming(void) {
+    if (!s_prev_seeded || !s_incoming_cb) return;
+
+    double dsol = s_sol_balance - s_prev_sol;
+    if (dsol > INCOMING_SOL_MIN) s_incoming_cb("SOL", dsol);
+
+    for (size_t i = 0; i < s_tokens_n; ++i) {
+        double prev = 0.0;
+        for (size_t j = 0; j < s_prev_tokens_n; ++j) {
+            if (strcmp(s_tokens[i].mint, s_prev_tokens[j].mint) == 0) {
+                prev = s_prev_tokens[j].amount;
+                break;
+            }
+        }
+        double d = s_tokens[i].amount - prev;
+        bool is_usdc = strcmp(s_tokens[i].mint, USDC_MINT) == 0;
+        double thr   = is_usdc ? INCOMING_USDC_MIN : INCOMING_SPL_MIN;
+        if (d > thr) {
+            const char *sym = s_tokens[i].symbol[0] ? s_tokens[i].symbol : "tokens";
+            s_incoming_cb(sym, d);
+        }
+    }
+}
+
+static void snapshot_balances(void) {
+    s_prev_sol = s_sol_balance;
+    memcpy(s_prev_tokens, s_tokens, sizeof(s_prev_tokens));
+    s_prev_tokens_n = s_tokens_n;
+    s_prev_seeded   = true;
+}
+
 void wallet_refresh(void) {
     if (!s_ok) return;
     char *buf = alloc_rpc_buf();
@@ -383,6 +437,10 @@ void wallet_refresh(void) {
     refresh_tokens(buf);
     free(buf);
     s_last_refresh_us = esp_timer_get_time();
+
+    detect_incoming();
+    snapshot_balances();
+
     ESP_LOGI(TAG, "refresh done — %.4f SOL, %u tokens",
              s_sol_balance, (unsigned)s_tokens_n);
 }

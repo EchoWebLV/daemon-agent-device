@@ -25,9 +25,42 @@
 
 static const char *TAG = "ai";
 
-// OpenAI-compatible endpoint behind sol.blockrun.ai's x402 paywall.
-// Same URL the Chrome extension's "paid LLM" path uses.
-static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completions";
+// OpenAI-compatible endpoints behind x402 paywalls. Dispatch is by model-id
+// prefix; the last entry (NULL prefix) is the fallback. Adding a provider
+// here is a one-liner as long as it speaks OpenAI chat-completions.
+typedef struct {
+    const char *prefix;   // model-id prefix to match ("shannon/"), NULL = default
+    const char *url;
+} llm_endpoint_t;
+
+static const llm_endpoint_t LLM_ENDPOINTS[] = {
+    { "shannon/", "https://daemon-x402s-seven.vercel.app/api/call" },
+    { NULL,       "https://sol.blockrun.ai/api/v1/chat/completions" },
+};
+
+static const char *resolve_llm_url(const char *model) {
+    if (model && model[0]) {
+        for (size_t i = 0; i < sizeof(LLM_ENDPOINTS) / sizeof(LLM_ENDPOINTS[0]); ++i) {
+            const char *p = LLM_ENDPOINTS[i].prefix;
+            if (p && strncmp(model, p, strlen(p)) == 0) return LLM_ENDPOINTS[i].url;
+        }
+    }
+    return LLM_ENDPOINTS[sizeof(LLM_ENDPOINTS) / sizeof(LLM_ENDPOINTS[0]) - 1].url;
+}
+
+// Shannon's wrapper forwards `model` verbatim to the Shannon API, which wants
+// the bare id ("shannon-1.6-lite") — not our catalog-qualified "shannon/…"
+// form. Peel the provider segment off before putting it on the wire. Other
+// endpoints (blockrun, OpenRouter-style) keep the provider/model form.
+static const char *wire_model(const char *model) {
+    if (!model) return "";
+    if (strncmp(model, "shannon/", 8) == 0) return model + 8;
+    return model;
+}
+
+static bool is_shannon(const char *model) {
+    return model && strncmp(model, "shannon/", 8) == 0;
+}
 
 // ---------------------------------------------------------------------------
 // Built-in personality. Copied verbatim from the Arduino build — tuning
@@ -36,9 +69,12 @@ static const char *LLM_ENDPOINT = "https://sol.blockrun.ai/api/v1/chat/completio
 // ---------------------------------------------------------------------------
 static const char *PERSONA =
     "You are a Daemon, a smart build-a-bear AI. "
-    "Write responses that are short and concise. No emojis. "
-    "When using tools, avoid markdown and present the output in a clear, "
-    "natural, conversational way. Occasionally add light sarcasm.";
+    "HARD LENGTH RULE: reply in 1 to 2 short sentences. Never more than 40 words. "
+    "Do not pad with greetings, restatements, or summaries. "
+    "Never use markdown in any response — no asterisks for bold or italics, "
+    "no dashes or numbers as bullets, no hash headings, no backticks, no code "
+    "fences, no tables. Write like you are speaking out loud. No emojis. "
+    "Occasionally add light sarcasm.";
 
 // ---------------------------------------------------------------------------
 // Rolling history. Fixed-size arena; oldest turn is dropped when full.
@@ -157,12 +193,21 @@ static void append_tool_listing(char *out, size_t cap,
 static void build_system_prompt(char *out, size_t cap,
                                 const cJSON *services, const cJSON *enabled) {
     if (!out || cap == 0) return;
+    // The built-in PERSONA carries the non-negotiable rules (length cap,
+    // markdown ban). The user-set personality is layered on top so flavour
+    // ("you are a pirate") composes with the rules instead of replacing
+    // them.
     const char *custom = devcfg_personality();
-    const char *base   = (custom && custom[0]) ? custom : PERSONA;
-
-    int n = snprintf(out, cap,
-        "%s\n\n---\nLIVE WALLET STATE (refresh this each answer):\n",
-        base);
+    int n;
+    if (custom && custom[0]) {
+        n = snprintf(out, cap,
+            "%s\n\n%s\n\n---\nLIVE WALLET STATE (refresh this each answer):\n",
+            PERSONA, custom);
+    } else {
+        n = snprintf(out, cap,
+            "%s\n\n---\nLIVE WALLET STATE (refresh this each answer):\n",
+            PERSONA);
+    }
     if (n < 0 || n >= (int)cap) { out[cap - 1] = '\0'; return; }
 
     size_t used = (size_t)n;
@@ -467,7 +512,42 @@ static int build_chat_body(char *out, size_t cap,
     if (!is_supported_model(model)) {
         model = "anthropic/claude-haiku-4.5";
     }
-    cJSON_AddStringToObject(root, "model", model);
+
+    // Shannon's wrapper expects a flat `{ "message": "..." }` body — no
+    // model/messages/tools at all. Flatten persona + history + current turn
+    // into a single string. Tool calling is unsupported on Shannon for now.
+    if (is_shannon(model)) {
+        char *flat = malloc(CHAT_BODY_CAP);
+        if (!flat) { cJSON_Delete(root); return -1; }
+        size_t off = 0;
+        char *sysprompt = malloc(SYS_PROMPT_CAP);
+        if (sysprompt) {
+            build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
+            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s\n\n", sysprompt);
+            free(sysprompt);
+        }
+        if (use_history && s_hist_len > 0) {
+            for (int i = 0; i < s_hist_len && off < CHAT_BODY_CAP; ++i) {
+                off += snprintf(flat + off, CHAT_BODY_CAP - off,
+                                "%s: %s\n",
+                                s_history[i].role, s_history[i].text);
+            }
+        } else if (one_shot_prompt && one_shot_prompt[0]) {
+            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s", one_shot_prompt);
+        }
+        cJSON_AddStringToObject(root, "message", flat);
+        // Pass max_tokens through too — if Shannon's wrapper forwards it,
+        // the model will be bounded; if it ignores it, the persona's hard
+        // length rule is still our backstop.
+        cJSON_AddNumberToObject(root, "max_tokens", max_tokens);
+        free(flat);
+        bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
+        cJSON_Delete(root);
+        if (!ok) { ESP_LOGW(TAG, "shannon body overflow (cap=%u)", (unsigned)cap); return -1; }
+        return (int)strlen(out);
+    }
+
+    cJSON_AddStringToObject(root, "model", wire_model(model));
     cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
     cJSON_AddNumberToObject(root, "temperature", temperature);
 
@@ -536,7 +616,9 @@ static cJSON *post_chat_fetch(const char *body,
         return NULL;
     }
     x402_result_t r = {0};
-    x402_post(LLM_ENDPOINT, body, NULL, rsp, CHAT_RSP_CAP, &r);
+    const char *url = resolve_llm_url(devcfg_llm_model());
+    ESP_LOGI(TAG, "POST %s (model=%s)", url, devcfg_llm_model());
+    x402_post(url, body, NULL, rsp, CHAT_RSP_CAP, &r);
 
     cJSON *msg_owned = NULL;
 

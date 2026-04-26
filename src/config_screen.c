@@ -36,6 +36,7 @@ static const catalog_item_t MODELS[] = {
     { "openai/gpt-4o-mini",           "GPT-4o Mini"        },
     { "openai/gpt-4o",                "GPT-4o"             },
     { "deepseek/deepseek-chat",       "DeepSeek V3"        },
+    { "shannon/shannon-1.6-lite",     "Shannon 1.6 Lite"   },
 };
 
 // ElevenLabs stock voices: 3 male + 2 female.

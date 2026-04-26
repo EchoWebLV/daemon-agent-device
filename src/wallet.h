@@ -75,6 +75,15 @@ void wallet_usdc_display_string(char *out, size_t cap);
 // also gets a "(~$X.XX)" suffix.
 void wallet_context(char *out, size_t cap, double sol_usd_price);
 
+// Fires once per positive balance delta whose amount crosses an internal
+// threshold (> 0.01 SOL, > 0.1 USDC, > 0.1 for other SPL tokens). `symbol`
+// is a short ticker ("SOL" / "USDC" / known-mint symbol / "tokens" when
+// unknown). Never fires on the first refresh after boot — the starting
+// balance would otherwise announce itself. Runs on the wallet task, so
+// blocking work (network calls, TTS kick-off) inside the callback is OK.
+typedef void (*wallet_incoming_cb_t)(const char *symbol, double amount);
+void wallet_set_incoming_cb(wallet_incoming_cb_t cb);
+
 #ifdef __cplusplus
 }
 #endif

@@ -212,8 +212,7 @@ size_t wifi_sta_scan(wifi_sta_scan_ap_t *out, size_t cap) {
         return 0;
     }
 
-    wifi_scan_config_t scan_cfg = {0};   // default: active, all channels, 120 ms/ch
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, /*block=*/true);
+    esp_err_t err = esp_wifi_scan_start(NULL, /*block=*/true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(err));
         return 0;

@@ -31,6 +31,12 @@ extern const size_t index_html_len;
 // POST — full custom-services JSON plus a few small fields — fits with
 // room to spare for the surrounding JSON envelope.
 #define BODY_MAX   8192
+// /config GET serializes model + escaped persona (worst case 1024*6 = 6144)
+// + servicesEnabled (512) + customServices (4096) into one envelope. That
+// can blow past BODY_MAX, which would 500 the request and the web UI would
+// silently render an empty form. Size the response buffer for that worst
+// case so save → refresh round-trips reliably.
+#define CONFIG_GET_MAX 16384
 
 static httpd_handle_t         s_httpd   = NULL;
 static server_say_handler_t   s_on_say  = NULL;
@@ -149,7 +155,7 @@ static esp_err_t handle_config_get(httpd_req_t *req) {
     // of it for TLS, so keep this off the stack.
     char *model_esc   = malloc(96 * 6 + 1);
     char *persona_esc = malloc(1024 * 6 + 1);
-    char *body        = malloc(BODY_MAX);
+    char *body        = malloc(CONFIG_GET_MAX);
     if (!model_esc || !persona_esc || !body) {
         free(model_esc); free(persona_esc); free(body);
         return send_json(req, 500, "{\"error\":\"oom\"}");
@@ -157,11 +163,11 @@ static esp_err_t handle_config_get(httpd_req_t *req) {
     json_escape(model,   model_esc,   96 * 6 + 1);
     json_escape(persona, persona_esc, 1024 * 6 + 1);
 
-    int n = snprintf(body, BODY_MAX,
+    int n = snprintf(body, CONFIG_GET_MAX,
                      "{\"model\":\"%s\",\"personality\":\"%s\","
                      "\"servicesEnabled\":%s,\"customServices\":%s}",
                      model_esc, persona_esc, svc_on, svc_all);
-    esp_err_t err = (n > 0 && n < BODY_MAX)
+    esp_err_t err = (n > 0 && n < CONFIG_GET_MAX)
         ? send_json(req, 200, body)
         : send_json(req, 500, "{\"error\":\"body too large\"}");
     free(model_esc);
