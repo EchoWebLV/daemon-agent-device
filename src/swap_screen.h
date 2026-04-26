@@ -3,7 +3,6 @@
 //  thread via lv_async_call; the calling task waits on `done_sem`.
 // ---------------------------------------------------------------------------
 #pragma once
-#include <stdbool.h>
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
