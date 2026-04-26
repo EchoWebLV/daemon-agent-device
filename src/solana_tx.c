@@ -253,18 +253,17 @@ static int v2_intern(v2_key_t *keys, size_t *n, const uint8_t pk[32],
 
 // After interning, sort into Solana's required order:
 //     [signed-writable] [signed-readonly] [unsigned-writable] [unsigned-readonly]
-// while keeping fee_payer at index 0 and signer_pubkey at index 1. We do the
-// classification + sort in one pass with a stable-insertion shuffle.
+// while keeping fee_payer pinned at index 0 (Solana's wire spec — slot 0 is
+// always the fee-payer's signature slot). Everything else (including a
+// distinct signer_pubkey, when present) gets sorted into rank order. Stable
+// insertion sort.
 static void v2_classify_sort(v2_key_t *keys, size_t n) {
-    // Three-pass insertion sort: keep [0] and [1] fixed; sort the tail.
-    // Class rank: 0 = signer+writable, 1 = signer-only, 2 = writable-only, 3 = readonly.
-    // Lower rank goes earlier.
-    if (n < 3) return;
-    for (size_t i = 3; i < n; i++) {
+    if (n < 2) return;
+    for (size_t i = 2; i < n; i++) {
         v2_key_t cur = keys[i];
         int cur_rank = (cur.is_signer ? 0 : 2) + (cur.is_writable ? 0 : 1);
         size_t j = i;
-        while (j > 2) {
+        while (j > 1) {
             v2_key_t pv = keys[j - 1];
             int pv_rank = (pv.is_signer ? 0 : 2) + (pv.is_writable ? 0 : 1);
             if (pv_rank <= cur_rank) break;
@@ -402,16 +401,22 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
     }
 
     // tx = sig_count(shortvec) + sig_count*64 zero/sig + message
+    // Slot ordering follows the sorted accounts table: keys[0..num_required_sigs)
+    // are the signers in account-table order. We hold signer_pubkey's secret;
+    // any other slot is zeroed (gateway fills the fee_payer slot when they
+    // differ; truly-other signers are unsupported in v2 today).
+    int signer_slot = v2_index_of(keys, nkeys, in->signer_pubkey);
+    if (signer_slot < 0 || signer_slot >= num_required_sigs) {
+        ESP_LOGE(TAG, "v2 signer not in required-sig range (slot=%d)", signer_slot);
+        return -1;
+    }
     uint8_t tx[1 + V2_MAX_ACCOUNTS * 64 + V2_MSG_BUF];
     wc_t tw = { .buf = tx, .cap = sizeof tx };
     wc_shortvec(&tw, num_required_sigs);
     uint8_t zero_sig[64] = {0};
-    // Slot 0 = fee_payer (zeroed; gateway fills); slot 1 = our signature;
-    // any other signers (we currently never have any) are also zeroed and
-    // would need separate handling.
     for (uint8_t s = 0; s < num_required_sigs; s++) {
-        if (s == 1) wc_bytes(&tw, sig, 64);
-        else        wc_bytes(&tw, zero_sig, 64);
+        if (s == signer_slot) wc_bytes(&tw, sig, 64);
+        else                  wc_bytes(&tw, zero_sig, 64);
     }
     wc_bytes(&tw, msg, w.len);
     if (tw.overflow) { ESP_LOGE(TAG, "v2 tx overflow"); return -1; }

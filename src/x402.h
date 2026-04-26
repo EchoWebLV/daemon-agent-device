@@ -10,11 +10,25 @@
 //  work on whatever arrived first.
 // ---------------------------------------------------------------------------
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Fetches the latest blockhash via the configured Solana RPC. Implementation
+// in x402.c; exposed because the vault_execute test verb in testharness.c
+// needs it to build a tx outside the x402 payment path. Returns true and
+// writes 32 bytes to `out` on success.
+bool fetch_recent_blockhash(uint8_t out[32]);
+
+// Generic Solana JSON-RPC POST. Sends `payload` (a complete JSON request body)
+// to `wallet_rpc_url` via TLS, captures the response into `out` (NUL-terminated,
+// truncated on overflow). Used by Phase 2a's vault_execute test verb to send
+// the built tx; production callers go through x402's payment path instead.
+bool rpc_call(const char *payload, char *out, size_t out_cap);
 
 typedef struct {
     int    status;       // final HTTP status (after payment if one was required)

@@ -73,7 +73,7 @@ static esp_err_t on_rpc_event(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-static bool rpc_call(const char *payload, char *out, size_t out_cap) {
+bool rpc_call(const char *payload, char *out, size_t out_cap) {
     if (!wifi_sta_is_connected()) return false;
     if (out_cap == 0) return false;
     out[0] = '\0';
@@ -108,7 +108,7 @@ static bool rpc_call(const char *payload, char *out, size_t out_cap) {
 // ---------------------------------------------------------------------------
 // RPC helpers used while building the payment.
 // ---------------------------------------------------------------------------
-static bool fetch_recent_blockhash(uint8_t out[32]) {
+bool fetch_recent_blockhash(uint8_t out[32]) {
     static const char *REQ =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLatestBlockhash\",\"params\":[]}";
     char body[512];

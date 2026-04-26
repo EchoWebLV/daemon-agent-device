@@ -27,12 +27,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "secrets.h"
 
 // Subsystem APIs the verbs drive. Keep this list tight — the harness is
 // the only caller that needs to see all of these together, so we intentionally
@@ -40,6 +44,7 @@
 #include "agent_pda.h"
 #include "ai.h"
 #include "base58.h"
+#include "solana_tx.h"
 #include "swap.h"
 #include "ui.h"
 #include "wallet.h"
@@ -320,6 +325,220 @@ static void handle_vault_pda(void) {
     resp_ok(buf);
 }
 
+// Hardcoded test-vault state — mirrors target/test-vault.json. Re-run
+// `yarn ts-node scripts/setup-test-vault.ts <DEVICE_PUBKEY>` after every
+// firmware reflash that needs fresh ATAs (the script mints a new test SPL
+// each run; existing on-chain accounts stay around but go unused).
+static const char *TV_USDC_MINT      = "7qjcdScgJZCDGt78ASR1YLo7AMWQ7YVZqpeKtdWbMWkb";
+static const char *TV_VAULT_USDC_ATA = "Ai1yFpb33QKmfv2qSyixcthQXi2NC4ReArwU3LEs7CsV";
+static const char *TV_OWNER_USDC_ATA = "6EjvMEkBWYcVWSxH2rt2etyVnbUB1NHnMwtYCdheTTVM";
+
+typedef struct { char *buf; size_t cap; size_t len; } devnet_body_t;
+
+static esp_err_t devnet_on_data(esp_http_client_event_t *evt) {
+    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+    devnet_body_t *r = (devnet_body_t *)evt->user_data;
+    if (!r || r->cap == 0) return ESP_OK;
+    size_t room = r->cap - 1 - r->len;
+    if (room == 0) return ESP_OK;
+    size_t take = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
+    memcpy(r->buf + r->len, evt->data, take);
+    r->len += take;
+    r->buf[r->len] = '\0';
+    return ESP_OK;
+}
+
+// Devnet POST helper — wallet_rpc_url returns mainnet (the daemon's normal
+// runtime), but our deployed agent_program lives on devnet for Phase 2a, so
+// the test verb has to talk to devnet directly. Hardcoded Helius devnet URL.
+static bool devnet_rpc_post(const char *payload, char *out, size_t out_cap) {
+    extern bool wifi_sta_is_connected(void);
+    if (!wifi_sta_is_connected()) return false;
+    if (out_cap == 0) return false;
+    out[0] = '\0';
+
+    char url[200];
+    snprintf(url, sizeof url,
+             "https://devnet.helius-rpc.com/?api-key=%s", HELIUS_API_KEY);
+
+    devnet_body_t rb = { .buf = out, .cap = out_cap, .len = 0 };
+
+    esp_http_client_config_t cfg = {
+        .url               = url,
+        .method            = HTTP_METHOD_POST,
+        .transport_type    = HTTP_TRANSPORT_OVER_SSL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = devnet_on_data,
+        .user_data         = &rb,
+        .timeout_ms        = 15000,
+    };
+    esp_http_client_handle_t http = esp_http_client_init(&cfg);
+    if (!http) return false;
+    esp_http_client_set_header(http, "Content-Type", "application/json");
+    esp_http_client_set_post_field(http, payload, (int)strlen(payload));
+    esp_err_t err = esp_http_client_perform(http);
+    int       code = esp_http_client_get_status_code(http);
+    esp_http_client_cleanup(http);
+    if (err != ESP_OK || code != 200) {
+        ESP_LOGW(TAG, "devnet rpc err=%s code=%d", esp_err_to_name(err), code);
+        return false;
+    }
+    return true;
+}
+
+// Direct-RPC sendTransaction (devnet). Cribbed from swap.c::rpc_send_tx so the
+// test verb stays self-contained — testharness can't reach swap.c's statics.
+static bool rpc_send_test_tx(const char *signed_tx_b64,
+                             char *txid_out, size_t cap)
+{
+    size_t req_cap = strlen(signed_tx_b64) + 256;
+    char  *req     = malloc(req_cap);
+    if (!req) return false;
+    snprintf(req, req_cap,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sendTransaction\","
+        "\"params\":[\"%s\","
+        "{\"encoding\":\"base64\",\"skipPreflight\":false,"
+        "\"preflightCommitment\":\"processed\"}]}",
+        signed_tx_b64);
+
+    char *rsp = malloc(4096);  // heap, not stack — keeps harness stack lean
+    if (!rsp) { free(req); return false; }
+    bool ok = devnet_rpc_post(req, rsp, 4096);
+    free(req);
+    if (!ok) { free(rsp); return false; }
+
+    cJSON *root = cJSON_Parse(rsp);
+    free(rsp);
+    if (!root) return false;
+    bool got = false;
+    const cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (cJSON_IsString(result) && result->valuestring && result->valuestring[0]) {
+        strlcpy(txid_out, result->valuestring, cap);
+        got = true;
+    } else {
+        const cJSON *err = cJSON_GetObjectItem(root, "error");
+        if (cJSON_IsObject(err)) {
+            const cJSON *msg = cJSON_GetObjectItem(err, "message");
+            if (cJSON_IsString(msg)) ESP_LOGW(TAG, "rpc err: %s", msg->valuestring);
+            const cJSON *data = cJSON_GetObjectItem(err, "data");
+            const cJSON *logs = data ? cJSON_GetObjectItem(data, "logs") : NULL;
+            if (cJSON_IsArray(logs)) {
+                int n = cJSON_GetArraySize(logs);
+                for (int i = 0; i < n; i++) {
+                    const cJSON *ln = cJSON_GetArrayItem(logs, i);
+                    if (cJSON_IsString(ln)) ESP_LOGW(TAG, "  log: %s", ln->valuestring);
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return got;
+}
+
+// Builds vault_execute(TransferChecked from vault → owner, amount tokens, 6 dec)
+// for the test mint and submits it. Returns the resulting tx signature on
+// success — verify on solscan.io/?cluster=devnet.
+static void handle_vault_transfer(const char *args) {
+    // Argv: <amount-tokens-with-6-dec> e.g. "10000" = 0.01 USDC
+    uint64_t amount = strtoull(args, NULL, 10);
+    if (amount == 0) { resp_err("vault transfer bad_amount"); return; }
+
+    const uint8_t *device_pk = wallet_pubkey_bytes();
+    const uint8_t *owner_pk  = wallet_owner_pubkey_bytes();
+    if (!device_pk || !owner_pk) { resp_err("vault no_keys"); return; }
+
+    uint8_t agent_root[32], vault_pk[32];
+    if (agent_pda_derive_root(owner_pk, agent_root) < 0)        { resp_err("vault root_derive"); return; }
+    if (agent_pda_derive_vault(agent_root, vault_pk) < 0)       { resp_err("vault vault_derive"); return; }
+
+    uint8_t mint_pk[32], vault_ata[32], owner_ata[32];
+    if (base58_decode(TV_USDC_MINT,      mint_pk,    32) != 32) { resp_err("decode mint"); return; }
+    if (base58_decode(TV_VAULT_USDC_ATA, vault_ata,  32) != 32) { resp_err("decode vault_ata"); return; }
+    if (base58_decode(TV_OWNER_USDC_ATA, owner_ata,  32) != 32) { resp_err("decode owner_ata"); return; }
+
+    // Fetch a devnet blockhash directly (fetch_recent_blockhash uses
+    // wallet_rpc_url which is mainnet on this build).
+    uint8_t blockhash[32];
+    {
+        char body[1024];
+        if (!devnet_rpc_post(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLatestBlockhash\",\"params\":[]}",
+                body, sizeof body)) {
+            resp_err("vault blockhash"); return;
+        }
+        cJSON *root = cJSON_Parse(body);
+        if (!root) { resp_err("vault blockhash_parse"); return; }
+        cJSON *res = cJSON_GetObjectItem(root, "result");
+        cJSON *val = res ? cJSON_GetObjectItem(res, "value") : NULL;
+        cJSON *bh  = val ? cJSON_GetObjectItem(val, "blockhash") : NULL;
+        bool ok = cJSON_IsString(bh) && bh->valuestring &&
+                  base58_decode(bh->valuestring, blockhash, 32) == 32;
+        cJSON_Delete(root);
+        if (!ok) { resp_err("vault blockhash_decode"); return; }
+    }
+
+    // Inner: SPL TransferChecked(vault_ata → owner_ata, amount, 6 dec).
+    uint8_t inner_data[10];
+    inner_data[0] = 0x0C;
+    for (int i = 0; i < 8; i++) inner_data[1 + i] = (uint8_t)(amount >> (i * 8));
+    inner_data[9] = 6;
+
+    agent_meta_t inner_metas[] = {
+        { vault_ata,  false, true  },   // source
+        { mint_pk,    false, false },   // mint
+        { owner_ata,  false, true  },   // destination
+        { vault_pk,   true,  false },   // authority (vault PDA — signs via CPI)
+    };
+
+    uint8_t outer_ix_data[256];
+    agent_meta_t outer_metas[16];
+    size_t outer_meta_count = 0;
+    int outer_data_len = agent_pda_build_vault_execute_ix(
+        vault_pk, device_pk, SPL_TOKEN_PROGRAM_ID,
+        inner_metas, sizeof inner_metas / sizeof inner_metas[0],
+        inner_data, sizeof inner_data,
+        outer_ix_data, sizeof outer_ix_data,
+        outer_metas, &outer_meta_count, sizeof outer_metas / sizeof outer_metas[0]);
+    if (outer_data_len < 0) { resp_err("vault build_ix"); return; }
+
+    // Translate agent_meta_t → solana_ix_account_t for the v2 builder.
+    solana_ix_account_t v2_accs[16];
+    for (size_t i = 0; i < outer_meta_count; i++) {
+        v2_accs[i].pubkey      = outer_metas[i].pubkey;
+        v2_accs[i].is_signer   = outer_metas[i].is_signer;
+        v2_accs[i].is_writable = outer_metas[i].is_writable;
+    }
+    solana_ix_v2_t ix = {
+        .program_id    = AGENT_PROGRAM_ID,
+        .accounts      = v2_accs,
+        .account_count = outer_meta_count,
+        .data          = outer_ix_data,
+        .data_len      = (size_t)outer_data_len,
+    };
+    // Test path: device pays its own fees (no x402 facilitator), so fee_payer
+    // = device_pk too. That makes num_required_sigs = 1 and slot 0 carries
+    // our signature.
+    solana_tx_input_v2_t txin = {
+        .fee_payer      = device_pk,
+        .signer_pubkey  = device_pk,
+        .blockhash      = blockhash,
+        .ixs            = &ix,
+        .ix_count       = 1,
+        .cu_limit       = 50000,
+        .cu_price_micro = 1,
+    };
+    char tx_b64[1536];
+    int tx_len = solana_build_tx_v2_base64(&txin, tx_b64, sizeof tx_b64);
+    if (tx_len <= 0) { resp_err("vault build_tx"); return; }
+
+    char txid[96];
+    if (!rpc_send_test_tx(tx_b64, txid, sizeof txid)) { resp_err("vault rpc_send"); return; }
+
+    char buf[160];
+    snprintf(buf, sizeof buf, "txid %s", txid);
+    resp_ok(buf);
+}
+
 // Encodes an empty vault_execute payload to expose the Anchor discriminator
 // in hex. Must match sha256("global:vault_execute")[0..8] = b2c50da89714ae28.
 static void handle_vault_disc(void) {
@@ -477,10 +696,12 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- VAULT PDA / VAULT DISC --- (Phase 2a-x402)
+    // --- VAULT PDA / VAULT DISC / VAULT TRANSFER <amount> --- (Phase 2a-x402)
     if ((rest = match_token(after_test, "VAULT"))) {
+        const char *args;
         if (match_token(rest, "PDA"))  { handle_vault_pda();  return; }
         if (match_token(rest, "DISC")) { handle_vault_disc(); return; }
+        if ((args = match_token(rest, "TRANSFER"))) { handle_vault_transfer(args); return; }
         resp_err("vault bad_subverb");
         return;
     }
@@ -594,12 +815,13 @@ static void harness_task(void *arg) {
 // ---------- public API -----------------------------------------------------
 
 bool test_harness_begin(void) {
-    // 8 KB stack. AI PING and X402 CALL drive mbedTLS + cJSON + (for x402)
-    // a Solana tx build/sign. mbedTLS is heap-only in this build, so the
-    // handshake stays in the ~4 KB range; 8 KB leaves ~2 KB of watermark.
+    // 16 KB stack. The Phase 2a-x402 verbs (VAULT TRANSFER especially) build
+    // an entire v0 message on the stack (3KB tx buf + 1KB msg buf) and then
+    // POST a 4KB sendTransaction response — combined call chain peaks around
+    // 10 KB. Earlier verbs fit in 8 KB, this one doesn't.
     BaseType_t ok = xTaskCreatePinnedToCore(harness_task,
                                             "testharness",
-                                            8 * 1024,
+                                            16 * 1024,
                                             NULL,
                                             4,          // priority
                                             NULL,

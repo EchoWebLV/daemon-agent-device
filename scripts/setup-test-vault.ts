@@ -128,8 +128,8 @@ async function main() {
     console.log("    already funded");
   }
 
-  // 3. mint test "USDC" + vault ATA
-  console.log("[3] minting test USDC + vault ATA");
+  // 3. mint test "USDC" + vault ATA + owner ATA (destination for tests)
+  console.log("[3] minting test USDC + vault & owner ATAs");
   const mint = await createMint(conn, owner, owner.publicKey, null, 6);
   const vaultAta = await getOrCreateAssociatedTokenAccount(
     conn,
@@ -138,9 +138,16 @@ async function main() {
     vault,
     true
   );
+  const ownerAta = await getOrCreateAssociatedTokenAccount(
+    conn,
+    owner,
+    mint,
+    owner.publicKey
+  );
   await mintTo(conn, owner, mint, vaultAta.address, owner, 1_000_000);
   console.log("    mint:     ", mint.toBase58());
   console.log("    vault_ata:", vaultAta.address.toBase58());
+  console.log("    owner_ata:", ownerAta.address.toBase58());
 
   // 4. persist for the firmware
   const out = path.resolve("target/test-vault.json");
@@ -156,6 +163,7 @@ async function main() {
         vault: vault.toBase58(),
         usdc_mint: mint.toBase58(),
         vault_usdc_ata: vaultAta.address.toBase58(),
+        owner_usdc_ata: ownerAta.address.toBase58(),
       },
       null,
       2
