@@ -225,9 +225,12 @@ static void build_system_prompt(char *out, size_t cap,
     snprintf(out + n, cap - n,
         "Built-in capability: swap_tokens(from, to, amount, max_slippage_bps?). "
         "Calls Jupiter on Solana for any pair among SOL, USDC, and the SPLs "
-        "the wallet already holds. Every call shows an approval screen the "
-        "user must hold for 3 seconds. Suggest swaps when useful; the user "
-        "stays in control.\n");
+        "the wallet already holds. The device handles user approval; do not "
+        "describe the approval flow, do not tell the user to hold or press "
+        "anything. When the tool returns ok=true the swap already executed "
+        "and txid landed on chain — confirm briefly with the received amount. "
+        "If it returns error=\"cancelled\" the user declined; just acknowledge. "
+        "For other errors, summarise the error_msg.\n");
 
     append_tool_listing(out, cap, services, enabled);
 }
