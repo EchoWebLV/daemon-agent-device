@@ -39,9 +39,13 @@
 
 static const char *TAG = "swap_screen";
 
-#define HOLD_MS         3000
-#define IDLE_TIMEOUT_MS 30000
-#define POLL_PERIOD_MS  20
+#define HOLD_MS              3000
+#define IDLE_TIMEOUT_MS      30000
+#define POLL_PERIOD_MS       20
+// CST328 reports brief RELEASED dropouts during a static hold (INT line
+// retriggers between frames). Require this many continuous ms of RELEASED
+// before treating it as a real lift-off.
+#define RELEASE_DEBOUNCE_MS  120
 
 typedef struct {
     swap_screen_args_t args;
@@ -54,6 +58,7 @@ typedef struct {
     lv_timer_t        *poll_timer;
     uint32_t           hold_ms;          // accumulated continuous-contact ms
     uint32_t           idle_ms;          // ms since last contact
+    uint32_t           release_streak_ms; // continuous RELEASED ms (debounce)
     bool               touching;
 } ctx_t;
 
@@ -103,6 +108,7 @@ static void poll_tick(lv_timer_t *t) {
     if (down) {
         s_ctx.hold_ms += POLL_PERIOD_MS;
         s_ctx.idle_ms  = 0;
+        s_ctx.release_streak_ms = 0;
         s_ctx.touching = true;
         int pct = (int)((s_ctx.hold_ms * 100) / HOLD_MS);
         if (pct > 100) pct = 100;
@@ -118,10 +124,18 @@ static void poll_tick(lv_timer_t *t) {
         }
     } else {
         if (s_ctx.touching && s_ctx.hold_ms > 0) {
-            close_modal(SWAP_UI_CANCEL_RELEASE);
+            // Debounce: a single RELEASED tick is usually a CST328 dropout
+            // mid-hold, not a real lift. Only cancel after the streak crosses
+            // RELEASE_DEBOUNCE_MS of continuous releases.
+            s_ctx.release_streak_ms += POLL_PERIOD_MS;
+            if (s_ctx.release_streak_ms >= RELEASE_DEBOUNCE_MS) {
+                close_modal(SWAP_UI_CANCEL_RELEASE);
+                return;
+            }
             return;
         }
         s_ctx.touching = false;
+        s_ctx.release_streak_ms = 0;
         s_ctx.idle_ms += POLL_PERIOD_MS;
         if (s_ctx.idle_ms >= IDLE_TIMEOUT_MS) {
             close_modal(SWAP_UI_CANCEL_TIMEOUT);
