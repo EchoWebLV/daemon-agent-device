@@ -1,21 +1,21 @@
 [toolchain]
-anchor_version = "0.30.1"
+anchor_version = "0.32.1"
 
 [features]
 resolution = true
 skip-lint = false
 
 [programs.devnet]
-agent_program = "278wVm31qm5CVnjMszX7Ek5zWuWY4sFJtuEjt9N9Nivu"
+agent_program = "FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
 
 [programs.localnet]
-agent_program = "278wVm31qm5CVnjMszX7Ek5zWuWY4sFJtuEjt9N9Nivu"
+agent_program = "FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
