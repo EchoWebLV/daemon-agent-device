@@ -21,6 +21,17 @@ export PATH="$HOME/.avm/bin:$PATH"
 ANCHOR=$(command -v anchor)
 echo "==> using $ANCHOR ($(anchor --version))"
 
+echo "==> seeding committed program keypair into target/deploy"
+mkdir -p target/deploy
+for crate in programs/*/; do
+  name=$(basename "$crate")
+  src="$crate/keypair.json"
+  if [[ -f "$src" ]]; then
+    cp -f "$src" "target/deploy/${name}-keypair.json"
+    chmod 600 "target/deploy/${name}-keypair.json"
+  fi
+done
+
 echo "==> SBF build (--no-idl -- --tools-version v1.53)"
 anchor build --no-idl -- --tools-version v1.53
 

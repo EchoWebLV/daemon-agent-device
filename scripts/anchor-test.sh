@@ -22,7 +22,7 @@ sleep 1
 
 WALLET="$HOME/.config/solana/id.json"
 MINT=$(solana address --keypair "$WALLET")
-PROGRAM_ID="FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
+PROGRAM_ID="9DJqU25ShsEXNisbzSNUPzaN6qiSbU9XiNL7eerqYPFf"
 SO_PATH="target/deploy/agent_program.so"
 LEDGER=".anchor/test-ledger"
 

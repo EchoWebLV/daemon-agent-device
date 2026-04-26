@@ -9,7 +9,7 @@ pub mod state;
 use error::*;
 use state::*;
 
-declare_id!("FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA");
+declare_id!("9DJqU25ShsEXNisbzSNUPzaN6qiSbU9XiNL7eerqYPFf");
 
 #[program]
 pub mod agent_program {

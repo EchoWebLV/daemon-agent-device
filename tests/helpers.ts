@@ -18,7 +18,7 @@ import {
 export const PROGRAM_ID = new PublicKey(
   // overwritten by anchor.workspace.AgentProgram.programId at runtime;
   // this constant is only used for direct PDA derivation outside tests.
-  "FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
+  "9DJqU25ShsEXNisbzSNUPzaN6qiSbU9XiNL7eerqYPFf"
 );
 
 export {

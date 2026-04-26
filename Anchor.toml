@@ -6,10 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-agent_program = "FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
+agent_program = "9DJqU25ShsEXNisbzSNUPzaN6qiSbU9XiNL7eerqYPFf"
 
 [programs.localnet]
-agent_program = "FNVcw2kCnzSxZwqNEnoSMmVnTLXaiusxupLZ4CWkYPAA"
+agent_program = "9DJqU25ShsEXNisbzSNUPzaN6qiSbU9XiNL7eerqYPFf"
 
 [registry]
 url = "https://api.apr.dev"
