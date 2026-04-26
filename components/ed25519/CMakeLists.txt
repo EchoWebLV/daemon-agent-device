@@ -1,11 +1,10 @@
 # Ed25519 signing for Solana x402 payments.
 #
 # Sources are vendored verbatim from orlp/ed25519 @ master (zlib-like licence,
-# see LICENSE in this directory). We only need the sign path, but the
-# library's 16 files are tightly coupled so we pull the full set except for
-# seed.c (needs /dev/urandom — we don't create fresh seeds on-device) and
-# verify.c / add_scalar.c / key_exchange.c (unused). That keeps this to
-# ~100 KB of precomputed table + ~6 KB of actual code.
+# see LICENSE in this directory). The library's 16 files are tightly coupled
+# so we pull the full set except seed.c (needs /dev/urandom — we don't create
+# fresh seeds on-device) and add_scalar.c / key_exchange.c (unused). verify.c
+# is included so swap_test_sig_for_test can self-verify spliced signatures.
 idf_component_register(
     SRCS
         "src/fe.c"

@@ -431,6 +431,10 @@ static int sign_v0_tx_in_place(const char *in_b64, char *out_b64, size_t out_cap
     if (!compact_u16_read(raw, raw_len, &cursor, &num_keys)) { free(raw); return -1; }
     size_t keys_off = cursor;
     if (keys_off + (size_t)num_keys * 32 > raw_len)           { free(raw); return -1; }
+    // Signers occupy the first `num_sigs` static keys. A malformed tx
+    // claiming more signers than total keys would let the loop below
+    // read past the keys array.
+    if (num_sigs > num_keys)                                  { free(raw); return -1; }
 
     const uint8_t *mypub = wallet_pubkey_bytes();
     if (!mypub) { free(raw); return -1; }
@@ -487,6 +491,10 @@ int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap) {
     uint16_t num_keys = 0;
     compact_u16_read(raw, raw_len, &cursor, &num_keys);
     size_t keys_off = cursor;
+    // Mirror the same num_sigs <= num_keys bound the sign path enforces;
+    // we just produced this buffer ourselves so the check is defensive
+    // symmetry, not load-bearing.
+    if (num_sigs > num_keys) { free(raw); return -4; }
 
     const uint8_t *mypub = wallet_pubkey_bytes();
     if (!mypub) { free(raw); return -4; }
