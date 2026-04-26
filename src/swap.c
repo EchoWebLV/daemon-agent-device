@@ -254,7 +254,7 @@ static bool jup_get_quote(const swap_token_t *from, const swap_token_t *to,
 
     char url[512];
     snprintf(url, sizeof(url),
-             "https://quote-api.jup.ag/v6/quote"
+             "https://lite-api.jup.ag/swap/v1/quote"
              "?inputMint=%s&outputMint=%s&amount=%llu&slippageBps=%u"
              "&onlyDirectRoutes=false&restrictIntermediateTokens=true",
              from->mint, to->mint,
@@ -319,7 +319,7 @@ static bool jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
 
     char *rsp = heap_caps_malloc(JUP_SWAP_RSP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rsp) { free(body); return false; }
-    bool ok = https_post_json("https://quote-api.jup.ag/v6/swap",
+    bool ok = https_post_json("https://lite-api.jup.ag/swap/v1/swap",
                               body, rsp, JUP_SWAP_RSP_CAP);
     free(body);
     if (!ok) { free(rsp); return false; }
