@@ -705,3 +705,30 @@ static bool rpc_wait_for_confirm(const char *txid) {
     ESP_LOGW(TAG, "wait confirm timeout %.16s...", txid ? txid : "(null)");
     return false;
 }
+
+bool swap_dry_run_for_test(const char *from_sym, const char *to_sym,
+                           double amount_ui, uint16_t slippage_bps,
+                           char *out_json, size_t cap) {
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        snprintf(out_json, cap, "{\"error\":\"unknown_symbol\"}"); return false;
+    }
+    if (!has_balance(&a, amount_ui)) {
+        snprintf(out_json, cap, "{\"error\":\"insufficient_balance\"}"); return false;
+    }
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        snprintf(out_json, cap, "{\"error\":\"quote_failed\"}"); return false;
+    }
+    double scale = swap_pow10(b.decimals);
+    snprintf(out_json, cap,
+        "{\"from\":\"%s\",\"to\":\"%s\",\"in\":%.6f,\"out\":%.6f,"
+        "\"min\":%.6f,\"slip_bps\":%u}",
+        a.sym, b.sym, amount_ui,
+        (double)q.out_atomic     / scale,
+        (double)q.min_out_atomic / scale,
+        (unsigned)slip);
+    free(q.quote_json);
+    return true;
+}

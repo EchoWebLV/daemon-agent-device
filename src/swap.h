@@ -66,6 +66,12 @@ const char *swap_show_demo_for_test(void);
 // Used by the test harness only (TEST SWAP SIG <b64>).
 int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap);
 
+// Diagnostic — runs the pipeline up to (but not past) the approval modal,
+// returns the screen args as JSON. Caller is the test harness only.
+bool swap_dry_run_for_test(const char *from_sym, const char *to_sym,
+                           double amount_ui, uint16_t slippage_bps,
+                           char *out_json, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

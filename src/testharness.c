@@ -446,7 +446,7 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- SWAP RESOLVE <sym> | SWAP DEMO | SWAP SIG <b64> -------------------
+    // --- SWAP RESOLVE <sym> | SWAP DEMO | SWAP SIG <b64> | SWAP DRY_RUN ---
     if ((rest = match_token(after_test, "SWAP"))) {
         // RESOLVE <sym>  →  TEST OK <mint>:<decimals> | TEST ERR unresolved
         const char *args;
@@ -479,6 +479,23 @@ static void dispatch_line(const char *line) {
                 resp_err(m);
             }
             free(out);
+            return;
+        }
+        // DRY_RUN <from> <to> <amount> [slippage_bps]
+        //   → TEST OK <json blob> | TEST ERR <json blob>
+        if ((args = match_token(rest, "DRY_RUN"))) {
+            char from[12] = {0}, to[12] = {0};
+            double amount = 0;
+            unsigned slip = 0;
+            int parsed = sscanf(args, "%11s %11s %lf %u",
+                                from, to, &amount, &slip);
+            if (parsed < 3) { resp_err("usage SWAP DRY_RUN <from> <to> <amount> [slippage_bps]"); return; }
+            char buf[256];
+            if (swap_dry_run_for_test(from, to, amount, (uint16_t)slip, buf, sizeof(buf))) {
+                resp_ok(buf);
+            } else {
+                resp_err(buf);  // already JSON-shaped; harness OK with raw payload
+            }
             return;
         }
         resp_err("swap bad_subverb");
