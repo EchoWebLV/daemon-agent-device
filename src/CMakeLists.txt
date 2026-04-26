@@ -6,6 +6,7 @@
 # Add to REQUIRES only when we depend on something outside that set.
 idf_component_register(
     SRCS
+        "agent_pda.c"
         "ai.c"
         "app_main.c"
         "base58.c"
