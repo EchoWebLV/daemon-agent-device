@@ -23,3 +23,11 @@ src/generated/
 *.pyc
 __pycache__/
 .venv/
+
+# Anchor / Solana
+target/
+.anchor/
+test-ledger/
+node_modules/
+.yarn/
+.idea/
