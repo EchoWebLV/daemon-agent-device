@@ -10,6 +10,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -482,7 +483,19 @@ static void execute_tool(const cJSON *services, const cJSON *enabled,
             if (args) cJSON_Delete(args);
             return;
         }
-        uint16_t slip = cJSON_IsNumber(js) ? (uint16_t)js->valuedouble : 0;
+        if (!isfinite(ja->valuedouble) || ja->valuedouble <= 0.0) {
+            snprintf(out, cap, "{\"ok\":false,\"error\":\"bad_amount\"}");
+            cJSON_Delete(args);
+            return;
+        }
+        // Out-of-range or non-finite slippage doubles can trap on float→u16
+        // conversion; clamp the source double before casting and let
+        // swap_request apply its per-pair fallback for sub-range values.
+        uint16_t slip = 0;
+        if (cJSON_IsNumber(js)) {
+            double v = js->valuedouble;
+            if (isfinite(v) && v >= 0.0 && v <= 65535.0) slip = (uint16_t)v;
+        }
         swap_result_t r;
         bool ok = swap_request(jf->valuestring, jt->valuestring,
                                 ja->valuedouble, slip, &r);
