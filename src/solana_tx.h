@@ -44,6 +44,50 @@ typedef struct {
 int solana_build_signed_tx_base64(const solana_tx_input_t *in,
                                   char *out, size_t out_cap);
 
+// ---------------------------------------------------------------------------
+// v2 path: generic v0-message builder over an arbitrary list of instructions.
+// Used by the vault_execute path; the v1 entry above stays for swap.c during
+// the Phase 2a-x402 → Phase 2a-swap transition.
+// ---------------------------------------------------------------------------
+
+// Per-account meta inside a single instruction.
+typedef struct {
+    const uint8_t *pubkey;     // 32 bytes, non-owning
+    bool           is_signer;
+    bool           is_writable;
+} solana_ix_account_t;
+
+// One Solana instruction (program ID + per-account metas + opaque data).
+typedef struct {
+    const uint8_t              *program_id;     // 32 bytes
+    const solana_ix_account_t  *accounts;
+    size_t                      account_count;
+    const uint8_t              *data;
+    size_t                      data_len;
+} solana_ix_v2_t;
+
+typedef struct {
+    const uint8_t        *fee_payer;       // 32 bytes (slot-0 signer)
+    const uint8_t        *signer_pubkey;   // 32 bytes — our wallet (slot-1 signer)
+    const uint8_t        *blockhash;       // 32 bytes
+    const solana_ix_v2_t *ixs;
+    size_t                ix_count;
+    uint32_t              cu_limit;
+    uint64_t              cu_price_micro;
+} solana_tx_input_v2_t;
+
+// Same wire shape as solana_build_signed_tx_base64: signed VersionedTransaction
+// (slot-0 sig zeroed for the facilitator to fill, slot-1 sig from our wallet),
+// base64-encoded into `out`. Returns length on success, -1 on overflow / missing
+// input / sign failure.
+//
+// Internally builds the deduped account table (fee_payer + signer first, then
+// all unique pubkeys from the instructions' programs + accounts), classifies
+// signer/writable, derives the v0 header counts, emits the instruction list
+// with per-instruction account indices, signs the message, splices the sig.
+int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
+                              char *out, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

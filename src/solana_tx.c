@@ -214,3 +214,221 @@ int solana_build_signed_tx_base64(const solana_tx_input_t *in,
     out[written] = '\0';
     return (int)written;
 }
+
+// ---------------------------------------------------------------------------
+// v2: generic multi-instruction v0 message builder
+// ---------------------------------------------------------------------------
+
+// Caps the number of distinct accounts a single tx can reference. The vault
+// payment path uses ~10; Jupiter swaps via vault_execute will be ~20-30.
+#define V2_MAX_ACCOUNTS 32
+#define V2_MAX_IXS      8
+#define V2_MSG_BUF      1280   // Solana hard cap is 1232 bytes; keep slack.
+
+typedef struct {
+    uint8_t pubkey[32];
+    bool    is_signer;
+    bool    is_writable;
+} v2_key_t;
+
+// Returns the index of `pk` in keys[], adding it (with the given flags) if
+// missing. ORs the flags on hit so the strictest classification wins. Returns
+// -1 if the table is full.
+static int v2_intern(v2_key_t *keys, size_t *n, const uint8_t pk[32],
+                     bool is_signer, bool is_writable)
+{
+    for (size_t i = 0; i < *n; i++) {
+        if (memcmp(keys[i].pubkey, pk, 32) == 0) {
+            keys[i].is_signer   = keys[i].is_signer   || is_signer;
+            keys[i].is_writable = keys[i].is_writable || is_writable;
+            return (int)i;
+        }
+    }
+    if (*n >= V2_MAX_ACCOUNTS) return -1;
+    memcpy(keys[*n].pubkey, pk, 32);
+    keys[*n].is_signer   = is_signer;
+    keys[*n].is_writable = is_writable;
+    return (int)(*n)++;
+}
+
+// After interning, sort into Solana's required order:
+//     [signed-writable] [signed-readonly] [unsigned-writable] [unsigned-readonly]
+// while keeping fee_payer at index 0 and signer_pubkey at index 1. We do the
+// classification + sort in one pass with a stable-insertion shuffle.
+static void v2_classify_sort(v2_key_t *keys, size_t n) {
+    // Three-pass insertion sort: keep [0] and [1] fixed; sort the tail.
+    // Class rank: 0 = signer+writable, 1 = signer-only, 2 = writable-only, 3 = readonly.
+    // Lower rank goes earlier.
+    if (n < 3) return;
+    for (size_t i = 3; i < n; i++) {
+        v2_key_t cur = keys[i];
+        int cur_rank = (cur.is_signer ? 0 : 2) + (cur.is_writable ? 0 : 1);
+        size_t j = i;
+        while (j > 2) {
+            v2_key_t pv = keys[j - 1];
+            int pv_rank = (pv.is_signer ? 0 : 2) + (pv.is_writable ? 0 : 1);
+            if (pv_rank <= cur_rank) break;
+            keys[j] = pv;
+            j--;
+        }
+        keys[j] = cur;
+    }
+}
+
+// Index of `pk` in the (already-sorted) key table.
+static int v2_index_of(const v2_key_t *keys, size_t n, const uint8_t pk[32]) {
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(keys[i].pubkey, pk, 32) == 0) return (int)i;
+    }
+    return -1;
+}
+
+int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
+                              char *out, size_t out_cap)
+{
+    if (!in || !out || out_cap == 0) return -1;
+    if (!in->fee_payer || !in->signer_pubkey || !in->blockhash) return -1;
+    if (in->ix_count > V2_MAX_IXS) {
+        ESP_LOGE(TAG, "too many instructions (%u > %u)",
+                 (unsigned)in->ix_count, V2_MAX_IXS);
+        return -1;
+    }
+    if (!wallet_can_sign()) {
+        ESP_LOGE(TAG, "wallet has no signing key");
+        return -1;
+    }
+
+    // ---- 1. intern all accounts -----------------------------------------
+    v2_key_t keys[V2_MAX_ACCOUNTS];
+    size_t   nkeys = 0;
+    if (v2_intern(keys, &nkeys, in->fee_payer,     true,  true)  < 0) goto oom;
+    if (v2_intern(keys, &nkeys, in->signer_pubkey, true,  true)  < 0) goto oom;
+
+    // Compute Budget program ID — needed for the SetCU prefix instructions.
+    uint8_t cb_program[32];
+    if (base58_decode(COMPUTE_BUDGET_B58, cb_program, 32) != 32) return -1;
+    if (v2_intern(keys, &nkeys, cb_program, false, false) < 0) goto oom;
+
+    for (size_t i = 0; i < in->ix_count; i++) {
+        const solana_ix_v2_t *ix = &in->ixs[i];
+        if (!ix->program_id) return -1;
+        if (v2_intern(keys, &nkeys, ix->program_id, false, false) < 0) goto oom;
+        for (size_t j = 0; j < ix->account_count; j++) {
+            const solana_ix_account_t *a = &ix->accounts[j];
+            if (!a->pubkey) return -1;
+            if (v2_intern(keys, &nkeys, a->pubkey, a->is_signer, a->is_writable) < 0) goto oom;
+        }
+    }
+
+    // ---- 2. order keys --------------------------------------------------
+    v2_classify_sort(keys, nkeys);
+
+    // ---- 3. derive header counts ----------------------------------------
+    uint8_t num_required_sigs    = 0;
+    uint8_t num_readonly_signed  = 0;
+    uint8_t num_readonly_unsigned = 0;
+    for (size_t i = 0; i < nkeys; i++) {
+        if (keys[i].is_signer) {
+            num_required_sigs++;
+            if (!keys[i].is_writable) num_readonly_signed++;
+        } else {
+            if (!keys[i].is_writable) num_readonly_unsigned++;
+        }
+    }
+
+    // ---- 4. emit message ------------------------------------------------
+    uint8_t msg[V2_MSG_BUF];
+    wc_t w = { .buf = msg, .cap = sizeof msg };
+
+    wc_u8(&w, 0x80);                            // v0 marker
+    wc_u8(&w, num_required_sigs);
+    wc_u8(&w, num_readonly_signed);
+    wc_u8(&w, num_readonly_unsigned);
+
+    wc_shortvec(&w, (uint16_t)nkeys);
+    for (size_t i = 0; i < nkeys; i++) wc_bytes(&w, keys[i].pubkey, 32);
+
+    wc_bytes(&w, in->blockhash, 32);
+
+    // 2 prefix CU instructions + ix_count caller instructions.
+    wc_shortvec(&w, (uint16_t)(2 + in->ix_count));
+
+    int cb_idx = v2_index_of(keys, nkeys, cb_program);
+    if (cb_idx < 0) return -1;
+
+    // SetComputeUnitLimit (program_idx, no accounts, [0x02][u32 LE])
+    wc_u8(&w, (uint8_t)cb_idx);
+    wc_shortvec(&w, 0);
+    wc_shortvec(&w, 5);
+    wc_u8(&w, CB_SET_CU_LIMIT);
+    wc_u32_le(&w, in->cu_limit);
+
+    // SetComputeUnitPrice ([0x03][u64 LE])
+    wc_u8(&w, (uint8_t)cb_idx);
+    wc_shortvec(&w, 0);
+    wc_shortvec(&w, 9);
+    wc_u8(&w, CB_SET_CU_PRICE);
+    wc_u64_le(&w, in->cu_price_micro);
+
+    // Caller instructions
+    for (size_t i = 0; i < in->ix_count; i++) {
+        const solana_ix_v2_t *ix = &in->ixs[i];
+        int pidx = v2_index_of(keys, nkeys, ix->program_id);
+        if (pidx < 0) return -1;
+        wc_u8(&w, (uint8_t)pidx);
+        wc_shortvec(&w, (uint16_t)ix->account_count);
+        for (size_t j = 0; j < ix->account_count; j++) {
+            int aidx = v2_index_of(keys, nkeys, ix->accounts[j].pubkey);
+            if (aidx < 0) return -1;
+            wc_u8(&w, (uint8_t)aidx);
+        }
+        wc_shortvec(&w, (uint16_t)ix->data_len);
+        if (ix->data_len) wc_bytes(&w, ix->data, ix->data_len);
+    }
+
+    // No address-table lookups.
+    wc_shortvec(&w, 0);
+
+    if (w.overflow) {
+        ESP_LOGE(TAG, "v2 message overflow");
+        return -1;
+    }
+
+    // ---- 5. sign + assemble VersionedTransaction ------------------------
+    uint8_t sig[64];
+    if (!wallet_sign(msg, w.len, sig)) {
+        ESP_LOGE(TAG, "v2 sign failed");
+        return -1;
+    }
+
+    // tx = sig_count(shortvec) + sig_count*64 zero/sig + message
+    uint8_t tx[1 + V2_MAX_ACCOUNTS * 64 + V2_MSG_BUF];
+    wc_t tw = { .buf = tx, .cap = sizeof tx };
+    wc_shortvec(&tw, num_required_sigs);
+    uint8_t zero_sig[64] = {0};
+    // Slot 0 = fee_payer (zeroed; gateway fills); slot 1 = our signature;
+    // any other signers (we currently never have any) are also zeroed and
+    // would need separate handling.
+    for (uint8_t s = 0; s < num_required_sigs; s++) {
+        if (s == 1) wc_bytes(&tw, sig, 64);
+        else        wc_bytes(&tw, zero_sig, 64);
+    }
+    wc_bytes(&tw, msg, w.len);
+    if (tw.overflow) { ESP_LOGE(TAG, "v2 tx overflow"); return -1; }
+
+    size_t written = 0;
+    int rc = mbedtls_base64_encode((uint8_t *)out, out_cap, &written,
+                                   tw.buf, tw.len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "v2 base64 rc=%d (need %u have %u)",
+                 rc, (unsigned)written, (unsigned)out_cap);
+        return -1;
+    }
+    if (written >= out_cap) return -1;
+    out[written] = '\0';
+    return (int)written;
+
+oom:
+    ESP_LOGE(TAG, "account table full (%u keys)", V2_MAX_ACCOUNTS);
+    return -1;
+}
