@@ -38,6 +38,7 @@
 // the only caller that needs to see all of these together, so we intentionally
 // fan-in the dependencies here rather than in a public header.
 #include "ai.h"
+#include "swap.h"
 #include "ui.h"
 #include "wallet.h"
 #include "wifi_sta.h"
@@ -442,6 +443,17 @@ static void dispatch_line(const char *line) {
         const char *args;
         if ((args = match_token(rest, "CALL"))) { handle_x402_call(args); return; }
         resp_err("x402 bad_subverb");
+        return;
+    }
+
+    // --- SWAP_RESOLVE <sym>  →  TEST OK <mint>:<decimals> | TEST ERR unresolved
+    if ((rest = match_token(after_test, "SWAP_RESOLVE"))) {
+        char buf[64];
+        if (swap_resolve_for_test(rest, buf, sizeof(buf))) {
+            resp_ok(buf);
+        } else {
+            resp_err("unresolved");
+        }
         return;
     }
 

@@ -52,6 +52,10 @@ bool swap_request(const char *from_sym,
                   uint16_t    slippage_bps,
                   swap_result_t *out);
 
+// Diagnostic — used by the test harness only. Returns true iff `sym`
+// resolves; on success writes "<mint>:<decimals>" into `out`.
+bool swap_resolve_for_test(const char *sym, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
