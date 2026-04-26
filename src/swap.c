@@ -40,7 +40,9 @@ typedef struct {
 // wallet's most recent SPL holdings (first match wins on duplicate symbols).
 // Returns false if not resolvable.
 static bool resolve_token(const char *sym, swap_token_t *out) {
-    if (!sym || !out) return false;
+    // Reject empty sym: a wallet entry that hasn't been hydrated yet has
+    // symbol[0] == '\0', and an empty input would falsely match it.
+    if (!sym || !*sym || !out) return false;
     memset(out, 0, sizeof(*out));
 
     if (strcasecmp(sym, "SOL") == 0) {
@@ -71,6 +73,7 @@ static bool resolve_token(const char *sym, swap_token_t *out) {
 }
 
 bool swap_resolve_for_test(const char *sym, char *out, size_t cap) {
+    if (!out || cap == 0) return false;
     swap_token_t t;
     if (!resolve_token(sym, &t)) return false;
     snprintf(out, cap, "%s:%u", t.mint, (unsigned)t.decimals);
