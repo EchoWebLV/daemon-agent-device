@@ -410,7 +410,10 @@ bool swap_request(const char *from_sym,
     ui.amount_out   = amount_out;
     ui.min_out      = min_out;
     ui.slippage_bps = slip;
-    // Conservative fee estimate.
+    // Conservative fee estimate for the approval modal:
+    //   0.000005     = 5000-lamport priority floor (matches /swap request)
+    //   0.000000001  = 1-lamport base signature fee (single signer)
+    //   0.00203928   = ATA rent-exempt minimum, only if dest mint isn't held yet
     bool dest_has_ata = false;
     if (strcmp(b.sym, "SOL") == 0) {
         dest_has_ata = true;
