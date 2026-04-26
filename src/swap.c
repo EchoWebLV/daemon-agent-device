@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 #include "swap.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,7 +77,7 @@ static bool resolve_token(const char *sym, swap_token_t *out) {
 // of the symbol resolved by `t`. SPL holdings are matched by mint, not
 // symbol — handles the "two tokens with the same ticker" case correctly.
 static bool __attribute__((unused)) has_balance(const swap_token_t *t, double amount_ui) {
-    if (!t) return false;
+    if (!t || !isfinite(amount_ui) || amount_ui < 0.0) return false;
     if (strcmp(t->sym, "SOL") == 0) {
         return wallet_sol_balance() >= amount_ui;
     }
