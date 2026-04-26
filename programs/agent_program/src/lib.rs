@@ -66,6 +66,19 @@ pub mod agent_program {
         invoke_signed(&ix, ctx.remaining_accounts, &[signer_seeds])?;
         Ok(())
     }
+
+    pub fn vault_rotate_signer(ctx: Context<VaultRotateSigner>, new_signer: Pubkey) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        require_keys_eq!(
+            ctx.accounts.recovery_authority.key(),
+            vault.recovery_authority,
+            AgentError::NotRecoveryAuthority
+        );
+        vault.current_signer = new_signer;
+        vault.signer_rotated_at = Clock::get()?.unix_timestamp;
+        msg!("vault rotated; new_signer={}", new_signer);
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -92,6 +105,18 @@ pub struct VaultExecute<'info> {
     pub vault: Account<'info, Vault>,
 
     pub current_signer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VaultRotateSigner<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", vault.agent_root.as_ref()],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, Vault>,
+
+    pub recovery_authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
