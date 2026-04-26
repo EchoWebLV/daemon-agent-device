@@ -1,5 +1,11 @@
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import {
+  PublicKey,
+  Keypair,
+  SystemProgram,
+  Transaction,
+  SystemProgram as SP,
+} from "@solana/web3.js";
 
 export const PROGRAM_ID = new PublicKey(
   // overwritten by anchor.workspace.AgentProgram.programId at runtime;
@@ -21,11 +27,23 @@ export function deriveVault(agentRoot: PublicKey, programId: PublicKey) {
   );
 }
 
+/**
+ * Fund a public key by transferring lamports from the AnchorProvider wallet.
+ * Uses a system-program transfer instead of requestAirdrop, which is broken
+ * on solana-test-validator 2.3.x.
+ */
 export async function fundLamports(
   conn: anchor.web3.Connection,
   to: PublicKey,
   lamports: number
 ) {
-  const sig = await conn.requestAirdrop(to, lamports);
-  await conn.confirmTransaction(sig, "confirmed");
+  const provider = anchor.AnchorProvider.env();
+  const tx = new Transaction().add(
+    SP.transfer({
+      fromPubkey: provider.wallet.publicKey,
+      toPubkey: to,
+      lamports,
+    })
+  );
+  await provider.sendAndConfirm(tx);
 }
