@@ -35,6 +35,9 @@
 
 static const char *TAG = "swap";
 static double swap_pow10(uint8_t n);
+static int sign_v0_tx_in_place(const char *in_b64, char *out_b64, size_t out_cap);
+static bool rpc_send_tx(const char *signed_tx_b64, char *txid_out, size_t cap);
+static bool rpc_wait_for_confirm(const char *txid);
 
 // Jupiter response sizes. Quote response is a few KB of routing detail;
 // 6 KB is comfortable headroom. Swap response inflates with multi-hop
@@ -192,7 +195,7 @@ static bool resolve_token(const char *sym, swap_token_t *out) {
 // Returns true if the wallet snapshot says we hold at least `amount_ui`
 // of the symbol resolved by `t`. SPL holdings are matched by mint, not
 // symbol — handles the "two tokens with the same ticker" case correctly.
-static bool __attribute__((unused)) has_balance(const swap_token_t *t, double amount_ui) {
+static bool has_balance(const swap_token_t *t, double amount_ui) {
     if (!t || !isfinite(amount_ui) || amount_ui < 0.0) return false;
     if (strcmp(t->sym, "SOL") == 0) {
         return wallet_sol_balance() >= amount_ui;
@@ -213,13 +216,13 @@ static bool __attribute__((unused)) has_balance(const swap_token_t *t, double am
 
 // Slippage defaults: 50 bps for SOL/USDC, 100 bps for any pair involving
 // an SPL. Caller-supplied values outside [10, 500] fall back to default.
-static uint16_t __attribute__((unused)) default_slippage(const swap_token_t *a, const swap_token_t *b) {
+static uint16_t default_slippage(const swap_token_t *a, const swap_token_t *b) {
     bool a_major = (strcmp(a->sym, "SOL") == 0 || strcmp(a->sym, "USDC") == 0);
     bool b_major = (strcmp(b->sym, "SOL") == 0 || strcmp(b->sym, "USDC") == 0);
     return (a_major && b_major) ? 50 : 100;
 }
 
-static uint16_t __attribute__((unused)) clamp_slippage(uint16_t requested, uint16_t fallback) {
+static uint16_t clamp_slippage(uint16_t requested, uint16_t fallback) {
     if (requested == 0)                        return fallback;
     if (requested < 10 || requested > 500)     return fallback;
     return requested;
@@ -237,7 +240,7 @@ typedef struct {
     char    *quote_json;       // heap, free()
 } jup_quote_t;
 
-static bool __attribute__((unused)) jup_get_quote(const swap_token_t *from, const swap_token_t *to,
+static bool jup_get_quote(const swap_token_t *from, const swap_token_t *to,
                           double amount_ui, uint16_t slippage_bps,
                           jup_quote_t *out) {
     memset(out, 0, sizeof(*out));
@@ -288,7 +291,7 @@ typedef struct {
     uint64_t priority_lamports;  // server may inflate from our requested 1
 } jup_swap_t;
 
-static bool __attribute__((unused)) jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
+static bool jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
                            jup_swap_t *out) {
     memset(out, 0, sizeof(*out));
     // Bound the user_pubkey before splicing into the JSON body. A real
@@ -355,18 +358,127 @@ bool swap_resolve_for_test(const char *sym, char *out, size_t cap) {
     return true;
 }
 
+static volatile bool s_in_progress = false;
+
 bool swap_request(const char *from_sym,
                   const char *to_sym,
                   double      amount_ui,
                   uint16_t    slippage_bps,
                   swap_result_t *out) {
-    (void)from_sym; (void)to_sym; (void)amount_ui; (void)slippage_bps;
     if (!out) return false;
     memset(out, 0, sizeof(*out));
-    out->status = SWAP_ERR_QUOTE;
-    strlcpy(out->error_msg, "not_implemented", sizeof(out->error_msg));
-    ESP_LOGW(TAG, "swap_request stub — not implemented yet");
-    return false;
+    if (from_sym) strlcpy(out->from_sym, from_sym, sizeof(out->from_sym));
+    if (to_sym)   strlcpy(out->to_sym,   to_sym,   sizeof(out->to_sym));
+    out->amount_in = amount_ui;
+
+    if (s_in_progress) {
+        out->status = SWAP_ERR_IN_PROGRESS;
+        strlcpy(out->error_msg, "swap_in_progress", sizeof(out->error_msg));
+        return false;
+    }
+    s_in_progress = true;
+
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        out->status = SWAP_ERR_QUOTE;
+        strlcpy(out->error_msg, "unknown_symbol", sizeof(out->error_msg));
+        s_in_progress = false; return false;
+    }
+    if (!has_balance(&a, amount_ui)) {
+        out->status = SWAP_ERR_INSUFFICIENT;
+        strlcpy(out->error_msg, "insufficient_balance", sizeof(out->error_msg));
+        s_in_progress = false; return false;
+    }
+
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        out->status = SWAP_ERR_QUOTE;
+        strlcpy(out->error_msg, "quote_failed", sizeof(out->error_msg));
+        s_in_progress = false; return false;
+    }
+
+    double scale_out  = swap_pow10(b.decimals);
+    double amount_out = (double)q.out_atomic    / scale_out;
+    double min_out    = (double)q.min_out_atomic / scale_out;
+
+    swap_screen_args_t ui = {0};
+    strlcpy(ui.from_sym, a.sym, sizeof(ui.from_sym));
+    strlcpy(ui.to_sym,   b.sym, sizeof(ui.to_sym));
+    ui.amount_in    = amount_ui;
+    ui.amount_out   = amount_out;
+    ui.min_out      = min_out;
+    ui.slippage_bps = slip;
+    // Conservative fee estimate.
+    bool dest_has_ata = false;
+    if (strcmp(b.sym, "SOL") == 0) {
+        dest_has_ata = true;
+    } else {
+        const token_holding_t *toks = NULL; size_t n = 0;
+        wallet_tokens(&toks, &n);
+        for (size_t i = 0; i < n; ++i) {
+            if (strcmp(toks[i].mint, b.mint) == 0) { dest_has_ata = true; break; }
+        }
+    }
+    ui.fee_sol = 0.000005 + 0.000000001 + (dest_has_ata ? 0.0 : 0.00203928);
+
+    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    if (!sem) {
+        out->status = SWAP_ERR_QUOTE;
+        strlcpy(out->error_msg, "no_sem", sizeof(out->error_msg));
+        free(q.quote_json); s_in_progress = false; return false;
+    }
+    swap_ui_result_t ui_result = SWAP_UI_CANCEL_TIMEOUT;
+    swap_screen_open(&ui, sem, &ui_result);
+    xSemaphoreTake(sem, portMAX_DELAY);
+    vSemaphoreDelete(sem);
+
+    if (ui_result != SWAP_UI_CONFIRM) {
+        out->status = SWAP_ERR_CANCELLED;
+        strlcpy(out->error_msg, "cancelled", sizeof(out->error_msg));
+        free(q.quote_json); s_in_progress = false; return false;
+    }
+
+    jup_swap_t s;
+    if (!jup_build_swap(&q, wallet_pubkey(), &s)) {
+        out->status = SWAP_ERR_BUILD;
+        strlcpy(out->error_msg, "build_failed", sizeof(out->error_msg));
+        free(q.quote_json); s_in_progress = false; return false;
+    }
+    free(q.quote_json);
+
+    char *signed_b64 = malloc(SWAP_TX_B64_CAP);
+    if (!signed_b64) {
+        out->status = SWAP_ERR_BUILD;
+        strlcpy(out->error_msg, "oom", sizeof(out->error_msg));
+        free(s.tx_b64); s_in_progress = false; return false;
+    }
+    if (sign_v0_tx_in_place(s.tx_b64, signed_b64, SWAP_TX_B64_CAP) != 0) {
+        out->status = SWAP_ERR_BUILD;
+        strlcpy(out->error_msg, "sign_failed", sizeof(out->error_msg));
+        free(signed_b64); free(s.tx_b64); s_in_progress = false; return false;
+    }
+    free(s.tx_b64);
+
+    if (!rpc_send_tx(signed_b64, out->txid, sizeof(out->txid))) {
+        out->status = SWAP_ERR_SUBMIT;
+        strlcpy(out->error_msg, "submit_failed", sizeof(out->error_msg));
+        free(signed_b64); s_in_progress = false; return false;
+    }
+    free(signed_b64);
+
+    if (!rpc_wait_for_confirm(out->txid)) {
+        out->status = SWAP_ERR_UNCONFIRMED;
+        strlcpy(out->error_msg, "unconfirmed", sizeof(out->error_msg));
+        s_in_progress = false; return false;
+    }
+
+    out->status     = SWAP_OK;
+    out->amount_out = amount_out;
+    wallet_request_refresh();
+    s_in_progress = false;
+    return true;
 }
 
 const char *swap_show_demo_for_test(void) {
@@ -516,7 +628,7 @@ int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap) {
 
 // sendTransaction with encoding=base64. Returns true and writes txid (base58)
 // on success.
-static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char *txid_out, size_t cap) {
+static bool rpc_send_tx(const char *signed_tx_b64, char *txid_out, size_t cap) {
     size_t req_cap = strlen(signed_tx_b64) + 256;
     char *req = malloc(req_cap);
     if (!req) return false;
@@ -558,7 +670,7 @@ static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char 
 
 // Polls getSignatureStatuses every 800 ms up to 30 s. Returns true once
 // the tx has a non-null status; false on timeout.
-static bool __attribute__((unused)) rpc_wait_for_confirm(const char *txid) {
+static bool rpc_wait_for_confirm(const char *txid) {
     ESP_LOGI(TAG, "wait confirm %.16s...", txid ? txid : "(null)");
     char url[160];
     wallet_rpc_url(url, sizeof(url));
