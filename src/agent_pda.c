@@ -9,13 +9,11 @@
 // ---------------------------------------------------------------------------
 #include "agent_pda.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "ed25519.h"
-#include "esp_log.h"
 #include "mbedtls/sha256.h"
-
-static const char *TAG = "agent_pda";
 
 // Solana sentinel appended after seeds during PDA derivation; off-curve
 // points produced this way can't be confused with a regular pubkey.
@@ -84,6 +82,25 @@ int agent_pda_derive_vault(const uint8_t agent_root[32], uint8_t out_vault[32]) 
     return find_pda(seeds, seed_lens, 2, out_vault);
 }
 
+// Anchor instruction discriminator: first 8 bytes of sha256("global:<name>").
+// Cross-checked against `crypto.createHash("sha256").update("global:vault_execute")`
+// which yields b2c50da8 9714ae28.
+static void anchor_discriminator(const char *name, uint8_t out[8]) {
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "global:%s", name);
+    uint8_t hash[32];
+    mbedtls_sha256((const uint8_t *)buf, (size_t)n, hash, 0);
+    memcpy(out, hash, 8);
+}
+
+// Borsh-Vec encoded little-endian length prefix (4 bytes).
+static inline void put_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
 int agent_pda_build_vault_execute_ix(
     const uint8_t vault_pubkey[32],
     const uint8_t current_signer[32],
@@ -98,12 +115,68 @@ int agent_pda_build_vault_execute_ix(
     size_t *out_meta_count,
     size_t out_meta_cap)
 {
-    (void)vault_pubkey; (void)current_signer; (void)inner_program_id;
-    (void)inner_metas; (void)inner_meta_count;
-    (void)inner_data; (void)inner_data_len;
-    (void)out_ix_data; (void)out_ix_cap;
-    (void)out_metas; (void)out_meta_count; (void)out_meta_cap;
-    ESP_LOGE(TAG, "agent_pda_build_vault_execute_ix: NOT IMPLEMENTED (Task 4)");
-    return -1;
+    if (!vault_pubkey || !current_signer || !inner_program_id) return -1;
+    if (inner_meta_count > 0 && !inner_metas) return -1;
+    if (inner_data_len > 0 && !inner_data) return -1;
+    if (inner_meta_count > 64)               return -1;   // sanity
+    if (inner_data_len   > 1024)             return -1;   // sanity
+
+    // ---- ix data: [discriminator(8)][InnerIx Borsh] -----------------------
+    //   InnerIx { program_id: Pubkey, accounts: Vec<Meta>, data: Vec<u8> }
+    //   Meta    { pubkey: Pubkey, is_signer: bool, is_writable: bool }
+    uint8_t       *p   = out_ix_data;
+    uint8_t       *end = out_ix_data + out_ix_cap;
+
+    if ((size_t)(end - p) < 8) return -1;
+    anchor_discriminator("vault_execute", p);
+    p += 8;
+
+    if ((size_t)(end - p) < 32) return -1;
+    memcpy(p, inner_program_id, 32);
+    p += 32;
+
+    if ((size_t)(end - p) < 4 + inner_meta_count * 34u) return -1;
+    put_u32_le(p, (uint32_t)inner_meta_count);
+    p += 4;
+    for (size_t i = 0; i < inner_meta_count; i++) {
+        memcpy(p, inner_metas[i].pubkey, 32); p += 32;
+        *p++ = inner_metas[i].is_signer   ? 1 : 0;
+        *p++ = inner_metas[i].is_writable ? 1 : 0;
+    }
+
+    if ((size_t)(end - p) < 4 + inner_data_len) return -1;
+    put_u32_le(p, (uint32_t)inner_data_len);
+    p += 4;
+    if (inner_data_len) {
+        memcpy(p, inner_data, inner_data_len);
+        p += inner_data_len;
+    }
+
+    int ix_data_len = (int)(p - out_ix_data);
+
+    // ---- account metas for the OUTER vault_execute ------------------------
+    //   [0]  vault          (writable, NOT signer at outer level — PDA)
+    //   [1]  current_signer (signer)
+    //   [2..N+1]  inner ix's accounts (signer flag stripped — PDA signs them
+    //            via CPI seeds inside the program; writable carried through)
+    //   [N+2]  inner program account (read-only)
+    if (!out_metas || !out_meta_count) return -1;
+    size_t need = 2 + inner_meta_count + 1;
+    if (need > out_meta_cap) return -1;
+
+    size_t k = 0;
+    out_metas[k++] = (agent_meta_t){ .pubkey = vault_pubkey,    .is_signer = false, .is_writable = true  };
+    out_metas[k++] = (agent_meta_t){ .pubkey = current_signer,  .is_signer = true,  .is_writable = false };
+    for (size_t i = 0; i < inner_meta_count; i++) {
+        out_metas[k++] = (agent_meta_t){
+            .pubkey      = inner_metas[i].pubkey,
+            .is_signer   = false,
+            .is_writable = inner_metas[i].is_writable,
+        };
+    }
+    out_metas[k++] = (agent_meta_t){ .pubkey = inner_program_id, .is_signer = false, .is_writable = false };
+    *out_meta_count = k;
+
+    return ix_data_len;
 }
 

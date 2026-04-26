@@ -320,6 +320,28 @@ static void handle_vault_pda(void) {
     resp_ok(buf);
 }
 
+// Encodes an empty vault_execute payload to expose the Anchor discriminator
+// in hex. Must match sha256("global:vault_execute")[0..8] = b2c50da89714ae28.
+static void handle_vault_disc(void) {
+    uint8_t buf[256];
+    agent_meta_t metas[4];
+    size_t mc = 0;
+    uint8_t zeroes[32] = {0};
+    int n = agent_pda_build_vault_execute_ix(
+        zeroes, zeroes, zeroes,
+        NULL, 0, NULL, 0,
+        buf, sizeof buf, metas, &mc, sizeof metas / sizeof metas[0]);
+    if (n < 8) { resp_err("disc encode_failed"); return; }
+    char hex[32];
+    snprintf(hex, sizeof hex,
+             "%02x%02x%02x%02x%02x%02x%02x%02x",
+             buf[0], buf[1], buf[2], buf[3],
+             buf[4], buf[5], buf[6], buf[7]);
+    char out[64];
+    snprintf(out, sizeof out, "disc %s", hex);
+    resp_ok(out);
+}
+
 static void handle_wallet_balance(void) {
     // Force a fresh two-call RPC round-trip so the host isn't reading a
     // minute-old cache. wallet_refresh() blocks; that's fine — the harness
@@ -455,9 +477,10 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- VAULT PDA --- (Phase 2a-x402)
+    // --- VAULT PDA / VAULT DISC --- (Phase 2a-x402)
     if ((rest = match_token(after_test, "VAULT"))) {
-        if (match_token(rest, "PDA")) { handle_vault_pda(); return; }
+        if (match_token(rest, "PDA"))  { handle_vault_pda();  return; }
+        if (match_token(rest, "DISC")) { handle_vault_disc(); return; }
         resp_err("vault bad_subverb");
         return;
     }
