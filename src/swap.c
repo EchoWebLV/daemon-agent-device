@@ -25,7 +25,9 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
+#include "mbedtls/base64.h"
 
+#include "ed25519.h"
 #include "swap_screen.h"
 #include "wallet.h"
 #include "wifi_sta.h"
@@ -39,6 +41,29 @@ static double swap_pow10(uint8_t n);
 // swaps. We reject anything larger as SWAP_ERR_BUILD.
 #define JUP_QUOTE_RSP_CAP 6144
 #define JUP_SWAP_RSP_CAP  12288
+
+// v0 transaction buffer sizes. Jupiter swap wire txs are typically ~1.2 KB;
+// 4 KB raw + 8 KB base64 covers everything observed in practice.
+#define SWAP_TX_RAW_CAP   4096
+#define SWAP_TX_B64_CAP   8192
+
+// compact-u16 (Solana's "shortvec"): 1-3 bytes, low 7 bits of each byte are
+// data, MSB indicates continuation. Returns false if the buffer is exhausted
+// or all 3 bytes have the continuation bit set (malformed).
+static bool compact_u16_read(const uint8_t *buf, size_t cap,
+                             size_t *cursor, uint16_t *out) {
+    uint16_t v = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (*cursor >= cap) return false;
+        uint8_t b = buf[(*cursor)++];
+        v |= ((uint16_t)(b & 0x7F)) << (7 * i);
+        if ((b & 0x80) == 0) {
+            *out = v;
+            return true;
+        }
+    }
+    return false;
+}
 
 typedef struct { char *buf; size_t cap; size_t len; bool overflowed; } http_body_t;
 
@@ -360,4 +385,122 @@ const char *swap_show_demo_for_test(void) {
     vSemaphoreDelete(sem);
     if (r >= 0 && r < (int)(sizeof(S)/sizeof(S[0]))) return S[r];
     return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// v0 transaction signing
+// ---------------------------------------------------------------------------
+
+// Decode a base64 v0 versioned tx, locate the message bytes and the
+// signature slot owned by our wallet, sign the message via wallet_sign(),
+// and write the 64-byte signature into that slot. Re-encodes back to
+// base64 in `out_b64` (NUL-terminated). Returns 0 on success, negative
+// on any failure.
+//
+// Wire layout parsed:
+//   [ compact-u16: numRequiredSignatures ]
+//   [ numRequiredSignatures × 64-byte signature slots ]
+//   [ message:
+//       [ 1B prefix 0x80 ] [ 1B numRequiredSignatures ]
+//       [ 1B numReadonlySigned ] [ 1B numReadonlyUnsigned ]
+//       [ compact-u16: numStaticAccountKeys ]
+//       [ numStaticAccountKeys × 32-byte pubkeys ]  ← signers are first n slots
+//       ... rest of message
+//   ]
+static int sign_v0_tx_in_place(const char *in_b64, char *out_b64, size_t out_cap) {
+    size_t in_b64_len = strlen(in_b64);
+    uint8_t *raw = malloc(SWAP_TX_RAW_CAP);
+    if (!raw) return -1;
+    size_t raw_len = 0;
+    int rc = mbedtls_base64_decode(raw, SWAP_TX_RAW_CAP, &raw_len,
+                                    (const uint8_t *)in_b64, in_b64_len);
+    if (rc != 0) { free(raw); ESP_LOGW(TAG, "tx b64 decode rc=%d", rc); return -1; }
+
+    size_t cursor = 0;
+    uint16_t num_sigs = 0;
+    if (!compact_u16_read(raw, raw_len, &cursor, &num_sigs)) { free(raw); return -1; }
+    if (num_sigs == 0 || num_sigs > 8)                       { free(raw); return -1; }
+    size_t sigs_off = cursor;
+    size_t msg_off  = sigs_off + (size_t)num_sigs * 64;
+    if (msg_off >= raw_len)                                   { free(raw); return -1; }
+
+    // Read message header: 1B prefix, 1B numReqSig, 1B numRoSig, 1B numRoUnsig
+    if (msg_off + 4 >= raw_len) { free(raw); return -1; }
+    cursor = msg_off + 4;
+    uint16_t num_keys = 0;
+    if (!compact_u16_read(raw, raw_len, &cursor, &num_keys)) { free(raw); return -1; }
+    size_t keys_off = cursor;
+    if (keys_off + (size_t)num_keys * 32 > raw_len)           { free(raw); return -1; }
+
+    const uint8_t *mypub = wallet_pubkey_bytes();
+    if (!mypub) { free(raw); return -1; }
+    int slot = -1;
+    for (uint16_t i = 0; i < num_sigs; ++i) {
+        if (memcmp(raw + keys_off + (size_t)i * 32, mypub, 32) == 0) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        ESP_LOGW(TAG, "our pubkey not found in first %u signers", num_sigs);
+        free(raw);
+        return -1;
+    }
+
+    uint8_t sig[64];
+    if (!wallet_sign(raw + msg_off, raw_len - msg_off, sig)) {
+        free(raw); return -1;
+    }
+    memcpy(raw + sigs_off + (size_t)slot * 64, sig, 64);
+
+    size_t enc_len = 0;
+    rc = mbedtls_base64_encode((uint8_t *)out_b64, out_cap, &enc_len,
+                               raw, raw_len);
+    free(raw);
+    if (rc != 0) { ESP_LOGW(TAG, "tx b64 encode rc=%d", rc); return -1; }
+    if (enc_len >= out_cap) return -1;
+    out_b64[enc_len] = '\0';
+    return 0;
+}
+
+// Diagnostic: sign the tx, then decode the result and verify the signature
+// at our slot validates against the message bytes. Returns 0 on success,
+// negative on failure (distinct codes for debugging).
+int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap) {
+    if (sign_v0_tx_in_place(in_b64, out_b64, cap) != 0) return -1;
+
+    // Decode again and verify the signature at our slot.
+    size_t b64_len = strlen(out_b64);
+    uint8_t *raw = malloc(SWAP_TX_RAW_CAP);
+    if (!raw) return -2;
+    size_t raw_len = 0;
+    if (mbedtls_base64_decode(raw, SWAP_TX_RAW_CAP, &raw_len,
+                              (const uint8_t *)out_b64, b64_len) != 0) {
+        free(raw); return -3;
+    }
+    size_t cursor = 0;
+    uint16_t num_sigs = 0;
+    compact_u16_read(raw, raw_len, &cursor, &num_sigs);
+    size_t sigs_off = cursor;
+    size_t msg_off  = sigs_off + (size_t)num_sigs * 64;
+    cursor = msg_off + 4;
+    uint16_t num_keys = 0;
+    compact_u16_read(raw, raw_len, &cursor, &num_keys);
+    size_t keys_off = cursor;
+
+    const uint8_t *mypub = wallet_pubkey_bytes();
+    if (!mypub) { free(raw); return -4; }
+    int slot = -1;
+    for (uint16_t i = 0; i < num_sigs; ++i) {
+        if (memcmp(raw + keys_off + (size_t)i * 32, mypub, 32) == 0) {
+            slot = (int)i; break;
+        }
+    }
+    if (slot < 0) { free(raw); return -4; }
+
+    int ok = ed25519_verify(raw + sigs_off + (size_t)slot * 64,
+                            raw + msg_off, raw_len - msg_off,
+                            mypub);
+    free(raw);
+    return ok ? 0 : -5;
 }

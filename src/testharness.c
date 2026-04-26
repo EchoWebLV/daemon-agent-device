@@ -446,20 +446,42 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- SWAP_RESOLVE <sym>  →  TEST OK <mint>:<decimals> | TEST ERR unresolved
-    if ((rest = match_token(after_test, "SWAP_RESOLVE"))) {
-        char buf[64];
-        if (swap_resolve_for_test(rest, buf, sizeof(buf))) {
-            resp_ok(buf);
-        } else {
-            resp_err("unresolved");
+    // --- SWAP RESOLVE <sym> | SWAP DEMO | SWAP SIG <b64> -------------------
+    if ((rest = match_token(after_test, "SWAP"))) {
+        // RESOLVE <sym>  →  TEST OK <mint>:<decimals> | TEST ERR unresolved
+        const char *args;
+        if ((args = match_token(rest, "RESOLVE"))) {
+            char buf[64];
+            if (swap_resolve_for_test(args, buf, sizeof(buf))) {
+                resp_ok(buf);
+            } else {
+                resp_err("unresolved");
+            }
+            return;
         }
-        return;
-    }
-
-    // SWAP_DEMO  →  TEST OK confirm | cancel_release | cancel_swipe | cancel_timeout
-    if ((rest = match_token(after_test, "SWAP_DEMO"))) {
-        resp_ok(swap_show_demo_for_test());
+        // DEMO  →  TEST OK confirm | cancel_release | cancel_swipe | cancel_timeout
+        if (match_token(rest, "DEMO")) {
+            resp_ok(swap_show_demo_for_test());
+            return;
+        }
+        // SIG <b64-unsigned-v0-tx>  →  TEST OK signed | TEST ERR rc=<n>
+        // Output buffer sized for SWAP_TX_B64_CAP (8192) — enough for any
+        // Jupiter v6 single-tx swap we have observed.
+        if ((args = match_token(rest, "SIG"))) {
+            char *out = malloc(8192);
+            if (!out) { resp_err("oom"); return; }
+            int rc = swap_test_sig_for_test(args, out, 8192);
+            if (rc == 0) {
+                resp_ok("signed");
+            } else {
+                char m[32];
+                snprintf(m, sizeof(m), "rc=%d", rc);
+                resp_err(m);
+            }
+            free(out);
+            return;
+        }
+        resp_err("swap bad_subverb");
         return;
     }
 

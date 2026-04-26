@@ -14,6 +14,7 @@ idf_component_register(
         "src/sc.c"
         "src/sha512.c"
         "src/sign.c"
+        "src/verify.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

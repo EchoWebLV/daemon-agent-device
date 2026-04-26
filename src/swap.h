@@ -60,6 +60,12 @@ bool swap_resolve_for_test(const char *sym, char *out, size_t cap);
 // reports the resolution. Used by the host harness only.
 const char *swap_show_demo_for_test(void);
 
+// Diagnostic: take an unsigned base64 v0 tx, run the signature splice,
+// and verify the output decodes and the signature at our slot validates
+// against the message bytes. Returns 0 on success, negative on failure.
+// Used by the test harness only (TEST SWAP SIG <b64>).
+int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
