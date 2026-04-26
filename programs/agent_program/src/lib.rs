@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
 use anchor_lang::solana_program::program::invoke_signed;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 
 pub mod error;
 pub mod state;
@@ -79,6 +80,56 @@ pub mod agent_program {
         msg!("vault rotated; new_signer={}", new_signer);
         Ok(())
     }
+
+    pub fn vault_sweep(ctx: Context<VaultSweep>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.recovery_authority.key(),
+            ctx.accounts.vault.recovery_authority,
+            AgentError::NotRecoveryAuthority
+        );
+
+        let vault_info = ctx.accounts.vault.to_account_info();
+        let dest_info = ctx.accounts.destination.to_account_info();
+
+        let rent_min = Rent::get()?.minimum_balance(vault_info.data_len());
+        let movable = vault_info.lamports().saturating_sub(rent_min);
+        require!(movable > 0, AgentError::NothingToSweep);
+
+        **vault_info.try_borrow_mut_lamports()? -= movable;
+        **dest_info.try_borrow_mut_lamports()? += movable;
+
+        msg!("swept {} lamports → {}", movable, ctx.accounts.destination.key());
+        Ok(())
+    }
+
+    pub fn vault_sweep_token(ctx: Context<VaultSweepToken>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.recovery_authority.key(),
+            ctx.accounts.vault.recovery_authority,
+            AgentError::NotRecoveryAuthority
+        );
+
+        let amount = ctx.accounts.vault_ata.amount;
+        let decimals = ctx.accounts.mint.decimals;
+
+        let agent_root = ctx.accounts.vault.agent_root;
+        let bump = ctx.accounts.vault.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", agent_root.as_ref(), &[bump]]];
+
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.vault_ata.to_account_info(),
+            mint: ctx.accounts.mint.to_account_info(),
+            to: ctx.accounts.destination_ata.to_account_info(),
+            authority: ctx.accounts.vault.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer_seeds,
+        );
+        token::transfer_checked(cpi_ctx, amount, decimals)?;
+        Ok(())
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -116,6 +167,42 @@ pub struct VaultRotateSigner<'info> {
     )]
     pub vault: Account<'info, Vault>,
 
+    pub recovery_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VaultSweep<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", vault.agent_root.as_ref()],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, Vault>,
+
+    /// CHECK: arbitrary destination chosen by recovery_authority
+    #[account(mut)]
+    pub destination: AccountInfo<'info>,
+
+    pub recovery_authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct VaultSweepToken<'info> {
+    #[account(
+        seeds = [b"vault", vault.agent_root.as_ref()],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut, token::authority = vault, token::mint = mint)]
+    pub vault_ata: Account<'info, TokenAccount>,
+
+    #[account(mut, token::mint = mint)]
+    pub destination_ata: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
     pub recovery_authority: Signer<'info>,
 }
 

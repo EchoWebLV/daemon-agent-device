@@ -268,4 +268,109 @@ describe("agent_program", () => {
     }
     expect(threw).to.equal(true);
   });
+
+  it("vault_sweep: recovery_authority drains SOL above rent-min", async () => {
+    const owner = Keypair.generate();
+    const device = Keypair.generate();
+    const dest = Keypair.generate();
+    await fundLamports(provider.connection, owner.publicKey, 2 * LAMPORTS_PER_SOL);
+
+    const [agentRoot] = deriveAgentRoot(owner.publicKey, program.programId);
+    const [vault] = deriveVault(agentRoot, program.programId);
+
+    await program.methods
+      .initializeAgent(device.publicKey)
+      .accounts({ owner: owner.publicKey, agentRoot, vault, systemProgram: SystemProgram.programId })
+      .signers([owner])
+      .rpc();
+
+    await fundLamports(provider.connection, vault, 1.0 * LAMPORTS_PER_SOL);
+
+    const beforeDest = await provider.connection.getBalance(dest.publicKey);
+    await program.methods
+      .vaultSweep()
+      .accounts({ vault, destination: dest.publicKey, recoveryAuthority: owner.publicKey })
+      .signers([owner])
+      .rpc();
+    const afterDest = await provider.connection.getBalance(dest.publicKey);
+
+    const moved = afterDest - beforeDest;
+    expect(moved).to.be.greaterThan(0.9 * LAMPORTS_PER_SOL);
+
+    // Vault account retains exactly its own rent-exempt minimum — enough to
+    // keep the PDA alive (so future ops still work) but everything else swept.
+    const vaultBal = await provider.connection.getBalance(vault);
+    const vaultAcct = await provider.connection.getAccountInfo(vault);
+    const rentMin = await provider.connection.getMinimumBalanceForRentExemption(vaultAcct!.data.length);
+    expect(vaultBal).to.equal(rentMin);
+  });
+
+  it("vault_sweep_token: drains an SPL ATA owned by vault", async () => {
+    const owner = Keypair.generate();
+    const device = Keypair.generate();
+    const dest = Keypair.generate();
+    const payer = (provider.wallet as anchor.Wallet).payer;
+
+    await fundLamports(provider.connection, owner.publicKey, 2 * LAMPORTS_PER_SOL);
+
+    const [agentRoot] = deriveAgentRoot(owner.publicKey, program.programId);
+    const [vault] = deriveVault(agentRoot, program.programId);
+
+    await program.methods
+      .initializeAgent(device.publicKey)
+      .accounts({ owner: owner.publicKey, agentRoot, vault, systemProgram: SystemProgram.programId })
+      .signers([owner])
+      .rpc();
+
+    const { mint, atas } = await setupMintAndAtas(provider.connection, payer, [vault, dest.publicKey]);
+    const [vaultAta, destAta] = atas;
+
+    await program.methods
+      .vaultSweepToken()
+      .accounts({
+        vault,
+        vaultAta,
+        destinationAta: destAta,
+        mint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        recoveryAuthority: owner.publicKey,
+      })
+      .signers([owner])
+      .rpc();
+
+    const balance = await provider.connection.getTokenAccountBalance(destAta);
+    expect(balance.value.amount).to.equal("1000000");
+  });
+
+  it("vault_sweep: non-recovery_authority is rejected", async () => {
+    const owner = Keypair.generate();
+    const device = Keypair.generate();
+    const dest = Keypair.generate();
+    const evil = Keypair.generate();
+    await fundLamports(provider.connection, owner.publicKey, 2 * LAMPORTS_PER_SOL);
+    await fundLamports(provider.connection, evil.publicKey, 0.05 * LAMPORTS_PER_SOL);
+
+    const [agentRoot] = deriveAgentRoot(owner.publicKey, program.programId);
+    const [vault] = deriveVault(agentRoot, program.programId);
+
+    await program.methods
+      .initializeAgent(device.publicKey)
+      .accounts({ owner: owner.publicKey, agentRoot, vault, systemProgram: SystemProgram.programId })
+      .signers([owner])
+      .rpc();
+    await fundLamports(provider.connection, vault, 0.5 * LAMPORTS_PER_SOL);
+
+    let threw = false;
+    try {
+      await program.methods
+        .vaultSweep()
+        .accounts({ vault, destination: dest.publicKey, recoveryAuthority: evil.publicKey })
+        .signers([evil])
+        .rpc();
+    } catch (e: any) {
+      threw = true;
+      expect(e.toString()).to.match(/NotRecoveryAuthority/);
+    }
+    expect(threw).to.equal(true);
+  });
 });
