@@ -25,6 +25,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mbedtls/base64.h"
 
 #include "ed25519.h"
@@ -511,4 +512,73 @@ int swap_test_sig_for_test(const char *in_b64, char *out_b64, size_t cap) {
                             mypub);
     free(raw);
     return ok ? 0 : -5;
+}
+
+// sendTransaction with encoding=base64. Returns true and writes txid (base58)
+// on success.
+static bool __attribute__((unused)) rpc_send_tx(const char *signed_tx_b64, char *txid_out, size_t cap) {
+    size_t req_cap = strlen(signed_tx_b64) + 256;
+    char *req = malloc(req_cap);
+    if (!req) return false;
+    snprintf(req, req_cap,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sendTransaction\","
+        "\"params\":[\"%s\","
+        "{\"encoding\":\"base64\",\"skipPreflight\":false,"
+        "\"preflightCommitment\":\"processed\"}]}",
+        signed_tx_b64);
+
+    char rsp[512];
+    char url[160];
+    wallet_rpc_url(url, sizeof(url));
+    bool ok = https_post_json(url, req, rsp, sizeof(rsp));
+    free(req);
+    if (!ok) return false;
+
+    cJSON *root = cJSON_Parse(rsp);
+    if (!root) return false;
+    bool got = false;
+    const cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (cJSON_IsString(result)) {
+        strlcpy(txid_out, result->valuestring, cap);
+        got = true;
+    } else {
+        const cJSON *err = cJSON_GetObjectItem(root, "error");
+        if (cJSON_IsObject(err)) {
+            const cJSON *msg = cJSON_GetObjectItem(err, "message");
+            if (cJSON_IsString(msg)) ESP_LOGW(TAG, "send err: %s", msg->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+    return got;
+}
+
+// Polls getSignatureStatuses every 800 ms up to 30 s. Returns true once
+// the tx has a non-null status; false on timeout.
+static bool __attribute__((unused)) rpc_wait_for_confirm(const char *txid) {
+    char url[160];
+    wallet_rpc_url(url, sizeof(url));
+    for (int i = 0; i < 38; ++i) {
+        char req[256];
+        snprintf(req, sizeof(req),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignatureStatuses\","
+            "\"params\":[[\"%s\"],{\"searchTransactionHistory\":false}]}",
+            txid);
+        char rsp[1024];
+        if (https_post_json(url, req, rsp, sizeof(rsp))) {
+            cJSON *root = cJSON_Parse(rsp);
+            if (root) {
+                const cJSON *result = cJSON_GetObjectItem(root, "result");
+                const cJSON *value  = result ? cJSON_GetObjectItem(result, "value") : NULL;
+                bool landed = false;
+                if (cJSON_IsArray(value) && cJSON_GetArraySize(value) > 0) {
+                    const cJSON *st = cJSON_GetArrayItem(value, 0);
+                    if (cJSON_IsObject(st)) landed = true;        // any status = landed
+                }
+                cJSON_Delete(root);
+                if (landed) return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    return false;
 }
