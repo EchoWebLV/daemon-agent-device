@@ -47,9 +47,16 @@ const uint8_t *wallet_vault_pda_bytes(void);
 const char    *wallet_vault_pda(void);
 
 // Canonical USDC ATA owned by the vault PDA. Same caching rules as the vault
-// PDA itself — this is where x402 payments now draw from.
+// PDA itself — this is where x402 payments draw their refill from.
 const uint8_t *wallet_vault_usdc_ata_bytes(void);
 const char    *wallet_vault_usdc_ata(void);
+
+// Canonical USDC ATA owned by the DEVICE's keypair. Pre-funded with a small
+// buffer; the spending-account flow has the device's ATA pay x402 directly
+// (so the facilitator's structure validator is satisfied) and the vault
+// refills the same amount in the same tx. Bytes derived once at wallet_begin.
+const uint8_t *wallet_device_usdc_ata_bytes(void);
+const char    *wallet_device_usdc_ata(void);
 
 // True when a 64-byte seed is loaded and the derived pubkey matches.
 bool wallet_can_sign(void);

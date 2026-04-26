@@ -164,10 +164,11 @@ async function main() {
     ownerAta = oa.address;
     await mintTo(conn, owner, mint, vaultAta, owner, 1_000_000);
   } else {
-    console.log("[3] using real USDC + ensuring vault & owner ATAs");
+    console.log("[3] using real USDC + ensuring vault & owner & device ATAs");
     mint = new PublicKey(REAL_USDC_MAINNET);
     const va = await getOrCreateAssociatedTokenAccount(conn, owner, mint, vault, true);
     const oa = await getOrCreateAssociatedTokenAccount(conn, owner, mint, owner.publicKey);
+    const da = await getOrCreateAssociatedTokenAccount(conn, owner, mint, devicePk);
     vaultAta = va.address;
     ownerAta = oa.address;
 
@@ -183,6 +184,25 @@ async function main() {
       console.log("    sig:", sig);
     } else {
       console.log("    vault USDC already ≥ $1");
+    }
+
+    // Ensure the device's ATA has a small buffer for the spending-account
+    // pattern: the x402 facilitator's exact-scheme validator wants ix[2]
+    // to be a direct TransferChecked from the device's ATA, so the device
+    // needs a few micro-USDC sitting there. Each call refills the same
+    // amount in ix[3] via vault_execute, so this buffer is one-time.
+    const deviceBuffer = 100_000n; // 0.1 USDC — covers ~3000 calls @ $0.00003 each
+    const deviceUsdcBal = (await conn.getTokenAccountBalance(da.address)).value.amount;
+    if (BigInt(deviceUsdcBal) < deviceBuffer) {
+      const need = deviceBuffer - BigInt(deviceUsdcBal);
+      console.log(`    funding device USDC: ${deviceUsdcBal} → ${deviceBuffer} (sending ${need})`);
+      const ix = createTransferCheckedInstruction(
+        ownerAta, mint, da.address, owner.publicKey, need, 6
+      );
+      const sig = await provider.sendAndConfirm(new Transaction().add(ix));
+      console.log("    sig:", sig);
+    } else {
+      console.log("    device USDC already ≥ buffer");
     }
   }
   console.log("    mint:     ", mint.toBase58());

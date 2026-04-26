@@ -340,15 +340,21 @@ static bool build_payment_header(const char *desc_json,
     uint64_t amount_atomic = strtoull(amount_s, NULL, 10);
     int      timeout_sec   = cJSON_IsNumber(timeout_j) ? (int)timeout_j->valuedouble : 300;
 
-    // Source ATA: the VAULT's USDC ATA, derived from the owner pubkey at
-    // wallet_begin time. The device key never directly owns USDC anymore —
-    // funds live in the program-owned vault, the device just signs
-    // vault_execute requests.
-    const uint8_t *vault_pk        = wallet_vault_pda_bytes();
-    const uint8_t *source_ata_pk   = wallet_vault_usdc_ata_bytes();
+    // x402 payment: direct TransferChecked from device's USDC ATA → payTo's
+    // ATA. The @x402/svm exact-scheme validator requires the tx to have
+    // exactly ix[0]=SetCU-limit, ix[1]=SetCU-price, ix[2]=TransferChecked,
+    // and only memo / lighthouse programs at ix[3..]. No room for our
+    // vault_execute wrapper here.
+    //
+    // Phase 2a's vault is still load-bearing: it holds the bulk of USDC
+    // and the device's ATA is a small spending float. A separate path
+    // (Phase 2a-refill — TODO) drains the vault into the device's ATA on
+    // demand when the float runs low. That refill IS a vault_execute, just
+    // not on the x402 hot path.
+    const uint8_t *device_ata_pk   = wallet_device_usdc_ata_bytes();
     const uint8_t *device_pk       = wallet_pubkey_bytes();
-    if (!vault_pk || !source_ata_pk || !device_pk) {
-        ESP_LOGW(TAG, "vault paths not configured (OWNER_PUBKEY in secrets.h?)");
+    if (!device_ata_pk || !device_pk) {
+        ESP_LOGW(TAG, "wallet/vault paths not configured (OWNER_PUBKEY in secrets.h?)");
         goto out;
     }
 
@@ -359,65 +365,42 @@ static bool build_payment_header(const char *desc_json,
     }
 
     uint8_t fee_payer_key[32], dest_ata[32], mint_key[32], blockhash[32];
-    if (base58_decode(fee_payer,       fee_payer_key, 32) != 32) goto out;
-    if (base58_decode(dest_ata_b58,    dest_ata,      32) != 32) goto out;
-    if (base58_decode(USDC_MINT,       mint_key,      32) != 32) goto out;
-    if (!fetch_recent_blockhash(blockhash))                      goto out;
+    if (base58_decode(fee_payer,    fee_payer_key, 32) != 32) goto out;
+    if (base58_decode(dest_ata_b58, dest_ata,      32) != 32) goto out;
+    if (base58_decode(USDC_MINT,    mint_key,      32) != 32) goto out;
+    if (!fetch_recent_blockhash(blockhash))                   goto out;
 
-    // Inner ix: SPL TransferChecked from vault's USDC ATA → recipient ATA,
-    // authority = vault PDA (the program signs for it via CPI seeds).
-    uint8_t inner_data[10];
-    inner_data[0] = 0x0C;                                     // TransferChecked discriminator
-    for (int i = 0; i < 8; i++) inner_data[1 + i] = (uint8_t)(amount_atomic >> (i * 8));
-    inner_data[9] = USDC_DECIMALS;
+    // SPL TransferChecked, device ATA → payTo ATA, authority = device key.
+    uint8_t pay_data[10];
+    pay_data[0] = 0x0C;
+    for (int i = 0; i < 8; i++) pay_data[1 + i] = (uint8_t)(amount_atomic >> (i * 8));
+    pay_data[9] = USDC_DECIMALS;
 
-    const agent_meta_t inner_metas[] = {
-        { source_ata_pk, false, true  },                     // source (vault's USDC ATA)
-        { mint_key,      false, false },                     // mint
-        { dest_ata,      false, true  },                     // destination
-        { vault_pk,      true,  false },                     // authority (PDA — re-signed in program)
+    solana_ix_account_t pay_accs[] = {
+        { device_ata_pk, false, true  },
+        { mint_key,      false, false },
+        { dest_ata,      false, true  },
+        { device_pk,     true,  false },
     };
-
-    // Wrap into vault_execute. Outer instruction's data + meta layout the
-    // program expects is fully built by agent_pda_build_vault_execute_ix.
-    uint8_t outer_ix_data[256];
-    agent_meta_t outer_metas[16];
-    size_t outer_meta_count = 0;
-    int outer_data_len = agent_pda_build_vault_execute_ix(
-        vault_pk, device_pk, SPL_TOKEN_PROGRAM_ID,
-        inner_metas, sizeof inner_metas / sizeof inner_metas[0],
-        inner_data, sizeof inner_data,
-        outer_ix_data, sizeof outer_ix_data,
-        outer_metas, &outer_meta_count, sizeof outer_metas / sizeof outer_metas[0]);
-    if (outer_data_len < 0) { ESP_LOGW(TAG, "vault_execute encode failed"); goto out; }
-
-    // Translate to v2-builder shape and compose the tx. Bumped CU limit
-    // accommodates the extra ~5k CU the vault wrapper consumes; the inner
-    // TransferChecked itself is ~3k CU.
-    solana_ix_account_t v2_accs[16];
-    for (size_t i = 0; i < outer_meta_count; i++) {
-        v2_accs[i].pubkey      = outer_metas[i].pubkey;
-        v2_accs[i].is_signer   = outer_metas[i].is_signer;
-        v2_accs[i].is_writable = outer_metas[i].is_writable;
-    }
-    solana_ix_v2_t outer_ix = {
-        .program_id    = AGENT_PROGRAM_ID,
-        .accounts      = v2_accs,
-        .account_count = outer_meta_count,
-        .data          = outer_ix_data,
-        .data_len      = (size_t)outer_data_len,
+    solana_ix_v2_t pay_ix = {
+        .program_id    = SPL_TOKEN_PROGRAM_ID,
+        .accounts      = pay_accs,
+        .account_count = sizeof pay_accs / sizeof pay_accs[0],
+        .data          = pay_data,
+        .data_len      = sizeof pay_data,
     };
     solana_tx_input_v2_t in_v2 = {
         .fee_payer      = fee_payer_key,
         .signer_pubkey  = device_pk,
         .blockhash      = blockhash,
-        .ixs            = &outer_ix, .ix_count = 1,
-        .cu_limit       = 50000,
+        .ixs            = &pay_ix,
+        .ix_count       = 1,
+        .cu_limit       = 8000,
         .cu_price_micro = 1,
     };
-    char tx_b64[1024];
+    char tx_b64[768];
     int tx_len = solana_build_tx_v2_base64(&in_v2, tx_b64, sizeof tx_b64);
-    if (tx_len <= 0) { ESP_LOGW(TAG, "vault tx build failed"); goto out; }
+    if (tx_len <= 0) { ESP_LOGW(TAG, "x402 tx build failed"); goto out; }
 
     // Re-serialize `extra` and `extensions` so the envelope echoes them back
     // verbatim (facilitator validates the signature over these fields).
