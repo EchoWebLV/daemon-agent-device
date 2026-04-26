@@ -28,10 +28,14 @@
 #include "screens_common.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
+
+static const char *TAG = "swap_screen";
 
 #define HOLD_MS         3000
 #define IDLE_TIMEOUT_MS 30000
@@ -52,6 +56,16 @@ typedef struct {
 } ctx_t;
 
 static ctx_t s_ctx;       // single in-flight modal
+
+// Heap-allocated bundle that crosses the swap_screen_open → open_on_lvgl
+// boundary. Required because the caller writes on its own task and the
+// reader runs on the LVGL thread; passing through `lv_async_call`'s arg
+// keeps everything ordered via LVGL's internal mutex.
+typedef struct {
+    swap_screen_args_t args;
+    SemaphoreHandle_t  done_sem;
+    swap_ui_result_t  *out_result;
+} init_t;
 
 // Pretty-print a UI amount with up to 6 decimal places, trailing zeros stripped.
 static void fmt_amount(double v, char *out, size_t cap) {
@@ -82,6 +96,9 @@ static void on_swipe(lv_event_t *e) {
 
 static void poll_tick(lv_timer_t *t) {
     (void)t;
+    // Already-closed guard: an event-driven close (swipe) can run
+    // earlier in the same LVGL iteration; bail before reading torn state.
+    if (!s_ctx.scr) return;
     lv_indev_t *indev = lv_indev_get_next(NULL);
     lv_indev_state_t state = indev ? lv_indev_get_state(indev) : LV_INDEV_STATE_RELEASED;
     bool down = (state == LV_INDEV_STATE_PRESSED);
@@ -189,22 +206,42 @@ static void build_ui(void) {
 }
 
 static void open_on_lvgl(void *arg) {
-    (void)arg;
-    if (!lvgl_port_lock(0)) return;
+    init_t *init = (init_t *)arg;
+    if (!init) return;
+    if (!lvgl_port_lock(0)) {
+        // Lock failure must NOT strand the caller — they're blocked on
+        // done_sem expecting either CONFIRM or a CANCEL_*. Report timeout
+        // immediately so the caller can retry or surface the failure.
+        ESP_LOGW(TAG, "lvgl_port_lock failed; aborting open");
+        if (init->out_result) *init->out_result = SWAP_UI_CANCEL_TIMEOUT;
+        if (init->done_sem)   xSemaphoreGive(init->done_sem);
+        free(init);
+        return;
+    }
+    memset(&s_ctx, 0, sizeof(s_ctx));
+    s_ctx.args       = init->args;
+    s_ctx.done_sem   = init->done_sem;
+    s_ctx.out_result = init->out_result;
     s_ctx.prev_screen = lv_screen_active();
     build_ui();
     lv_screen_load(s_ctx.scr);
     s_ctx.poll_timer = lv_timer_create(poll_tick, POLL_PERIOD_MS, NULL);
     lvgl_port_unlock();
+    free(init);
 }
 
 void swap_screen_open(const swap_screen_args_t *args,
                       SemaphoreHandle_t        done_sem,
                       swap_ui_result_t        *out_result) {
-    memset(&s_ctx, 0, sizeof(s_ctx));
-    s_ctx.args       = *args;
-    s_ctx.done_sem   = done_sem;
-    s_ctx.out_result = out_result;
     if (out_result) *out_result = SWAP_UI_CANCEL_TIMEOUT;
-    lv_async_call(open_on_lvgl, NULL);
+    init_t *init = malloc(sizeof(*init));
+    if (!init) {
+        ESP_LOGW(TAG, "init alloc failed");
+        if (done_sem) xSemaphoreGive(done_sem);
+        return;
+    }
+    init->args       = *args;
+    init->done_sem   = done_sem;
+    init->out_result = out_result;
+    lv_async_call(open_on_lvgl, init);
 }
