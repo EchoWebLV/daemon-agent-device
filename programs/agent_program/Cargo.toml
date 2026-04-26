@@ -17,5 +17,7 @@ default = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+# init-if-needed not used (we only `init`); dropping the feature shrinks
+# the bytecode by a few KB after LTO.
+anchor-lang = { version = "0.32.1" }
 anchor-spl  = { version = "0.32.1", features = ["token"] }
