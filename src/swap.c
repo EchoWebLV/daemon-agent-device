@@ -72,6 +72,28 @@ static bool resolve_token(const char *sym, swap_token_t *out) {
     return false;
 }
 
+// Returns true if the wallet snapshot says we hold at least `amount_ui`
+// of the symbol resolved by `t`. SPL holdings are matched by mint, not
+// symbol — handles the "two tokens with the same ticker" case correctly.
+static bool __attribute__((unused)) has_balance(const swap_token_t *t, double amount_ui) {
+    if (!t) return false;
+    if (strcmp(t->sym, "SOL") == 0) {
+        return wallet_sol_balance() >= amount_ui;
+    }
+    if (strcmp(t->sym, "USDC") == 0) {
+        return wallet_usdc_amount() >= amount_ui;
+    }
+    const token_holding_t *toks = NULL;
+    size_t n = 0;
+    wallet_tokens(&toks, &n);
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(toks[i].mint, t->mint) == 0) {
+            return toks[i].amount >= amount_ui;
+        }
+    }
+    return false;
+}
+
 bool swap_resolve_for_test(const char *sym, char *out, size_t cap) {
     if (!out || cap == 0) return false;
     swap_token_t t;
