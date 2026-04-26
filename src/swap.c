@@ -86,7 +86,7 @@ static bool https_get(const char *url, char *out, size_t out_cap) {
 
 // One-shot HTTPS POST with JSON body. Truncated bodies are rejected (see
 // `https_get` for rationale).
-static bool __attribute__((unused)) https_post_json(const char *url, const char *body,
+static bool https_post_json(const char *url, const char *body,
                              char *out, size_t out_cap) {
     if (!wifi_sta_is_connected() || out_cap == 0) return false;
     out[0] = '\0';
@@ -252,6 +252,56 @@ static bool __attribute__((unused)) jup_get_quote(const swap_token_t *from, cons
     out->quote_json    = rsp;          // hand off ownership; do NOT free here
     cJSON_Delete(root);
     return true;
+}
+
+// POST /swap returns a base64 unsigned v0 versioned tx and a few metadata
+// fields (`prioritizationFeeLamports`). Caller owns `tx_b64_out` and frees
+// via free().
+typedef struct {
+    char    *tx_b64;             // heap, free()
+    uint64_t priority_lamports;  // server may inflate from our requested 1
+} jup_swap_t;
+
+static bool __attribute__((unused)) jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
+                           jup_swap_t *out) {
+    memset(out, 0, sizeof(*out));
+
+    // body = { quoteResponse: <verbatim quote JSON>, userPublicKey, ... }
+    // We hand-build the body so we don't pay an extra parse+serialize round
+    // on the (verbatim) quote JSON. cJSON would otherwise reformat numbers.
+    size_t body_cap = strlen(q->quote_json) + 256;
+    char *body = malloc(body_cap);
+    if (!body) return false;
+    int n = snprintf(body, body_cap,
+        "{\"quoteResponse\":%s,"
+        "\"userPublicKey\":\"%s\","
+        "\"wrapAndUnwrapSol\":true,"
+        "\"dynamicComputeUnitLimit\":true,"
+        "\"prioritizationFeeLamports\":1}",
+        q->quote_json, user_pubkey);
+    if (n < 0 || (size_t)n >= body_cap) { free(body); return false; }
+
+    char *rsp = heap_caps_malloc(JUP_SWAP_RSP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rsp) { free(body); return false; }
+    bool ok = https_post_json("https://quote-api.jup.ag/v6/swap",
+                              body, rsp, JUP_SWAP_RSP_CAP);
+    free(body);
+    if (!ok) { free(rsp); return false; }
+
+    cJSON *root = cJSON_Parse(rsp);
+    if (!root) { free(rsp); ESP_LOGW(TAG, "swap: parse fail"); return false; }
+    const cJSON *tx = cJSON_GetObjectItem(root, "swapTransaction");
+    if (!cJSON_IsString(tx)) {
+        cJSON_Delete(root); free(rsp);
+        ESP_LOGW(TAG, "swap: missing swapTransaction");
+        return false;
+    }
+    out->tx_b64 = strdup(tx->valuestring);
+    const cJSON *pri = cJSON_GetObjectItem(root, "prioritizationFeeLamports");
+    out->priority_lamports = cJSON_IsNumber(pri) ? (uint64_t)pri->valuedouble : 1;
+    cJSON_Delete(root);
+    free(rsp);
+    return out->tx_b64 != NULL;
 }
 
 // Tiny helper — raises 10 to the power n without relying on GNU pow10().
