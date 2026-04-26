@@ -68,7 +68,7 @@ async function main() {
   console.log("[1] initialize_agent");
   const sig1 = await program.methods
     .initializeAgent(device.publicKey)
-    .accounts({
+    .accountsPartial({
       owner: owner.publicKey,
       agentRoot,
       vault,
@@ -122,7 +122,7 @@ async function main() {
   };
   const sig4 = await program.methods
     .vaultExecute(innerData as any)
-    .accounts({ vault, currentSigner: device.publicKey })
+    .accountsPartial({ vault, currentSigner: device.publicKey })
     .remainingAccounts([
       ...inner.keys.map((k) => ({ pubkey: k.pubkey, isSigner: false, isWritable: k.isWritable })),
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -134,7 +134,7 @@ async function main() {
   console.log("[5] vault_rotate_signer →", newDevice.publicKey.toBase58());
   const sig5 = await program.methods
     .vaultRotateSigner(newDevice.publicKey)
-    .accounts({ vault, recoveryAuthority: owner.publicKey })
+    .accountsPartial({ vault, recoveryAuthority: owner.publicKey })
     .rpc();
   console.log("    sig:", sig5);
 
@@ -143,7 +143,7 @@ async function main() {
   try {
     await program.methods
       .vaultExecute(innerData as any)
-      .accounts({ vault, currentSigner: device.publicKey })
+      .accountsPartial({ vault, currentSigner: device.publicKey })
       .remainingAccounts([
         ...inner.keys.map((k) => ({ pubkey: k.pubkey, isSigner: false, isWritable: k.isWritable })),
         { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -159,7 +159,7 @@ async function main() {
   console.log("[7] vault_sweep_token → owner");
   const sig7 = await program.methods
     .vaultSweepToken()
-    .accounts({
+    .accountsPartial({
       vault,
       vaultAta,
       destinationAta: ownerAta,
@@ -173,7 +173,7 @@ async function main() {
   console.log("[8] vault_sweep → owner");
   const sig8 = await program.methods
     .vaultSweep()
-    .accounts({ vault, destination: owner.publicKey, recoveryAuthority: owner.publicKey })
+    .accountsPartial({ vault, destination: owner.publicKey, recoveryAuthority: owner.publicKey })
     .rpc();
   console.log("    sig:", sig8);
 
