@@ -22,9 +22,14 @@
 //  Hold detection: an LVGL timer at 50 Hz reads the touch indev. The
 //  fill-arc reaches 100% after 3000 ms of continuous contact; release
 //  before then = CANCEL_RELEASE. 30 s with no touch at all =
-//  CANCEL_TIMEOUT. Swipe-gesture cancellation was removed because the
-//  CTP panel reports capacitive jitter as a gesture during a static
-//  hold, dismissing the modal before the arc can fill.
+//  CANCEL_TIMEOUT. Tapping the top-right cancel button also closes
+//  with CANCEL_RELEASE; the poll_tick uses the touch point to skip
+//  hold accumulation while the user's finger is on that button so the
+//  arc doesn't briefly fill on a quick tap.
+//
+//  Swipe-gesture cancellation was removed because the CTP panel
+//  reports capacitive jitter as a gesture during a static hold,
+//  dismissing the modal before the arc can fill.
 // ---------------------------------------------------------------------------
 #include "swap_screen.h"
 #include "screens_common.h"
@@ -55,6 +60,7 @@ typedef struct {
     lv_obj_t          *scr;
     lv_obj_t          *arc;
     lv_obj_t          *arc_label;
+    lv_obj_t          *cancel_btn;
     lv_timer_t        *poll_timer;
     uint32_t           hold_ms;          // accumulated continuous-contact ms
     uint32_t           idle_ms;          // ms since last contact
@@ -96,9 +102,23 @@ static void close_modal(swap_ui_result_t result) {
     s_ctx.done_sem = NULL;
 }
 
+static void on_cancel_click(lv_event_t *e) {
+    (void)e;
+    close_modal(SWAP_UI_CANCEL_RELEASE);
+}
+
+static bool press_on_cancel(lv_indev_t *indev) {
+    if (!indev || !s_ctx.cancel_btn) return false;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    lv_area_t a;
+    lv_obj_get_coords(s_ctx.cancel_btn, &a);
+    return p.x >= a.x1 && p.x <= a.x2 && p.y >= a.y1 && p.y <= a.y2;
+}
+
 static void poll_tick(lv_timer_t *t) {
     (void)t;
-    // Already-closed guard: an event-driven close (swipe) can run
+    // Already-closed guard: the cancel-button click handler can fire
     // earlier in the same LVGL iteration; bail before reading torn state.
     if (!s_ctx.scr) return;
     lv_indev_t *indev = lv_indev_get_next(NULL);
@@ -106,6 +126,18 @@ static void poll_tick(lv_timer_t *t) {
     bool down = (state == LV_INDEV_STATE_PRESSED);
 
     if (down) {
+        // Touches that land on the cancel button must NOT fill the arc;
+        // poll_tick reads the global indev so it can't tell which widget
+        // the user pressed without a spatial check.
+        if (press_on_cancel(indev)) {
+            s_ctx.hold_ms = 0;
+            s_ctx.idle_ms = 0;
+            s_ctx.release_streak_ms = 0;
+            s_ctx.touching = false;
+            lv_arc_set_value(s_ctx.arc, 0);
+            lv_label_set_text(s_ctx.arc_label, "3");
+            return;
+        }
         s_ctx.hold_ms += POLL_PERIOD_MS;
         s_ctx.idle_ms  = 0;
         s_ctx.release_streak_ms = 0;
@@ -152,6 +184,20 @@ static void build_ui(void) {
     lv_label_set_text(title, "SWAP");
     lv_obj_set_style_text_color(title, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+    s_ctx.cancel_btn = lv_button_create(s_ctx.scr);
+    lv_obj_set_size(s_ctx.cancel_btn, 44, 32);
+    lv_obj_align(s_ctx.cancel_btn, LV_ALIGN_TOP_RIGHT, -8, 6);
+    lv_obj_set_style_bg_opa(s_ctx.cancel_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_ctx.cancel_btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_ctx.cancel_btn, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_ctx.cancel_btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(s_ctx.cancel_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_t *cancel_lbl = lv_label_create(s_ctx.cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(cancel_lbl, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(s_ctx.cancel_btn, on_cancel_click, LV_EVENT_CLICKED, NULL);
 
     char buf[64], amt[24];
     fmt_amount(s_ctx.args.amount_in, amt, sizeof(amt));
