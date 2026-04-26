@@ -325,69 +325,17 @@ static void handle_vault_pda(void) {
     resp_ok(buf);
 }
 
-// Hardcoded test-vault state — mirrors target/test-vault.json. Re-run
-// `yarn ts-node scripts/setup-test-vault.ts <DEVICE_PUBKEY>` after every
-// firmware reflash that needs fresh ATAs (the script mints a new test SPL
-// each run; existing on-chain accounts stay around but go unused).
-static const char *TV_USDC_MINT      = "7qjcdScgJZCDGt78ASR1YLo7AMWQ7YVZqpeKtdWbMWkb";
-static const char *TV_VAULT_USDC_ATA = "Ai1yFpb33QKmfv2qSyixcthQXi2NC4ReArwU3LEs7CsV";
-static const char *TV_OWNER_USDC_ATA = "6EjvMEkBWYcVWSxH2rt2etyVnbUB1NHnMwtYCdheTTVM";
+// Hardcoded vault state — mirrors target/test-vault-mainnet.json. Re-run
+// `yarn ts-node scripts/setup-test-vault.ts mainnet <DEVICE_PUBKEY>` if
+// any of these ever drift (they shouldn't for mainnet — real USDC mint
+// is canonical, ATAs are deterministic from owner+mint).
+static const char *TV_USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+static const char *TV_VAULT_USDC_ATA = "Hb1L7xMqwzvdNVbSPMx8zkAwwkHzzZqLnkvzopyrXtj1";
+static const char *TV_OWNER_USDC_ATA = "CDbc47nCDiVfr7LBS2Xk8cyyrbsobZv1USvSdmmHrpsQ";
 
-typedef struct { char *buf; size_t cap; size_t len; } devnet_body_t;
-
-static esp_err_t devnet_on_data(esp_http_client_event_t *evt) {
-    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
-    devnet_body_t *r = (devnet_body_t *)evt->user_data;
-    if (!r || r->cap == 0) return ESP_OK;
-    size_t room = r->cap - 1 - r->len;
-    if (room == 0) return ESP_OK;
-    size_t take = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
-    memcpy(r->buf + r->len, evt->data, take);
-    r->len += take;
-    r->buf[r->len] = '\0';
-    return ESP_OK;
-}
-
-// Devnet POST helper — wallet_rpc_url returns mainnet (the daemon's normal
-// runtime), but our deployed agent_program lives on devnet for Phase 2a, so
-// the test verb has to talk to devnet directly. Hardcoded Helius devnet URL.
-static bool devnet_rpc_post(const char *payload, char *out, size_t out_cap) {
-    extern bool wifi_sta_is_connected(void);
-    if (!wifi_sta_is_connected()) return false;
-    if (out_cap == 0) return false;
-    out[0] = '\0';
-
-    char url[200];
-    snprintf(url, sizeof url,
-             "https://devnet.helius-rpc.com/?api-key=%s", HELIUS_API_KEY);
-
-    devnet_body_t rb = { .buf = out, .cap = out_cap, .len = 0 };
-
-    esp_http_client_config_t cfg = {
-        .url               = url,
-        .method            = HTTP_METHOD_POST,
-        .transport_type    = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .event_handler     = devnet_on_data,
-        .user_data         = &rb,
-        .timeout_ms        = 15000,
-    };
-    esp_http_client_handle_t http = esp_http_client_init(&cfg);
-    if (!http) return false;
-    esp_http_client_set_header(http, "Content-Type", "application/json");
-    esp_http_client_set_post_field(http, payload, (int)strlen(payload));
-    esp_err_t err = esp_http_client_perform(http);
-    int       code = esp_http_client_get_status_code(http);
-    esp_http_client_cleanup(http);
-    if (err != ESP_OK || code != 200) {
-        ESP_LOGW(TAG, "devnet rpc err=%s code=%d", esp_err_to_name(err), code);
-        return false;
-    }
-    return true;
-}
-
-// Direct-RPC sendTransaction (devnet). Cribbed from swap.c::rpc_send_tx so the
-// test verb stays self-contained — testharness can't reach swap.c's statics.
+// Direct-RPC sendTransaction. Uses the daemon's normal Helius mainnet URL
+// (wallet_rpc_url) — the program is on mainnet and so is the vault. Surfaces
+// preflight logs to ESP_LOGW for debugging.
 static bool rpc_send_test_tx(const char *signed_tx_b64,
                              char *txid_out, size_t cap)
 {
@@ -403,7 +351,7 @@ static bool rpc_send_test_tx(const char *signed_tx_b64,
 
     char *rsp = malloc(4096);  // heap, not stack — keeps harness stack lean
     if (!rsp) { free(req); return false; }
-    bool ok = devnet_rpc_post(req, rsp, 4096);
+    bool ok = rpc_call(req, rsp, 4096);
     free(req);
     if (!ok) { free(rsp); return false; }
 
@@ -456,26 +404,8 @@ static void handle_vault_transfer(const char *args) {
     if (base58_decode(TV_VAULT_USDC_ATA, vault_ata,  32) != 32) { resp_err("decode vault_ata"); return; }
     if (base58_decode(TV_OWNER_USDC_ATA, owner_ata,  32) != 32) { resp_err("decode owner_ata"); return; }
 
-    // Fetch a devnet blockhash directly (fetch_recent_blockhash uses
-    // wallet_rpc_url which is mainnet on this build).
     uint8_t blockhash[32];
-    {
-        char body[1024];
-        if (!devnet_rpc_post(
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLatestBlockhash\",\"params\":[]}",
-                body, sizeof body)) {
-            resp_err("vault blockhash"); return;
-        }
-        cJSON *root = cJSON_Parse(body);
-        if (!root) { resp_err("vault blockhash_parse"); return; }
-        cJSON *res = cJSON_GetObjectItem(root, "result");
-        cJSON *val = res ? cJSON_GetObjectItem(res, "value") : NULL;
-        cJSON *bh  = val ? cJSON_GetObjectItem(val, "blockhash") : NULL;
-        bool ok = cJSON_IsString(bh) && bh->valuestring &&
-                  base58_decode(bh->valuestring, blockhash, 32) == 32;
-        cJSON_Delete(root);
-        if (!ok) { resp_err("vault blockhash_decode"); return; }
-    }
+    if (!fetch_recent_blockhash(blockhash)) { resp_err("vault blockhash"); return; }
 
     // Inner: SPL TransferChecked(vault_ata → owner_ata, amount, 6 dec).
     uint8_t inner_data[10];
