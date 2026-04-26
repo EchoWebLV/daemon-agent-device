@@ -38,13 +38,14 @@ static double swap_pow10(uint8_t n);
 #define JUP_QUOTE_RSP_CAP 6144
 #define JUP_SWAP_RSP_CAP  12288
 
-typedef struct { char *buf; size_t cap; size_t len; } http_body_t;
+typedef struct { char *buf; size_t cap; size_t len; bool overflowed; } http_body_t;
 
 static esp_err_t on_http_event(esp_http_client_event_t *evt) {
     if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
     http_body_t *r = (http_body_t *)evt->user_data;
     if (!r || !r->buf || r->cap == 0) return ESP_OK;
     size_t room = r->cap - 1 - r->len;
+    if (evt->data_len > 0 && (size_t)evt->data_len > room) r->overflowed = true;
     if (room == 0) return ESP_OK;
     size_t take = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
     memcpy(r->buf + r->len, evt->data, take);
@@ -53,12 +54,14 @@ static esp_err_t on_http_event(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-// One-shot HTTPS GET. Returns true iff status == 200 and the body fit.
+// One-shot HTTPS GET. Returns true iff status == 200 and the entire body fit
+// inside `out` (a truncated body is rejected — silent truncation would let
+// cJSON parse a partial response and produce wrong numbers).
 static bool https_get(const char *url, char *out, size_t out_cap) {
     if (!wifi_sta_is_connected() || out_cap == 0) return false;
     out[0] = '\0';
 
-    http_body_t rb = { .buf = out, .cap = out_cap, .len = 0 };
+    http_body_t rb = { .buf = out, .cap = out_cap, .len = 0, .overflowed = false };
     esp_http_client_config_t cfg = {
         .url               = url,
         .method            = HTTP_METHOD_GET,
@@ -73,18 +76,20 @@ static bool https_get(const char *url, char *out, size_t out_cap) {
     esp_err_t err  = esp_http_client_perform(h);
     int       code = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
-    if (err != ESP_OK) { ESP_LOGW(TAG, "GET %s: %s", url, esp_err_to_name(err)); return false; }
-    if (code != 200)   { ESP_LOGW(TAG, "GET %s: HTTP %d", url, code);             return false; }
+    if (err != ESP_OK)  { ESP_LOGW(TAG, "GET %s: %s", url, esp_err_to_name(err)); return false; }
+    if (code != 200)    { ESP_LOGW(TAG, "GET %s: HTTP %d", url, code);             return false; }
+    if (rb.overflowed)  { ESP_LOGW(TAG, "GET %s: body > %u bytes", url, (unsigned)out_cap); return false; }
     return true;
 }
 
-// One-shot HTTPS POST with JSON body.
+// One-shot HTTPS POST with JSON body. Truncated bodies are rejected (see
+// `https_get` for rationale).
 static bool __attribute__((unused)) https_post_json(const char *url, const char *body,
                              char *out, size_t out_cap) {
     if (!wifi_sta_is_connected() || out_cap == 0) return false;
     out[0] = '\0';
 
-    http_body_t rb = { .buf = out, .cap = out_cap, .len = 0 };
+    http_body_t rb = { .buf = out, .cap = out_cap, .len = 0, .overflowed = false };
     esp_http_client_config_t cfg = {
         .url               = url,
         .method            = HTTP_METHOD_POST,
@@ -101,8 +106,9 @@ static bool __attribute__((unused)) https_post_json(const char *url, const char 
     esp_err_t err  = esp_http_client_perform(h);
     int       code = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
-    if (err != ESP_OK) { ESP_LOGW(TAG, "POST %s: %s", url, esp_err_to_name(err)); return false; }
-    if (code != 200)   { ESP_LOGW(TAG, "POST %s: HTTP %d", url, code);             return false; }
+    if (err != ESP_OK)  { ESP_LOGW(TAG, "POST %s: %s", url, esp_err_to_name(err)); return false; }
+    if (code != 200)    { ESP_LOGW(TAG, "POST %s: HTTP %d", url, code);             return false; }
+    if (rb.overflowed)  { ESP_LOGW(TAG, "POST %s: body > %u bytes", url, (unsigned)out_cap); return false; }
     return true;
 }
 
@@ -207,7 +213,12 @@ static bool __attribute__((unused)) jup_get_quote(const swap_token_t *from, cons
                           double amount_ui, uint16_t slippage_bps,
                           jup_quote_t *out) {
     memset(out, 0, sizeof(*out));
-    uint64_t atomic = (uint64_t)(amount_ui * swap_pow10(from->decimals) + 0.5);
+    if (!isfinite(amount_ui) || amount_ui < 0.0) return false;
+    // Avoid double→uint64_t UB on overflow. 1e18 is well below UINT64_MAX
+    // (~1.84e19) and far above any realistic Solana atomic amount.
+    double atomic_d = amount_ui * swap_pow10(from->decimals) + 0.5;
+    if (atomic_d >= 1e18) return false;
+    uint64_t atomic = (uint64_t)atomic_d;
     if (atomic == 0) return false;
 
     char url[512];
