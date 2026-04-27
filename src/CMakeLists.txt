@@ -17,6 +17,7 @@ idf_component_register(
         "imu.c"
         "info_screen.c"
         "menu_screen.c"
+        "pin.c"
         "price.c"
         "refill.c"
         "server.c"

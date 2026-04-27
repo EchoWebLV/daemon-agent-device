@@ -44,6 +44,7 @@
 #include "agent_pda.h"
 #include "ai.h"
 #include "base58.h"
+#include "pin.h"
 #include "refill.h"
 #include "solana_tx.h"
 #include "swap.h"
@@ -470,6 +471,82 @@ static void handle_vault_transfer(const char *args) {
     resp_ok(buf);
 }
 
+// Phase 2b PIN verbs: drive the seal/unlock/wipe primitives from the host
+// before the LVGL keypad UI is wired in.
+static void handle_pin_status(void) {
+    bool set = pin_is_set();
+    int  rem = pin_attempts_remaining();
+    char buf[64];
+    snprintf(buf, sizeof buf, "set=%d remaining=%d", set ? 1 : 0, rem);
+    resp_ok(buf);
+}
+
+// TEST PIN SETUP <pin>  → seals the secrets.h SOLANA_KEY under <pin>.
+// Same bytes wallet_begin already loads — sealing wires the PIN gate ON TOP
+// of the existing key without changing the on-chain identity. After this
+// lands, pin_unlock(<pin>) restores those exact bytes.
+static void handle_pin_setup(const char *args) {
+    char pin[PIN_MAX_LEN + 1] = {0};
+    if (!args || !args[0]) { resp_err("pin setup usage <pin>"); return; }
+    strlcpy(pin, args, sizeof pin);
+    for (size_t i = strlen(pin); i > 0 && (pin[i-1] == ' ' || pin[i-1] == '\t'); ) {
+        pin[--i] = '\0';
+    }
+
+    const char *seed_b58 = SOLANA_KEY;
+    if (!seed_b58 || !seed_b58[0] || strncmp(seed_b58, "PASTE-", 6) == 0) {
+        resp_err("pin no_seed"); return;
+    }
+
+    uint8_t seed_buf[PIN_MAX_SEED_LEN];
+    int n = base58_decode(seed_b58, seed_buf, sizeof seed_buf);
+    if (n != 32 && n != 64) { resp_err("pin seed_decode"); return; }
+
+    pin_status_t st = pin_setup(pin, seed_buf, (size_t)n);
+    memset(seed_buf, 0, sizeof seed_buf);
+    if (st != PIN_OK) {
+        char m[32]; snprintf(m, sizeof m, "pin setup err=%d", st);
+        resp_err(m); return;
+    }
+    resp_ok("sealed");
+}
+
+static void handle_pin_unlock(const char *args) {
+    char pin[PIN_MAX_LEN + 1] = {0};
+    if (!args || !args[0]) { resp_err("pin unlock usage <pin>"); return; }
+    strlcpy(pin, args, sizeof pin);
+    for (size_t i = strlen(pin); i > 0 && (pin[i-1] == ' ' || pin[i-1] == '\t'); ) {
+        pin[--i] = '\0';
+    }
+
+    uint8_t seed[PIN_MAX_SEED_LEN]; size_t seed_len = 0;
+    pin_status_t st = pin_unlock(pin, seed, sizeof seed, &seed_len);
+    memset(seed, 0, sizeof seed);                // never log seed bytes
+    if (st == PIN_OK) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "unlocked seed_len=%zu remaining=%d",
+                 seed_len, pin_attempts_remaining());
+        resp_ok(buf);
+    } else if (st == PIN_ERR_BAD_PIN) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "wrong remaining=%d", pin_attempts_remaining());
+        resp_err(buf);
+    } else if (st == PIN_ERR_WIPED) {
+        resp_err("pin wiped");
+    } else if (st == PIN_ERR_NOT_SET) {
+        resp_err("pin not_set");
+    } else {
+        char buf[32]; snprintf(buf, sizeof buf, "pin err=%d", st);
+        resp_err(buf);
+    }
+}
+
+static void handle_pin_wipe(void) {
+    pin_status_t st = pin_wipe();
+    if (st == PIN_OK) resp_ok("wiped");
+    else { char b[32]; snprintf(b, sizeof b, "pin err=%d", st); resp_err(b); }
+}
+
 // Force a refill from vault → device USDC ATA. Argv: micro-USDC amount.
 // Returns the resulting tx signature on success.
 static void handle_vault_refill(const char *args) {
@@ -650,6 +727,17 @@ static void dispatch_line(const char *line) {
         if ((args = match_token(rest, "TRANSFER"))) { handle_vault_transfer(args); return; }
         if ((args = match_token(rest, "REFILL")))   { handle_vault_refill(args);   return; }
         resp_err("vault bad_subverb");
+        return;
+    }
+
+    // --- PIN STATUS / SETUP <pin> / UNLOCK <pin> / WIPE --- (Phase 2b)
+    if ((rest = match_token(after_test, "PIN"))) {
+        const char *args;
+        if (match_token(rest, "STATUS")) { handle_pin_status(); return; }
+        if (match_token(rest, "WIPE"))   { handle_pin_wipe();   return; }
+        if ((args = match_token(rest, "SETUP")))  { handle_pin_setup(args);  return; }
+        if ((args = match_token(rest, "UNLOCK"))) { handle_pin_unlock(args); return; }
+        resp_err("pin bad_subverb");
         return;
     }
 

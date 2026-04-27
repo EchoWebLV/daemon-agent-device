@@ -43,6 +43,12 @@ bool refill_run_amount(uint64_t amount_atomic, char *out_txid, size_t txid_cap);
 // for confirmation before deciding the swap can proceed.
 bool refill_run_and_wait(uint64_t amount_atomic, char *out_txid, size_t txid_cap);
 
+// Reverse direction: send `amount_atomic` micro-USDC from the device's USDC
+// ATA into the vault's USDC ATA. No vault_execute needed — the device is
+// the source authority, so a direct SPL TransferChecked is enough. Useful
+// for sweeping swap winnings or excess float back into the bulk reserve.
+bool vault_deposit_usdc(uint64_t amount_atomic, char *out_txid, size_t txid_cap);
+
 #ifdef __cplusplus
 }
 #endif
