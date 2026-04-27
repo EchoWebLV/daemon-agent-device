@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Daemon — first run</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0; padding: 0;
+      background: #000; color: #2BFF4A;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 16px; line-height: 1.45;
+      min-height: 100dvh;
+    }
+    .wrap { max-width: 480px; margin: 0 auto; padding: 24px 20px 64px; }
+    h1 { font-size: 22px; letter-spacing: 0.5px; margin: 0 0 4px; color: #66FF80; }
+    .subtitle { color: #0D5A1A; margin: 0 0 28px; font-size: 13px; }
+    fieldset {
+      border: 1px solid #0A3311; border-radius: 8px;
+      padding: 14px 16px 18px; margin: 0 0 18px; background: #041A08;
+    }
+    legend { padding: 0 8px; color: #66FF80; font-weight: 600; font-size: 13px; letter-spacing: 0.4px; }
+    label { display: block; font-size: 12px; color: #0D5A1A; margin: 12px 0 4px; letter-spacing: 0.3px; }
+    label:first-of-type { margin-top: 0; }
+    input {
+      width: 100%; box-sizing: border-box;
+      background: #000; color: #2BFF4A;
+      border: 1px solid #0A3311; border-radius: 6px;
+      padding: 10px 12px; font: inherit;
+    }
+    input:focus { outline: none; border-color: #2BFF4A; }
+    .hint { font-size: 11px; color: #0D5A1A; margin-top: 4px; }
+    button {
+      width: 100%; padding: 14px;
+      background: #2BFF4A; color: #000;
+      border: 0; border-radius: 8px;
+      font: inherit; font-weight: 700; letter-spacing: 0.5px;
+      cursor: pointer; margin-top: 10px;
+    }
+    button:hover { background: #66FF80; }
+    button:disabled { background: #0D5A1A; color: #041A08; cursor: not-allowed; }
+    .status { margin: 12px 0; padding: 12px 14px; border-radius: 6px; font-size: 13px; }
+    .status.err { background: rgba(255, 80, 80, 0.08); color: #FFB84D; border: 1px solid #803A1A; }
+    .status.ok  { background: rgba(102, 255, 128, 0.08); color: #66FF80; border: 1px solid #2BFF4A; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Daemon — first run</h1>
+    <p class="subtitle">All four sections, please. Reboots after submit.</p>
+
+    <form id="f" autocomplete="off">
+      <fieldset>
+        <legend>1. Wi-Fi</legend>
+        <label for="ssid">SSID</label>
+        <input id="ssid" name="ssid" required maxlength="32" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" maxlength="64" />
+      </fieldset>
+
+      <fieldset>
+        <legend>2. Owner pubkey</legend>
+        <label for="owner_pubkey">Your Phantom address (recovery authority)</label>
+        <input id="owner_pubkey" name="owner_pubkey" required minlength="32" maxlength="44"
+               placeholder="DRHSrQjyX4..." />
+        <div class="hint">Used to derive your vault. You'll sign rotate / sweep transactions with this wallet.</div>
+      </fieldset>
+
+      <fieldset>
+        <legend>3. PIN</legend>
+        <label for="pin">Choose a 4–6 digit PIN</label>
+        <input id="pin" name="pin" required minlength="4" maxlength="6"
+               inputmode="numeric" pattern="[0-9]*" />
+        <label for="pin_confirm">Confirm</label>
+        <input id="pin_confirm" required minlength="4" maxlength="6"
+               inputmode="numeric" pattern="[0-9]*" />
+        <div class="hint">5 wrong attempts and the device wipes itself. Don't forget it.</div>
+      </fieldset>
+
+      <button id="submit" type="submit">Provision and reboot</button>
+      <div id="status" class="status" style="display:none"></div>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById('f');
+    const status = document.getElementById('status');
+    const submitBtn = document.getElementById('submit');
+    function setStatus(text, kind) {
+      status.style.display = 'block';
+      status.className = 'status ' + kind;
+      status.textContent = text;
+    }
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = new FormData(form);
+      if (f.get('pin') !== document.getElementById('pin_confirm').value) {
+        setStatus('PINs don\'t match', 'err'); return;
+      }
+      submitBtn.disabled = true;
+      setStatus('Saving...', 'ok');
+      try {
+        const r = await fetch('/wizard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ssid: f.get('ssid'),
+            password: f.get('password') || '',
+            owner_pubkey: f.get('owner_pubkey').trim(),
+            pin: f.get('pin'),
+          }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) {
+          setStatus('Done. Rebooting in 3s...', 'ok');
+        } else {
+          setStatus('Failed: ' + (j.error || r.statusText), 'err');
+          submitBtn.disabled = false;
+        }
+      } catch (err) {
+        setStatus('Network: ' + err.message, 'err');
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

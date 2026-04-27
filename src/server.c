@@ -268,6 +268,10 @@ void server_stop(void) {
     s_httpd = NULL;
 }
 
+server_http_handle_t server_http_handle(void) {
+    return (server_http_handle_t)s_httpd;
+}
+
 void server_set_say_handler(server_say_handler_t h) { s_on_say = h; }
 
 void server_set_status(const char *status) {

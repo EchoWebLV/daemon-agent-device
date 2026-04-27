@@ -31,7 +31,8 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # (source path relative to project root, C symbol base)
 ASSETS: list[tuple[str, str]] = [
-    ("src/html/index.html", "index_html"),
+    ("src/html/index.html",  "index_html"),
+    ("src/html/wizard.html", "wizard_html"),
 ]
 
 

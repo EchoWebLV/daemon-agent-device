@@ -36,6 +36,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "secrets.h"
 
 // Subsystem APIs the verbs drive. Keep this list tight — the harness is
@@ -52,6 +53,7 @@
 #include "ui.h"
 #include "wallet.h"
 #include "wifi_sta.h"
+#include "wizard.h"
 #include "x402.h"
 
 static const char *TAG = "testharness";
@@ -602,6 +604,38 @@ static void handle_pin_boot(void) {
     resp_ok("boot screen opened");
 }
 
+// WIZARD STATUS / START / STOP / RESET — Phase 2c.
+static void handle_wizard_status(void) {
+    bool first = wizard_is_first_run();
+    const char *opk = wizard_owner_pubkey();
+    char buf[96];
+    snprintf(buf, sizeof buf, "first_run=%d owner=%s",
+             first ? 1 : 0, opk ? opk : "(unset)");
+    resp_ok(buf);
+}
+static void handle_wizard_start(void) {
+    esp_err_t err = wizard_start();
+    if (err == ESP_OK) resp_ok("ap up at http://192.168.4.1/wizard");
+    else { char b[64]; snprintf(b, sizeof b, "err %s", esp_err_to_name(err)); resp_err(b); }
+}
+static void handle_wizard_stop(void) {
+    wizard_stop();
+    resp_ok("stopped");
+}
+static void handle_wizard_reset(void) {
+    // For testing: clear the "done" flag so wizard_is_first_run() goes
+    // back to true on next boot.
+    extern void wizard_mark_done(void);
+    nvs_handle_t h;
+    if (nvs_open("wizard", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, "done");
+        nvs_erase_key(h, "owner_pk");
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    resp_ok("reset");
+}
+
 // Force a refill from vault → device USDC ATA. Argv: micro-USDC amount.
 // Returns the resulting tx signature on success.
 static void handle_vault_refill(const char *args) {
@@ -795,6 +829,16 @@ static void dispatch_line(const char *line) {
         if ((args = match_token(rest, "SETUP")))  { handle_pin_setup(args);  return; }
         if ((args = match_token(rest, "UNLOCK"))) { handle_pin_unlock(args); return; }
         resp_err("pin bad_subverb");
+        return;
+    }
+
+    // --- WIZARD STATUS / START / STOP / RESET --- (Phase 2c)
+    if ((rest = match_token(after_test, "WIZARD"))) {
+        if (match_token(rest, "STATUS")) { handle_wizard_status(); return; }
+        if (match_token(rest, "START"))  { handle_wizard_start();  return; }
+        if (match_token(rest, "STOP"))   { handle_wizard_stop();   return; }
+        if (match_token(rest, "RESET"))  { handle_wizard_reset();  return; }
+        resp_err("wizard bad_subverb");
         return;
     }
 

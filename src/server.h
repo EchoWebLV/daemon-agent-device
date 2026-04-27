@@ -48,6 +48,13 @@ void server_set_say_handler(server_say_handler_t h);
 // the caller's buffer doesn't have to outlive the call.
 void server_set_status(const char *status);
 
+// Borrow the running httpd handle so other modules (wizard.c, future
+// admin endpoints) can register URI handlers on the same instance
+// instead of fighting over port 80. NULL when server_start hasn't run.
+struct httpd_handle_s;
+typedef struct httpd_handle_s *server_http_handle_t;
+server_http_handle_t server_http_handle(void);
+
 #ifdef __cplusplus
 }
 #endif
