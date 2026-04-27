@@ -28,6 +28,14 @@ void ai_reset_history(void);
 // is rolled back so the next attempt starts from a clean slate.
 bool ai_ask(const char *user, char *reply_out, size_t reply_cap);
 
+// Streaming variant. Same multi-turn semantics as ai_ask, but the LLM
+// reply streams sentence-by-sentence into voice_speak_chunk() as the
+// model emits it — first audio plays well before the full reply has
+// finished generating. Tool calls are NOT supported in this path; if
+// the user has services enabled, fall back to ai_ask. The accumulated
+// reply is written to `reply_out` for subtitle display + history append.
+bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap);
+
 // Single-turn prompt that does NOT touch the conversation history. Used
 // for ambient / one-off utterances (e.g. the wallet ticker chatter).
 bool ai_ask_one_shot(const char *prompt, char *reply_out, size_t reply_cap);

@@ -31,11 +31,17 @@ extern "C" {
 // task couldn't come up.
 bool voice_begin(void);
 
-// Kicks a TTS round-trip on the audio task. Returns false immediately on
-// precondition failures (no Wi-Fi, missing ElevenLabs key, empty text,
-// voice not initialised). The request is asynchronous — voice_is_speaking()
-// will flip to true once bytes start flowing out of I2S.
+// Single-shot TTS. Drains any queued chunks and plays this immediately
+// (interrupt-replace semantics). Returns false immediately on precondition
+// failures (no Wi-Fi, missing ElevenLabs key, empty text, voice not
+// initialised). Asynchronous — voice_is_speaking() flips to true once
+// bytes start flowing out of I2S.
 bool voice_speak(const char *text);
+
+// Append a TTS chunk to the back of the queue. Used by the streaming
+// chat path so multiple sentence-bounded fragments play back-to-back as
+// the LLM emits them. Returns false if the queue is full (chunk dropped).
+bool voice_speak_chunk(const char *text);
 
 // True while audio is actively streaming or the HTTP POST is in flight.
 bool voice_is_speaking(void);

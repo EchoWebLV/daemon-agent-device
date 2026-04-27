@@ -427,18 +427,24 @@ static void speech_task(void *arg) {
     }
 
     // Surface the transcript on screen so the user can sanity-check what
-    // Whisper heard before the AI reply overwrites it. Stays visible
-    // until ai_handle_say returns and ui_deliver_reply replaces it.
+    // Whisper heard before the AI reply replaces it.
     char displayed[600];
     snprintf(displayed, sizeof(displayed), "you: %s", transcript);
     ui_set_subtitle(displayed);
     ESP_LOGI(TAG, "transcript surfaced: %s", transcript);
 
-    // Mirror the typed-input path: ai_handle_say + ui_deliver_reply.
+    // Streaming path: ai_ask_streaming pipes sentences directly into
+    // voice_speak_chunk() as the LLM emits them, so audio starts ~600 ms
+    // after we get here instead of after the full 2-5 s reply finishes.
+    // The accumulated full reply lands in `reply` for the subtitle replace.
     char reply[1024] = {0};
-    ai_handle_say(transcript, reply, sizeof(reply));
-    if (reply[0]) {
-        ui_deliver_reply(reply);
+    bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
+    if (ok && reply[0]) {
+        ui_set_subtitle(reply);
+    } else if (reply[0]) {
+        // ai_ask_streaming wrote a human-readable error into reply on
+        // failure; show that instead of the user's transcript.
+        ui_set_subtitle(reply);
     }
     s_speech_in_flight = false;
     vTaskDelete(NULL);

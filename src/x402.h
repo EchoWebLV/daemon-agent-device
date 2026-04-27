@@ -10,6 +10,7 @@
 //  work on whatever arrived first.
 // ---------------------------------------------------------------------------
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -48,6 +49,21 @@ void x402_post(const char *url,
                char       *body_buf,
                size_t      body_cap,
                x402_result_t *out);
+
+// Streaming variant. Invoked once per chunk of response body as it arrives;
+// return true to keep streaming, false to abort. Total bytes seen is
+// reported via x402_result_t.body_len. The 402 + payment-retry dance
+// happens internally exactly like x402_call(); only the body delivery
+// differs (callback per chunk, no buffer).
+typedef bool (*x402_chunk_cb_t)(const char *data, size_t len, void *user);
+
+void x402_call_stream(const char *method,
+                      const char *url,
+                      const char *json_body,
+                      const char *auth_bearer,
+                      x402_chunk_cb_t on_chunk,
+                      void          *cb_user,
+                      x402_result_t *out);
 
 #ifdef __cplusplus
 }

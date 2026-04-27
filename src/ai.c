@@ -22,6 +22,7 @@
 #include "devcfg.h"
 #include "price.h"
 #include "swap.h"
+#include "voice.h"
 #include "wallet.h"
 #include "x402.h"
 
@@ -901,4 +902,263 @@ bool ai_ask_one_shot(const char *prompt, char *reply_out, size_t reply_cap) {
 
 void ai_handle_say(const char *user, char *reply_out, size_t reply_cap) {
     (void)ai_ask(user, reply_out, reply_cap);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming chat path. Voice-only — used by the long-press push-to-talk
+// flow so audio starts playing well before the LLM has finished generating.
+// Tools are intentionally not supported here; the streaming wire format
+// would need extra deltacode and the swap-tool round-trips don't fit a
+// "speak as you go" interaction anyway. If services are enabled, callers
+// should fall back to ai_ask().
+// ---------------------------------------------------------------------------
+
+#define STREAM_RAW_BUF      2048   // accumulator for partial SSE lines
+#define STREAM_SENT_CAP     320    // max characters in one sentence
+#define STREAM_REPLY_CAP    768    // full reply we hand back for history
+
+typedef struct {
+    char    raw[STREAM_RAW_BUF];   // partial SSE bytes spanning HTTP chunks
+    size_t  raw_len;
+
+    char    sent[STREAM_SENT_CAP]; // current sentence being built
+    size_t  sent_len;
+
+    char    reply[STREAM_REPLY_CAP]; // full assistant text accumulated
+    size_t  reply_len;
+
+    bool    done;                  // saw the [DONE] marker
+} stream_ctx_t;
+
+// True if `c` ends a sentence in the canonical sense (followed by space
+// or end-of-stream we'll catch on the final flush).
+static bool is_sentence_end(char c) {
+    return c == '.' || c == '?' || c == '!';
+}
+
+// Append text to reply buffer, capped at STREAM_REPLY_CAP-1.
+static void reply_append(stream_ctx_t *c, const char *s, size_t n) {
+    size_t room = STREAM_REPLY_CAP - 1 - c->reply_len;
+    if (room == 0) return;
+    size_t take = n < room ? n : room;
+    memcpy(c->reply + c->reply_len, s, take);
+    c->reply_len += take;
+    c->reply[c->reply_len] = '\0';
+}
+
+// Flush whatever is in `sent` (if non-empty) into voice_speak_chunk and
+// reset the buffer. Trims leading whitespace so adjacent sentences don't
+// inherit a stale leading space from the previous boundary.
+static void flush_sentence(stream_ctx_t *c) {
+    size_t i = 0;
+    while (i < c->sent_len && (c->sent[i] == ' ' || c->sent[i] == '\n')) i++;
+    if (i < c->sent_len) {
+        c->sent[c->sent_len] = '\0';
+        voice_speak_chunk(c->sent + i);
+    }
+    c->sent_len = 0;
+}
+
+// Append `text` of length `n` to the streaming context, splitting on
+// sentence-end punctuation. Each completed sentence is dispatched to
+// voice_speak_chunk(); the trailing partial sits in `sent` until the next
+// chunk or the end-of-stream flush.
+static void absorb_text(stream_ctx_t *c, const char *text, size_t n) {
+    reply_append(c, text, n);
+    for (size_t i = 0; i < n; ++i) {
+        if (c->sent_len < STREAM_SENT_CAP - 1) {
+            c->sent[c->sent_len++] = text[i];
+        }
+        // Boundary check: punctuation followed by space (or it's the very
+        // end of this chunk and the next chunk happens to start with one).
+        if (is_sentence_end(text[i])) {
+            bool next_is_break = (i + 1 < n) &&
+                                 (text[i + 1] == ' ' || text[i + 1] == '\n');
+            // Or the buffer just got dangerously full.
+            bool buf_full = c->sent_len >= STREAM_SENT_CAP - 32;
+            if (next_is_break || buf_full) flush_sentence(c);
+        }
+    }
+}
+
+// Parse one complete SSE record (`record_buf` of `record_len`, no trailing
+// "\n\n"). We only care about `data: ...` lines; the rest are ignored.
+// `data: [DONE]` flips ctx->done. Anything else is parsed as a JSON
+// chat-completion-chunk; we extract choices[0].delta.content and absorb.
+static void process_sse_record(stream_ctx_t *c, const char *record, size_t len) {
+    const char *p = record;
+    const char *end = record + len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        size_t line_len = eol ? (size_t)(eol - p) : (size_t)(end - p);
+        if (line_len > 5 && strncmp(p, "data:", 5) == 0) {
+            const char *payload = p + 5;
+            size_t paylen = line_len - 5;
+            while (paylen > 0 && (*payload == ' ' || *payload == '\t')) {
+                payload++; paylen--;
+            }
+            if (paylen == 6 && strncmp(payload, "[DONE]", 6) == 0) {
+                c->done = true;
+            } else if (paylen > 0) {
+                cJSON *root = cJSON_ParseWithLength(payload, paylen);
+                if (root) {
+                    cJSON *choices = cJSON_GetObjectItem(root, "choices");
+                    cJSON *first   = cJSON_IsArray(choices)
+                                     ? cJSON_GetArrayItem(choices, 0) : NULL;
+                    cJSON *delta   = first ? cJSON_GetObjectItem(first, "delta") : NULL;
+                    cJSON *content = delta ? cJSON_GetObjectItem(delta, "content") : NULL;
+                    if (cJSON_IsString(content) && content->valuestring) {
+                        absorb_text(c, content->valuestring,
+                                    strlen(content->valuestring));
+                    }
+                    cJSON_Delete(root);
+                }
+            }
+        }
+        p = eol ? eol + 1 : end;
+    }
+}
+
+// HTTP body chunk callback. Buffers raw bytes until a complete SSE
+// record (delimited by "\n\n") is available, then process it. Keep the
+// trailing partial in `raw` for the next chunk.
+static bool stream_chunk_cb(const char *data, size_t len, void *user) {
+    stream_ctx_t *c = (stream_ctx_t *)user;
+    if (!c) return false;
+    size_t room = STREAM_RAW_BUF - 1 - c->raw_len;
+    size_t take = len < room ? len : room;
+    if (take > 0) {
+        memcpy(c->raw + c->raw_len, data, take);
+        c->raw_len += take;
+        c->raw[c->raw_len] = '\0';
+    }
+    // Pull off complete "\n\n"-terminated records.
+    for (;;) {
+        char *sep = strstr(c->raw, "\n\n");
+        if (!sep) break;
+        size_t rec_len = (size_t)(sep - c->raw);
+        process_sse_record(c, c->raw, rec_len);
+        size_t consumed = rec_len + 2;
+        size_t leftover = c->raw_len - consumed;
+        if (leftover > 0) memmove(c->raw, c->raw + consumed, leftover);
+        c->raw_len = leftover;
+        c->raw[c->raw_len] = '\0';
+    }
+    return !c->done;   // stop reading once the upstream said [DONE]
+}
+
+// Build the chat body for the streaming variant: same OpenAI shape as the
+// non-streaming path but with `stream: true` and no tools (the streaming
+// wire format would need delta-call decoding we don't ship).
+static int build_chat_body_stream(char *out, size_t cap,
+                                  int max_tokens, float temperature) {
+    if (!out || cap == 0) return -1;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return -1;
+
+    const char *model = devcfg_llm_model();
+    if (!is_supported_model(model)) model = "anthropic/claude-haiku-4-5";
+
+    cJSON_AddStringToObject(root, "model",       wire_model(model));
+    cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
+    cJSON_AddNumberToObject(root, "temperature", temperature);
+    cJSON_AddBoolToObject  (root, "stream",      true);
+
+    cJSON *msgs = cJSON_AddArrayToObject(root, "messages");
+
+    char *sysprompt = malloc(SYS_PROMPT_CAP);
+    if (!sysprompt) { cJSON_Delete(root); return -1; }
+    // No tool listing in streaming mode — pass empty service arrays.
+    build_system_prompt(sysprompt, SYS_PROMPT_CAP, NULL, NULL);
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role",    "system");
+    cJSON_AddStringToObject(sys, "content", sysprompt);
+    cJSON_AddItemToArray(msgs, sys);
+    free(sysprompt);
+
+    for (int i = 0; i < s_hist_len; ++i) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role",    s_history[i].role);
+        cJSON_AddStringToObject(m, "content", s_history[i].text);
+        cJSON_AddItemToArray(msgs, m);
+    }
+
+    bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
+    cJSON_Delete(root);
+    if (!ok) { ESP_LOGW(TAG, "stream body overflow (cap=%u)", (unsigned)cap); return -1; }
+    return (int)strlen(out);
+}
+
+// Convert /api/<provider> into /api/<provider>/stream. Both routes share
+// the same x402 price tier and Solana receiver, so the only thing that
+// differs is the path suffix.
+static void stream_url_for(const char *base, char *out, size_t cap) {
+    snprintf(out, cap, "%s/stream", base);
+}
+
+bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
+    if (!user || !user[0] || !reply_out || reply_cap == 0) return false;
+    reply_out[0] = '\0';
+
+    push_turn("user", user);
+
+    char *body = malloc(CHAT_BODY_CAP);
+    if (!body) {
+        strlcpy(reply_out, "I'm out of memory.", reply_cap);
+        pop_last_turn();
+        return false;
+    }
+    int n = build_chat_body_stream(body, CHAT_BODY_CAP,
+                                   /*max_tokens=*/512, /*temperature=*/0.9);
+    if (n < 0) {
+        strlcpy(reply_out, "My thoughts didn't fit.", reply_cap);
+        free(body);
+        pop_last_turn();
+        return false;
+    }
+
+    char base_url[160];
+    strlcpy(base_url, resolve_llm_url(devcfg_llm_model()), sizeof(base_url));
+    char stream_url[192];
+    stream_url_for(base_url, stream_url, sizeof(stream_url));
+
+    stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        strlcpy(reply_out, "I'm out of memory.", reply_cap);
+        free(body);
+        pop_last_turn();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "POST(stream) %s (model=%s)", stream_url, devcfg_llm_model());
+    x402_result_t r = {0};
+    x402_call_stream("POST", stream_url, body, NULL,
+                     stream_chunk_cb, ctx, &r);
+    free(body);
+
+    // End-of-stream flush: any trailing partial sentence (no closing
+    // punctuation) still goes to TTS so we don't drop the tail.
+    flush_sentence(ctx);
+
+    bool ok = (r.status == 200) && (ctx->reply_len > 0);
+    if (!ok) {
+        ESP_LOGW(TAG, "stream HTTP %d (err=%s) reply_len=%u",
+                 r.status, r.error, (unsigned)ctx->reply_len);
+        if (r.status == 402) {
+            strlcpy(reply_out, "I couldn't complete the USDC payment.", reply_cap);
+        } else if (r.error[0]) {
+            snprintf(reply_out, reply_cap, "Daemon's brain is offline: %s", r.error);
+        } else {
+            strlcpy(reply_out, "I forgot what I was going to say.", reply_cap);
+        }
+        free(ctx);
+        pop_last_turn();
+        return false;
+    }
+
+    // Trim and surface the full reply for subtitle / history.
+    (void)trim_to(ctx->reply, reply_out, reply_cap);
+    free(ctx);
+    push_turn("assistant", reply_out);
+    return true;
 }

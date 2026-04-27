@@ -30,6 +30,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -53,15 +54,29 @@ static const char *TAG = "voice";
 #define BEEP_SAMPLE_HZ 16000
 #define VOICE_TEXT_MAX 512
 #define CODEC_WRITE_FRAMES 512
+// Queue depth for streaming TTS: we buffer up to N sentences while the
+// current one plays. 8 covers typical multi-sentence replies; depth-zero
+// behaviour (drop) is acceptable for the tail of a very long reply.
+#define VOICE_QUEUE_DEPTH 8
+
+typedef enum {
+    VOICE_CMD_SPEAK,    // do TTS round-trip on `.text` and play
+    VOICE_CMD_CHIRP,    // play a tiny acknowledgement tone
+} voice_cmd_t;
+
+typedef struct {
+    voice_cmd_t cmd;
+    char        text[VOICE_TEXT_MAX];
+} voice_msg_t;
 
 // --- module state ----------------------------------------------------------
 
 static esp_codec_dev_handle_t  s_codec      = NULL;
 static TaskHandle_t            s_audio_task = NULL;
-static SemaphoreHandle_t       s_request_sem = NULL;
+// Queue of voice_msg_t. Replaces the prior single-slot s_pending_text +
+// binary semaphore so streaming callers can append sentence-by-sentence.
+static QueueHandle_t           s_queue       = NULL;
 
-static char     s_pending_text[VOICE_TEXT_MAX] = "";
-static volatile bool s_pending_chirp   = false;
 static volatile bool s_playing         = false;
 static volatile bool s_stop_requested  = false;
 static volatile uint8_t s_volume_0_21  = 0;
@@ -275,31 +290,25 @@ static bool tts_perform(const char *text) {
 
 static void audio_task(void *arg) {
     (void)arg;
+    voice_msg_t msg;
     for (;;) {
-        xSemaphoreTake(s_request_sem, portMAX_DELAY);
+        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE) continue;
 
-        // Chirp first if requested. ~80 ms soft tone — fits between two
-        // semaphore wakeups and never blocks a real TTS request because
-        // voice_chirp() declines to enqueue while s_playing is true.
-        if (s_pending_chirp) {
-            s_pending_chirp = false;
+        if (msg.cmd == VOICE_CMD_CHIRP) {
+            // ~80 ms soft tone for press-release feedback.
             if (codec_open_for_speak() == ESP_OK) {
                 beep_tone(520, 80, 5000);
                 esp_codec_dev_close(s_codec);
             }
+            continue;
         }
 
-        char local[VOICE_TEXT_MAX];
-        strncpy(local, s_pending_text, sizeof(local) - 1);
-        local[sizeof(local) - 1] = 0;
-        s_pending_text[0] = 0;
-
-        if (!local[0]) continue;
+        if (msg.cmd != VOICE_CMD_SPEAK || !msg.text[0]) continue;
 
         s_stop_requested = false;
         s_playing = true;
         if (codec_open_for_speak() == ESP_OK) {
-            (void)tts_perform(local);
+            (void)tts_perform(msg.text);
             esp_codec_dev_close(s_codec);
         }
         s_playing = false;
@@ -330,40 +339,57 @@ bool voice_begin(void) {
         esp_codec_dev_close(s_codec);
     }
 
-    s_request_sem = xSemaphoreCreateBinary();
-    if (!s_request_sem) {
-        ESP_LOGE(TAG, "semaphore create failed");
+    s_queue = xQueueCreate(VOICE_QUEUE_DEPTH, sizeof(voice_msg_t));
+    if (!s_queue) {
+        ESP_LOGE(TAG, "voice queue create failed");
         return false;
     }
     BaseType_t ok = xTaskCreatePinnedToCore(
         audio_task, "voice_audio", 6144, NULL, 6, &s_audio_task, 0);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "audio task create failed");
-        vSemaphoreDelete(s_request_sem);
-        s_request_sem = NULL;
+        vQueueDelete(s_queue);
+        s_queue = NULL;
         return false;
     }
     ESP_LOGI(TAG, "voice up @ %d Hz mono via BSP/ES8311", TTS_SAMPLE_HZ);
     return true;
 }
 
+// Single-shot TTS. Drains any pending chunks first (interrupt-replace
+// semantics), then plays the new text. Used for typed messages, boot
+// greeting, wallet ticker reactions — anything that's a complete reply
+// rather than a streaming fragment.
 bool voice_speak(const char *text) {
-    if (!s_codec || !s_request_sem) return false;
+    if (!s_codec || !s_queue) return false;
     if (!text || !text[0]) return false;
     s_stop_requested = true;
-    strncpy(s_pending_text, text, sizeof(s_pending_text) - 1);
-    s_pending_text[sizeof(s_pending_text) - 1] = 0;
-    xSemaphoreGive(s_request_sem);
+    xQueueReset(s_queue);
+    voice_msg_t msg = { .cmd = VOICE_CMD_SPEAK };
+    strncpy(msg.text, text, sizeof(msg.text) - 1);
+    msg.text[sizeof(msg.text) - 1] = 0;
+    xQueueSend(s_queue, &msg, 0);
     return true;
 }
 
+// Append a TTS chunk to the back of the queue. Used by the streaming
+// chat path: as the LLM emits sentence-bounded fragments, each one
+// hands off here so audio starts before the LLM has finished generating.
+// Returns false if the queue is full (chunk silently dropped).
+bool voice_speak_chunk(const char *text) {
+    if (!s_codec || !s_queue) return false;
+    if (!text || !text[0]) return false;
+    voice_msg_t msg = { .cmd = VOICE_CMD_SPEAK };
+    strncpy(msg.text, text, sizeof(msg.text) - 1);
+    msg.text[sizeof(msg.text) - 1] = 0;
+    return xQueueSend(s_queue, &msg, 0) == pdTRUE;
+}
+
 void voice_chirp(void) {
-    // Skip if voice isn't up yet, or if TTS is in flight (chirp would queue
-    // behind it and play minutes too late). The whole point is immediate
-    // feedback when the user releases the talk button.
-    if (!s_codec || !s_request_sem || s_playing) return;
-    s_pending_chirp = true;
-    xSemaphoreGive(s_request_sem);
+    if (!s_codec || !s_queue || s_playing) return;
+    voice_msg_t msg = { .cmd = VOICE_CMD_CHIRP };
+    msg.text[0] = 0;
+    xQueueSend(s_queue, &msg, 0);
 }
 
 bool voice_is_speaking(void) {

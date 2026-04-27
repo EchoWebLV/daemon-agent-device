@@ -199,9 +199,19 @@ static bool b64_decode(const char *in, size_t in_len,
 // Header state captured during the first (possibly 402) response.
 // ---------------------------------------------------------------------------
 typedef struct {
-    char   *body_buf;       // caller-owned
+    // Buffered delivery (used in non-streaming mode and during phase 1 of
+    // the streaming path while we're capturing the 402 response). Mutually
+    // exclusive with the callback below — exactly one is active at a time.
+    char   *body_buf;
     size_t  body_cap;
     size_t  body_len;
+
+    // Streaming delivery. When `on_chunk` is non-NULL, body_buf is ignored
+    // and each HTTP_EVENT_ON_DATA tick fires the callback. Returning false
+    // from the callback aborts the perform.
+    x402_chunk_cb_t on_chunk;
+    void           *cb_user;
+    bool            stream_aborted;
 
     // Each may hold a ~4 KB base64 blob when present; stay unallocated
     // (NULL) when we don't need them (e.g. the retry path).
@@ -227,6 +237,19 @@ static esp_err_t on_x402_event(esp_http_client_event_t *evt) {
             break;
         }
         case HTTP_EVENT_ON_DATA: {
+            // Streaming mode: hand chunks to the caller as they arrive.
+            if (s->on_chunk) {
+                if (s->stream_aborted) return ESP_FAIL;
+                s->body_len += (size_t)evt->data_len;
+                bool keep = s->on_chunk((const char *)evt->data,
+                                        (size_t)evt->data_len, s->cb_user);
+                if (!keep) {
+                    s->stream_aborted = true;
+                    return ESP_FAIL;
+                }
+                break;
+            }
+            // Buffered mode (default).
             if (!s->body_buf || s->body_cap == 0) break;
             size_t room = s->body_cap - 1 - s->body_len;
             if (room == 0) break;
@@ -447,21 +470,35 @@ static esp_http_client_method_t method_from_str(const char *m, bool *has_body) {
     return HTTP_METHOD_POST;
 }
 
-void x402_call(const char *method,
-               const char *url,
-               const char *json_body,
-               const char *auth_bearer,
-               char       *body_buf,
-               size_t      body_cap,
-               x402_result_t *out) {
+// Internal one-stop entry that both x402_call and x402_call_stream share.
+// In buffered mode, body_buf is non-NULL; in streaming mode, on_chunk is
+// non-NULL. Phase 1 always buffers (so we can capture a small 402 body
+// for the description fallback path); phase 2's delivery follows whichever
+// mode the caller picked. In streaming mode we provide a tiny phase-1
+// scratch buffer so the 402 description can still be parsed if it's in
+// the body instead of a header.
+static void x402_call_internal(const char *method,
+                               const char *url,
+                               const char *json_body,
+                               const char *auth_bearer,
+                               char       *body_buf,        // NULL in stream mode
+                               size_t      body_cap,
+                               x402_chunk_cb_t on_chunk,    // NULL in buffered mode
+                               void           *cb_user,
+                               x402_result_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     if (body_buf && body_cap) body_buf[0] = '\0';
 
     bool has_body = true;
     esp_http_client_method_t http_method = method_from_str(method, &has_body);
+    bool streaming = (on_chunk != NULL);
 
-    if (!url || !body_buf || body_cap == 0) {
+    if (!url) {
+        strlcpy(out->error, "bad args", sizeof(out->error));
+        return;
+    }
+    if (!streaming && (!body_buf || body_cap == 0)) {
         strlcpy(out->error, "bad args", sizeof(out->error));
         return;
     }
@@ -487,8 +524,22 @@ void x402_call(const char *method,
         return;
     }
 
+    // Phase 1 always buffers (the 402 description may live in the body).
+    // In streaming mode we allocate a small temporary buffer for that.
+    char *phase1_buf = body_buf;
+    size_t phase1_cap = body_cap;
+    if (streaming) {
+        phase1_buf = (char *)heap_caps_calloc(1, X402_DESC_CAP, MALLOC_CAP_SPIRAM);
+        if (!phase1_buf) {
+            free(pr); free(xpr); free(wa);
+            strlcpy(out->error, "oom", sizeof(out->error));
+            return;
+        }
+        phase1_cap = X402_DESC_CAP;
+    }
+
     x402_state_t state = {
-        .body_buf = body_buf, .body_cap = body_cap, .body_len = 0,
+        .body_buf = phase1_buf, .body_cap = phase1_cap, .body_len = 0,
         .pr = pr, .xpr = xpr, .wa = wa,
     };
 
@@ -569,8 +620,16 @@ void x402_call(const char *method,
             goto done;
         }
 
-        // Reset body buffer for the retry.
-        body_buf[0]    = '\0';
+        // Phase 2 delivery: streaming mode swaps to the chunk callback.
+        // Buffered mode reuses body_buf, reset to empty.
+        if (streaming) {
+            state.body_buf = NULL;
+            state.body_cap = 0;
+            state.on_chunk = on_chunk;
+            state.cb_user  = cb_user;
+        } else {
+            body_buf[0] = '\0';
+        }
         state.body_len = 0;
         // Don't need the header slots anymore; avoid re-populating them.
         state.pr = state.xpr = state.wa = NULL;
@@ -587,7 +646,10 @@ void x402_call(const char *method,
         out->status   = code2;
         out->body_len = state.body_len;
         if (err2 != ESP_OK) {
-            snprintf(out->error, sizeof(out->error), "retry: %s", esp_err_to_name(err2));
+            // A user-cancelled stream surfaces as ESP_FAIL from on_data;
+            // don't tag that as a network error.
+            if (state.stream_aborted) strlcpy(out->error, "aborted", sizeof(out->error));
+            else snprintf(out->error, sizeof(out->error), "retry: %s", esp_err_to_name(err2));
         } else if (code2 == 200) {
             // Report the real USDC cost we committed to.
             out->cost_usd = (double)paid_atomic / 1e6;
@@ -605,10 +667,39 @@ void x402_call(const char *method,
     if (code1 != 200) {
         snprintf(out->error, sizeof(out->error), "status %d", code1);
     }
+    // Streaming callers expect chunks; phase-1 body sat in scratch and is
+    // unreachable. Surface what we got via the callback so unprefixed
+    // success on a streaming call still drains correctly.
+    if (streaming && code1 == 200 && phase1_buf && state.body_len > 0) {
+        on_chunk(phase1_buf, state.body_len, cb_user);
+    }
     esp_http_client_cleanup(h);
 
 done:
+    if (streaming && phase1_buf) free(phase1_buf);
     free(pr); free(xpr); free(wa);
+}
+
+void x402_call(const char *method,
+               const char *url,
+               const char *json_body,
+               const char *auth_bearer,
+               char       *body_buf,
+               size_t      body_cap,
+               x402_result_t *out) {
+    x402_call_internal(method, url, json_body, auth_bearer,
+                       body_buf, body_cap, NULL, NULL, out);
+}
+
+void x402_call_stream(const char *method,
+                      const char *url,
+                      const char *json_body,
+                      const char *auth_bearer,
+                      x402_chunk_cb_t on_chunk,
+                      void          *cb_user,
+                      x402_result_t *out) {
+    x402_call_internal(method, url, json_body, auth_bearer,
+                       NULL, 0, on_chunk, cb_user, out);
 }
 
 void x402_post(const char *url, const char *json_body,
