@@ -6,12 +6,14 @@
 # by bumping a single version.
 dependencies:
   idf: ">=5.1"
-  lvgl/lvgl:                      "^9.2.0"   # display UI (v9 API)
-  espressif/esp_lvgl_port:        "^2.4.0"   # LVGL <-> esp_lcd glue; v2.x goes with LVGL v9
-  # esp_lcd_touch is the generic abstraction; the vendor driver registers
-  # the concrete probe against it. We pull the CST328 driver from Waveshare's
-  # namespace — Espressif doesn't publish one for this IC.
-  espressif/esp_lcd_touch:        "^1.1.2"
-  waveshare/esp_lcd_touch_cst328: "^1.0.4"
-  # Uncomment as each subsystem comes online:
-  # espressif/esp_littlefs:    "^1.16.0"    # persistent storage
+  lvgl/lvgl:                       "^9.2.0"
+  espressif/esp_lvgl_port:         "^2.4.0"
+  espressif/esp_lcd_touch:         "^1.1.2"
+  # BOX-3B touch IC. Replaces the Waveshare CST328 driver.
+  espressif/esp_lcd_touch_tt21100: "^1.1.0"
+  # ILI9342C driver (covers ILI9341 + ILI9342). Replaces the built-in
+  # ST7789 wiring used by the Waveshare panel.
+  espressif/esp_lcd_ili9341:       "^2.0.0"
+  # CST328 dep stays one more task — touch.c still includes its header.
+  # Removed in Task 5 once touch.c is on TT21100.
+  waveshare/esp_lcd_touch_cst328:  "^1.0.4"

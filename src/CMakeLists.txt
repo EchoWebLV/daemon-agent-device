@@ -67,8 +67,11 @@ idf_component_register(
         # Pulled in via src/idf_component.yml.
         lvgl
         esp_lvgl_port
-        # CST328 touch controller + the esp_lcd_touch abstraction it
-        # plugs into. Both pulled in via src/idf_component.yml.
+        # LCD panel drivers — ILI9342 (BOX-3B) over esp_lcd, plus the
+        # generic touch abstraction and the TT21100 vendor driver.
+        # CST328 stays one more task while touch.c still uses it.
+        esp_lcd_ili9341
         esp_lcd_touch
+        esp_lcd_touch_tt21100
         esp_lcd_touch_cst328
 )
