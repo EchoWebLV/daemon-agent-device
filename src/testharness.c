@@ -963,6 +963,26 @@ static void dispatch_line(const char *line) {
             }
             return;
         }
+        // V2 <from> <to> <amount> [slippage_bps]  →  full pipeline dry-run:
+        // parser + wrap + ALT fetch + v2 sign. Returns the base64 tx so
+        // the host can validate via simulateTransaction without spending.
+        if ((args = match_token(rest, "V2"))) {
+            char from[12] = {0}, to[12] = {0};
+            double amount = 0;
+            unsigned slip = 0;
+            int parsed = sscanf(args, "%11s %11s %lf %u",
+                                from, to, &amount, &slip);
+            if (parsed < 3) { resp_err("usage SWAP V2 <from> <to> <amount> [slippage_bps]"); return; }
+            char *out = malloc(8192);
+            if (!out) { resp_err("oom"); return; }
+            if (swap_v2_build_for_test(from, to, amount, (uint16_t)slip, out, 8192)) {
+                resp_ok(out);
+            } else {
+                resp_err("v2_build_failed");
+            }
+            free(out);
+            return;
+        }
         resp_err("swap bad_subverb");
         return;
     }

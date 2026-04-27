@@ -208,6 +208,17 @@ bool swap_alts_for_test(const char *from_sym, const char *to_sym,
                         double amount_ui, uint16_t slippage_bps,
                         char *out_json, size_t cap);
 
+// Diagnostic — runs the FULL Jupiter /swap-instructions orchestration
+// (parse → wrap each ix in vault_execute → fetch ALTs → compose v0 tx
+// → sign with the device key) end-to-end and writes the base64 signed
+// VersionedTransaction into `out_b64`. Does NOT broadcast — the host
+// can hand it to `solana confirm` / `simulateTransaction` to validate
+// that the pipeline produced a runtime-acceptable tx before committing
+// to a real swap. Used by the host harness only.
+bool swap_v2_build_for_test(const char *from_sym, const char *to_sym,
+                            double amount_ui, uint16_t slippage_bps,
+                            char *out_b64, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -32,9 +32,11 @@
 #include "base58.h"
 #include "ed25519.h"
 #include "refill.h"
+#include "solana_tx.h"
 #include "swap_screen.h"
 #include "wallet.h"
 #include "wifi_sta.h"
+#include "x402.h"     // fetch_recent_blockhash
 
 static const char *TAG = "swap";
 static double swap_pow10(uint8_t n);
@@ -1356,4 +1358,185 @@ overflow:
     jup_alt_set_free(&set);
     snprintf(out_json, cap, "{\"error\":\"out_overflow\"}");
     return false;
+}
+
+// Per-instruction scratch — owns the outer ix data buffer + outer metas
+// array, both of which must live until solana_build_tx_v2_base64 has
+// serialized the message. Released by the V2 build helper after build.
+typedef struct {
+    uint8_t             *raw;     // outer ix data (heap)
+    size_t               raw_len;
+    solana_ix_account_t *metas;   // outer metas (heap)
+    size_t               meta_count;
+} swap_v2_wrapped_t;
+
+// Free the per-ix scratch. Idempotent.
+static void swap_v2_wrapped_free(swap_v2_wrapped_t *arr, size_t n) {
+    if (!arr) return;
+    for (size_t i = 0; i < n; i++) {
+        free(arr[i].raw);
+        free(arr[i].metas);
+    }
+    free(arr);
+}
+
+// Wrap one parsed Jupiter ix into a freshly allocated outer-ix buffer pair.
+// Returns true on success; on failure leaves *out clean.
+static bool swap_v2_wrap_one(const jup_ix_t *src,
+                             const uint8_t   vault[32],
+                             const uint8_t   signer[32],
+                             swap_v2_wrapped_t *out)
+{
+    memset(out, 0, sizeof *out);
+    // agent_pda caps inner metas at 64; outer = 2 + N + 1 (≤ 67). Pad to 72.
+    const size_t meta_cap = 72;
+    // outer ix data = 8 + 32 + 4 + 34*64 + 4 + 1024 ≤ 3.2 KB. 4 KB headroom.
+    const size_t raw_cap  = 4096;
+    out->raw   = malloc(raw_cap);
+    out->metas = malloc(meta_cap * sizeof(*out->metas));
+    if (!out->raw || !out->metas) {
+        free(out->raw); free(out->metas);
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    size_t mc = 0;
+    int rl = jup_ix_wrap_vault_execute(src, vault, signer,
+                                       out->raw, raw_cap,
+                                       out->metas, &mc, meta_cap);
+    if (rl < 0) {
+        free(out->raw); free(out->metas);
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    out->raw_len    = (size_t)rl;
+    out->meta_count = mc;
+    return true;
+}
+
+bool swap_v2_build_for_test(const char *from_sym, const char *to_sym,
+                            double amount_ui, uint16_t slippage_bps,
+                            char *out_b64, size_t cap)
+{
+    if (!out_b64 || cap == 0) return false;
+    out_b64[0] = '\0';
+
+    // ---- 1. resolve symbols + quote -------------------------------------
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        ESP_LOGW(TAG, "v2_build: unknown symbol"); return false;
+    }
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        ESP_LOGW(TAG, "v2_build: quote failed"); return false;
+    }
+
+    // ---- 2. resolve our keys + blockhash --------------------------------
+    const char    *user_b58     = wallet_vault_pda();
+    const uint8_t *vault_bytes  = wallet_vault_pda_bytes();
+    const uint8_t *signer_bytes = wallet_pubkey_bytes();
+    if (!user_b58 || !*user_b58 || !vault_bytes || !signer_bytes) {
+        free(q.quote_json); ESP_LOGW(TAG, "v2_build: no keys"); return false;
+    }
+    uint8_t blockhash[32];
+    if (!fetch_recent_blockhash(blockhash)) {
+        free(q.quote_json); ESP_LOGW(TAG, "v2_build: blockhash fail"); return false;
+    }
+
+    // ---- 3. parse /swap-instructions ------------------------------------
+    jup_swap_instructions_t parsed = {0};
+    bool ok_parse = jup_swap_instructions_build(q.quote_json, user_b58, &parsed);
+    free(q.quote_json);
+    if (!ok_parse) { ESP_LOGW(TAG, "v2_build: parse failed"); return false; }
+
+    bool          success    = false;
+    jup_alt_set_t alt_set    = {0};
+    swap_v2_wrapped_t *wrap  = NULL;
+    solana_ix_v2_t    *ixs   = NULL;
+    solana_alt_t      *alts  = NULL;
+    size_t             nwrap = 0;
+
+    do {
+        // ---- 4. fetch ALT contents --------------------------------------
+        if (!jup_alt_set_fetch(parsed.alt_addresses, parsed.alt_count, &alt_set)) {
+            ESP_LOGW(TAG, "v2_build: alt fetch failed"); break;
+        }
+
+        // ---- 5. wrap each ix in vault_execute ---------------------------
+        size_t total = parsed.setup_count
+                     + (parsed.has_swap    ? 1 : 0)
+                     + (parsed.has_cleanup ? 1 : 0);
+        if (total == 0) { ESP_LOGW(TAG, "v2_build: no ixs"); break; }
+        wrap = calloc(total, sizeof *wrap);
+        if (!wrap) break;
+
+        bool wrap_ok = true;
+        for (size_t i = 0; i < parsed.setup_count && wrap_ok; i++) {
+            wrap_ok = swap_v2_wrap_one(&parsed.setup[i], vault_bytes,
+                                       signer_bytes, &wrap[nwrap++]);
+        }
+        if (wrap_ok && parsed.has_swap) {
+            wrap_ok = swap_v2_wrap_one(&parsed.swap, vault_bytes,
+                                       signer_bytes, &wrap[nwrap++]);
+        }
+        if (wrap_ok && parsed.has_cleanup) {
+            wrap_ok = swap_v2_wrap_one(&parsed.cleanup, vault_bytes,
+                                       signer_bytes, &wrap[nwrap++]);
+        }
+        if (!wrap_ok) { ESP_LOGW(TAG, "v2_build: wrap failed"); break; }
+
+        // ---- 6. compose solana_ix_v2_t array ----------------------------
+        ixs = calloc(nwrap, sizeof *ixs);
+        if (!ixs) break;
+        for (size_t i = 0; i < nwrap; i++) {
+            ixs[i].program_id    = AGENT_PROGRAM_ID;
+            ixs[i].accounts      = wrap[i].metas;
+            ixs[i].account_count = wrap[i].meta_count;
+            ixs[i].data          = wrap[i].raw;
+            ixs[i].data_len      = wrap[i].raw_len;
+        }
+
+        // ---- 7. compose solana_alt_t array ------------------------------
+        if (alt_set.table_count > 0) {
+            alts = calloc(alt_set.table_count, sizeof *alts);
+            if (!alts) break;
+            for (size_t i = 0; i < alt_set.table_count; i++) {
+                alts[i].table_pubkey  = alt_set.tables[i].table_pubkey;
+                alts[i].addresses     = (const uint8_t (*)[32])alt_set.tables[i].addresses;
+                alts[i].address_count = alt_set.tables[i].count;
+            }
+        }
+
+        // ---- 8. build the v0 tx -----------------------------------------
+        // Jupiter recommends a generous CU limit for routed swaps.
+        // 1.4M is the runtime ceiling for a single tx; we ask for it so
+        // dynamicComputeUnitLimit doesn't squeeze a complex route. Priority
+        // is whatever Jupiter's response specified (we asked for 1).
+        solana_tx_input_v2_t txin = {
+            .fee_payer       = signer_bytes,
+            .signer_pubkey   = signer_bytes,
+            .blockhash       = blockhash,
+            .ixs             = ixs,
+            .ix_count        = nwrap,
+            .cu_limit        = 1400000,
+            .cu_price_micro  = parsed.priority_lamports ? parsed.priority_lamports : 1,
+            .alts            = alts,
+            .alt_count       = alt_set.table_count,
+        };
+        int len = solana_build_tx_v2_base64(&txin, out_b64, cap);
+        if (len <= 0) {
+            ESP_LOGW(TAG, "v2_build: tx build failed (len=%d)", len);
+            break;
+        }
+        success = true;
+    } while (0);
+
+    free(alts);
+    free(ixs);
+    swap_v2_wrapped_free(wrap, nwrap);
+    jup_alt_set_free(&alt_set);
+    jup_swap_instructions_free(&parsed);
+
+    if (!success) out_b64[0] = '\0';
+    return success;
 }
