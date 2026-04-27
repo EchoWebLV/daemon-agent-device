@@ -124,6 +124,17 @@ static void on_btn_event(lv_event_t *e) {
             pin_screen_set_status("PIN too short");
             return;
         }
+        // The caller's pin_unlock runs PBKDF2 (100k iterations, ~1-2 s)
+        // on this same task. Show "Unlocking..." and force an immediate
+        // render so the user gets feedback before the LVGL task freezes
+        // — without this the screen looks dead and people assume they
+        // typed the wrong PIN.
+        lv_obj_set_style_text_color(s_ctx.status_lbl, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
+        lv_label_set_text(s_ctx.status_lbl, "Unlocking...");
+        lv_refr_now(NULL);
+        // Restore warn color for any subsequent error message the cb sets.
+        lv_obj_set_style_text_color(s_ctx.status_lbl, SCR_COLOR_WARN, LV_PART_MAIN);
+
         pin_screen_cb_t cb = s_ctx.cb;
         void           *user = s_ctx.user;
         char            pin[PIN_BUF_MAX];
