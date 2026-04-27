@@ -38,6 +38,10 @@ static const char *TAG = "daemon";
 // of answering /say. Keeping the forwarder here (rather than in ai.c or ui.c)
 // lets each module stay unaware of the others — ai.c writes a reply, ui.c
 // displays+speaks it, and this one-liner is the seam where the two meet.
+//
+// M1 (BOX-3B): currently orphaned. Its only call site,
+// `server_set_say_handler(say_with_ui)`, is commented out below until M2
+// re-enables the chat path. Left in place so M2 just uncomments the wiring.
 static void say_with_ui(const char *user, char *reply_out, size_t reply_cap) {
     ai_handle_say(user, reply_out, reply_cap);
     // Only drive the UI when we got a non-empty answer. On error ai.c writes
@@ -172,12 +176,12 @@ void app_main(void) {
     // wallet just decodes the static key, and price_begin() is a no-op.
     // Refreshes only attempt network traffic when wifi_sta_is_connected().
     wallet_begin();
-    // React when incoming SOL / USDC / SPL crosses the announcement threshold.
-    // Must be installed before the first refresh so the baseline snapshot
-    // happens with the callback already set (the cb itself is skipped on the
-    // first refresh; installing late would still work but this keeps ordering
-    // obvious).
-    wallet_set_incoming_cb(on_wallet_incoming);
+    // M1 (BOX-3B): wallet incoming-cb intentionally not installed. The
+    // callback chains into ui_deliver_reply -> voice_speak (a no-op while
+    // voice_begin() is disabled) and would also flicker the creature
+    // mouth animation on a real wallet credit. Kept off so M1's display
+    // verification isn't muddied by stray wallet-driven UI events.
+    // Restored in M2 alongside the chat path.
     price_begin();
     if (wifi_err == ESP_OK) {
         wallet_request_refresh();
