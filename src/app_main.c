@@ -166,10 +166,14 @@ void app_main(void) {
     ai_begin();
     server_set_say_handler(say_with_ui);
 
-    // Voice path stays disabled until M3 (ES8311 codec rewrite of voice.c).
-    // voice_speak()'s internal NULL guards make it a safe no-op while
-    // voice_begin() hasn't run, so the chat -> ui_deliver_reply() chain
-    // doesn't crash — replies just appear silently as subtitle text.
+    // Voice: ES8311 codec on the shared I2C bus + I2S TX. Plays the
+    // boot-beep probe so a dead speaker / unseated codec is obvious in
+    // the first second of boot. Failure is non-fatal; voice_speak's
+    // NULL guards make replies fall through silently if codec init didn't
+    // take.
+    if (!voice_begin()) {
+        ESP_LOGW(TAG, "voice_begin failed; continuing muted");
+    }
 
     // No IMU on BOX-3B. Shake-to-talk is gone; M4 will replace it with
     // push-to-talk on the BOOT button once mic capture lands in M3.

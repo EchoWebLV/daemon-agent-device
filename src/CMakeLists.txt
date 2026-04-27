@@ -71,4 +71,7 @@ idf_component_register(
         esp_lcd_ili9341
         esp_lcd_touch
         esp_lcd_touch_gt911
+        # Audio codec stack — ES8311 for the speaker out path on BOX-3.
+        # Pulls in i2s_data_if + i2c_ctrl_if + es8311_codec as one component.
+        esp_codec_dev
 )

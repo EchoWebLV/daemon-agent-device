@@ -57,8 +57,12 @@
 #define BOARD_I2S_PIN_DOUT          GPIO_NUM_15   // ESP -> ES8311
 #define BOARD_I2S_PIN_DIN           GPIO_NUM_16   // ESP <- ES7210
 #define BOARD_AUDIO_PIN_PA_EN       GPIO_NUM_46   // speaker amp enable
-#define BOARD_ES8311_I2C_ADDR       (0x18)
-#define BOARD_ES7210_I2C_ADDR       (0x40)
+// 8-bit I2C addresses (7-bit slave addr left-shifted with the R/W bit).
+// The esp_codec_dev wrapper expects this form and shifts back internally;
+// passing the 7-bit form (0x18 / 0x40) makes the wrapper talk to the
+// wrong slave and codec init fails with "ES8311: Open fail".
+#define BOARD_ES8311_I2C_ADDR       (0x30)   // 7-bit 0x18 << 1
+#define BOARD_ES7210_I2C_ADDR       (0x80)   // 7-bit 0x40 << 1
 
 // === User inputs — defined for M4, unused in M1 ==============================
 #define BOARD_BTN_PIN_BOOT          GPIO_NUM_0    // momentary, active-low

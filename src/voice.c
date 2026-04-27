@@ -1,10 +1,32 @@
 // ---------------------------------------------------------------------------
-//  Voice playback implementation — ElevenLabs PCM → I2S_STD → PCM5101.
+//  Voice playback — ElevenLabs PCM stream → ES8311 codec on the BOX-3.
+//
+//  Pipeline (after voice_begin):
+//      voice_speak("...")
+//        → audio_task wakes
+//        → ElevenLabs HTTPS POST (/v1/text-to-speech/<voice>/stream,
+//          output_format=pcm_22050)
+//        → on each HTTP_EVENT_ON_DATA, raw 16-bit signed-LE mono PCM
+//          frames stream into esp_codec_dev_write
+//        → ES8311 codec (esp_codec_dev) drives I2S out + PA enable
+//
+//  Public API (voice_begin / voice_speak / voice_stop / voice_is_speaking
+//  / voice_set_volume / voice_diagnose) is unchanged from the previous
+//  PCM5101-DAC implementation, so app_main + ui.c don't have to know.
+//
+//  Hardware notes (BOX-3):
+//   - Codec ctrl on the shared I2C bus (bus_i2c() from bus.c) at 0x18.
+//   - I2S on I2S_NUM_0 with MCLK + BCLK + LRCK + DOUT pins from board.h.
+//   - PA enable on BOARD_AUDIO_PIN_PA_EN; the ES8311 driver toggles it
+//     itself via the gpio_if when the codec opens/closes, so we don't
+//     bit-bang it from here.
 // ---------------------------------------------------------------------------
 #include "voice.h"
 #include "secrets.h"
 #include "wifi_sta.h"
 #include "devcfg.h"
+#include "board.h"
+#include "bus.h"
 
 #include <math.h>
 #include <string.h>
@@ -24,38 +46,31 @@
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+
 #include "cJSON.h"
 
 static const char *TAG = "voice";
 
-// --- Pinout + audio format -------------------------------------------------
-#define I2S_BCLK_PIN   GPIO_NUM_48
-#define I2S_LRC_PIN    GPIO_NUM_38
-#define I2S_DOUT_PIN   GPIO_NUM_47
-
 #define TTS_SAMPLE_HZ  22050
 #define BEEP_SAMPLE_HZ 22050
-
-// Request text cap. The audio task copies the caller's string into a
-// bounded buffer so callers don't have to keep `text` alive.
 #define VOICE_TEXT_MAX 512
 
-// I2S write chunk in frames (L+R = 2 samples each). 512 frames ≈ 23 ms.
-// Small enough to respond to voice_stop() quickly without starving the DMA.
-#define I2S_WRITE_FRAMES 512
+// Codec write chunk in frames. ~23 ms at 22050 Hz mono.
+#define CODEC_WRITE_FRAMES 512
 
 // --- module state ----------------------------------------------------------
 
-static i2s_chan_handle_t s_tx         = NULL;
-static TaskHandle_t      s_audio_task = NULL;
-static SemaphoreHandle_t s_request_sem = NULL;   // signals a pending utterance
+static i2s_chan_handle_t       s_i2s_tx     = NULL;
+static esp_codec_dev_handle_t  s_codec      = NULL;   // OUT (speaker) handle
+static TaskHandle_t            s_audio_task = NULL;
+static SemaphoreHandle_t       s_request_sem = NULL;
 
-// Requested/live state. All written from the audio task except where
-// volatile-marked; voice_stop() flips s_stop_requested from any thread.
 static char     s_pending_text[VOICE_TEXT_MAX] = "";
 static volatile bool s_playing         = false;
 static volatile bool s_stop_requested  = false;
-static volatile uint8_t s_volume_0_21  = 0;    // overwritten by devcfg in voice_begin
+static volatile uint8_t s_volume_0_21  = 0;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -64,77 +79,123 @@ static bool has_eleven_key(void) {
     return k && strlen(k) >= 10 && strncmp(k, "your-", 5) != 0;
 }
 
-// Linear gain 0..21 -> 0..1.0. Linear (not log-taper) makes the low end of
-// the UI slider feel responsive on the small tabletop speaker.
-static float volume_gain(void) {
+// 0..21 → 0..100 for the codec's percent-volume API. Keep linear (not log)
+// because the small tabletop speaker has narrow useful range and a log
+// taper makes the bottom half feel dead.
+static int volume_percent(void) {
     uint8_t v = s_volume_0_21;
     if (v > 21) v = 21;
-    return (float)v / 21.0f;
+    return (int)((v * 100) / 21);
 }
 
-// Apply gain + expand mono samples to interleaved stereo in-place-ish. The
-// caller provides `mono_in` of `frames_in` mono samples and a `stereo_out`
-// buffer of at least `frames_in * 2` samples. Returns bytes written.
-static size_t mono_to_stereo_gain(const int16_t *mono_in, size_t frames_in,
-                                  int16_t *stereo_out, float gain) {
-    for (size_t i = 0; i < frames_in; i++) {
-        int32_t v = (int32_t)lroundf((float)mono_in[i] * gain);
-        if (v >  32767) v =  32767;
-        if (v < -32768) v = -32768;
-        stereo_out[2 * i]     = (int16_t)v;
-        stereo_out[2 * i + 1] = (int16_t)v;
-    }
-    return frames_in * 2 * sizeof(int16_t);
-}
-
-// --- I2S setup -------------------------------------------------------------
+// --- codec bring-up --------------------------------------------------------
 
 static esp_err_t i2s_install(uint32_t sample_hz) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    // Bigger DMA ring = smoother playback across bursty HTTP reads, at the
-    // cost of a few extra KB of internal RAM.
-    chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 240;
-    // Write zero-fills when the DMA ring underruns. Without this the ring
-    // keeps cycling the last descriptor forever, so the tail of the boot
-    // beep loops indefinitely between the 3-tone probe and the first TTS
-    // stream — which is exactly the "stuck on one sound" regression this
-    // fixes.
-    chan_cfg.auto_clear_after_cb = true;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BOARD_I2S_PORT, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num         = 8;
+    chan_cfg.dma_frame_num        = 240;
+    chan_cfg.auto_clear_after_cb  = true;
 
-    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL);
     if (err != ESP_OK) return err;
 
+    // ES8311 wants Philips slot format, 16-bit, mono. The codec stretches
+    // mono to its internal stereo path; sending stereo here just wastes
+    // half the DMA bandwidth.
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_hz),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = I2S_BCLK_PIN,
-            .ws   = I2S_LRC_PIN,
-            .dout = I2S_DOUT_PIN,
+            .mclk = BOARD_I2S_PIN_MCLK,
+            .bclk = BOARD_I2S_PIN_BCLK,
+            .ws   = BOARD_I2S_PIN_LRCK,
+            .dout = BOARD_I2S_PIN_DOUT,
             .din  = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
+            .invert_flags = { 0 },
         },
     };
-    err = i2s_channel_init_std_mode(s_tx, &std_cfg);
+    err = i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
     if (err != ESP_OK) {
-        i2s_del_channel(s_tx);
-        s_tx = NULL;
+        i2s_del_channel(s_i2s_tx);
+        s_i2s_tx = NULL;
         return err;
     }
-    return i2s_channel_enable(s_tx);
+    return i2s_channel_enable(s_i2s_tx);
+}
+
+static esp_err_t codec_install(void) {
+    // I2S data interface for the codec.
+    audio_codec_i2s_cfg_t i2s_if_cfg = {
+        .port      = BOARD_I2S_PORT,
+        .tx_handle = s_i2s_tx,
+        .rx_handle = NULL,
+    };
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_if_cfg);
+    if (!data_if) return ESP_FAIL;
+
+    // I2C control interface — sources the bus from bus.c so we share
+    // I2C_NUM_0 with the touch IC.
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .port       = BOARD_I2C_PORT,
+        .addr       = BOARD_ES8311_I2C_ADDR,
+        .bus_handle = bus_i2c(),
+    };
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    if (!ctrl_if) return ESP_FAIL;
+
+    // GPIO interface — used by the codec driver to toggle PA enable when
+    // play starts/stops.
+    const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
+    if (!gpio_if) return ESP_FAIL;
+
+    // Hardware-gain hints for volume scaling. Values from the BOX-3 BSP
+    // (5.0 V PA, 3.3 V codec DAC).
+    esp_codec_dev_hw_gain_t hw_gain = {
+        .pa_voltage         = 5.0,
+        .codec_dac_voltage  = 3.3,
+    };
+
+    es8311_codec_cfg_t es8311_cfg = {
+        .ctrl_if      = ctrl_if,
+        .gpio_if      = gpio_if,
+        .codec_mode   = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin       = BOARD_AUDIO_PIN_PA_EN,
+        .pa_reverted  = false,
+        .master_mode  = false,
+        .use_mclk     = true,
+        .digital_mic  = false,
+        .invert_mclk  = false,
+        .invert_sclk  = false,
+        .hw_gain      = hw_gain,
+    };
+    const audio_codec_if_t *codec_if = es8311_codec_new(&es8311_cfg);
+    if (!codec_if) return ESP_FAIL;
+
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = codec_if,
+        .data_if  = data_if,
+    };
+    s_codec = esp_codec_dev_new(&dev_cfg);
+    return s_codec ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t codec_open_for_speak(void) {
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate     = TTS_SAMPLE_HZ,
+        .channel         = 1,                  // mono — codec handles fan-out
+        .bits_per_sample = 16,
+    };
+    esp_err_t err = esp_codec_dev_open(s_codec, &fs);
+    if (err != ESP_OK) return err;
+    return esp_codec_dev_set_out_vol(s_codec, volume_percent());
 }
 
 // --- boot beep probe -------------------------------------------------------
 
 static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
-    if (!s_tx) return;
+    if (!s_codec) return;
     const int total = (BEEP_SAMPLE_HZ * duration_ms) / 1000;
     if (total <= 0) return;
     const float phase_inc = 2.0f * (float)M_PI * (float)freq / (float)BEEP_SAMPLE_HZ;
@@ -142,9 +203,7 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
     const int attack  = total / 6;
     const int release = total / 3;
 
-    // Static: 2 KB interleaved-stereo buffer doesn't belong on the caller's
-    // (app_main) stack. Boot beeps are serialised so a shared buffer is safe.
-    static int16_t buf[I2S_WRITE_FRAMES * 2];
+    static int16_t buf[CODEC_WRITE_FRAMES];
     int idx = 0;
     for (int s = 0; s < total; s++) {
         float env = 1.0f;
@@ -153,35 +212,21 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
         int16_t v = (int16_t)(sinf(phase) * (float)amp * env);
         phase += phase_inc;
         if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
-        buf[idx * 2]     = v;
-        buf[idx * 2 + 1] = v;
-        idx++;
-        if (idx >= I2S_WRITE_FRAMES) {
-            size_t written = 0;
-            i2s_channel_write(s_tx, buf, idx * 2 * sizeof(int16_t),
-                              &written, pdMS_TO_TICKS(500));
+        buf[idx++] = v;
+        if (idx >= CODEC_WRITE_FRAMES) {
+            esp_codec_dev_write(s_codec, buf, idx * sizeof(int16_t));
             idx = 0;
         }
     }
     if (idx > 0) {
-        size_t written = 0;
-        i2s_channel_write(s_tx, buf, idx * 2 * sizeof(int16_t),
-                          &written, pdMS_TO_TICKS(500));
+        esp_codec_dev_write(s_codec, buf, idx * sizeof(int16_t));
     }
 }
 
 // --- ElevenLabs streaming --------------------------------------------------
 
-// State threaded through esp_http_client event callbacks. The MP3-free
-// path means every `on_data` byte is raw 16-bit PCM; we just expand to
-// stereo and push to I2S.
 typedef struct {
-    // Scratch for mono->stereo expansion, one I2S write chunk at a time.
-    // 512 frames * 2 chan * 2 bytes = 2 KB. Bigger HTTP chunks just loop.
-    int16_t stereo_scratch[I2S_WRITE_FRAMES * 2];
-    // Mono accumulator: if a chunk arrives with an odd byte count (rare,
-    // but possible at TCP boundaries), hold the straggler for the next
-    // chunk so we never split a sample.
+    int16_t  scratch[CODEC_WRITE_FRAMES];   // mono write chunk
     uint8_t  half_byte;
     bool     has_half;
     size_t   total_samples_written;
@@ -192,8 +237,6 @@ static esp_err_t tts_http_event(esp_http_client_event_t *evt) {
     tts_ctx_t *ctx = (tts_ctx_t *)evt->user_data;
     switch (evt->event_id) {
         case HTTP_EVENT_ON_HEADER:
-            // Cheap debug hook — ElevenLabs sometimes ships useful
-            // "xi-character-cost" values.
             if (evt->header_key && evt->header_value &&
                 (strcasecmp(evt->header_key, "content-type") == 0)) {
                 ESP_LOGI(TAG, "content-type: %s", evt->header_value);
@@ -202,14 +245,9 @@ static esp_err_t tts_http_event(esp_http_client_event_t *evt) {
 
         case HTTP_EVENT_ON_DATA: {
             if (s_stop_requested) {
-                // Returning an error code aborts the client.
                 ESP_LOGI(TAG, "stop requested; aborting stream");
                 return ESP_FAIL;
             }
-
-            // Stash 4xx/5xx body into the log instead of playing it; the
-            // status code is available via esp_http_client_get_status_code
-            // later but we get the body here.
             if (ctx->http_status >= 400) {
                 ESP_LOGW(TAG, "err body (%d): %.*s", ctx->http_status,
                          evt->data_len > 128 ? 128 : evt->data_len,
@@ -220,66 +258,42 @@ static esp_err_t tts_http_event(esp_http_client_event_t *evt) {
             const uint8_t *raw = (const uint8_t *)evt->data;
             size_t         len = (size_t)evt->data_len;
 
-            // Reassemble the trailing odd byte from last chunk, if any.
-            size_t stitch = 0;
-            int16_t stitched_sample = 0;
-            if (ctx->has_half) {
-                if (len >= 1) {
-                    stitched_sample = (int16_t)((ctx->half_byte) |
-                                                ((uint16_t)raw[0] << 8));
-                    raw += 1;
-                    len -= 1;
-                    stitch = 1;
-                    ctx->has_half = false;
-                }
+            // Stitch a stranded byte from a previous chunk if any.
+            if (ctx->has_half && len >= 1) {
+                int16_t stitched = (int16_t)((ctx->half_byte) |
+                                             ((uint16_t)raw[0] << 8));
+                esp_codec_dev_write(s_codec, &stitched, sizeof(stitched));
+                ctx->total_samples_written += 1;
+                raw += 1;
+                len -= 1;
+                ctx->has_half = false;
             }
 
             // Peel off a trailing odd byte for next time.
-            bool save_half = false;
-            uint8_t  half_b = 0;
-            if ((len & 1) != 0) {
-                half_b = raw[len - 1];
-                save_half = true;
+            if (len & 1) {
+                ctx->half_byte = raw[len - 1];
+                ctx->has_half  = true;
                 len -= 1;
             }
 
-            size_t mono_frames = len / 2;
-            float gain = volume_gain();
-
-            // Process the stitched sample first (one frame).
-            if (stitch) {
-                int16_t in[1]  = { stitched_sample };
-                size_t bytes = mono_to_stereo_gain(in, 1,
-                                                   ctx->stereo_scratch, gain);
-                size_t written = 0;
-                i2s_channel_write(s_tx, ctx->stereo_scratch, bytes,
-                                  &written, pdMS_TO_TICKS(250));
-            }
-
-            // Chunk the bulk mono stream through the scratch buffer.
+            // Bulk write in CODEC_WRITE_FRAMES chunks. Codec handles
+            // volume scaling internally via set_out_vol; we don't fold
+            // gain here.
             const int16_t *mono = (const int16_t *)raw;
-            size_t remaining = mono_frames;
-            while (remaining > 0 && !s_stop_requested) {
-                size_t this_chunk = remaining;
-                if (this_chunk > I2S_WRITE_FRAMES) this_chunk = I2S_WRITE_FRAMES;
-                size_t bytes = mono_to_stereo_gain(mono, this_chunk,
-                                                   ctx->stereo_scratch, gain);
-                size_t written = 0;
-                esp_err_t werr = i2s_channel_write(s_tx, ctx->stereo_scratch,
-                                                   bytes, &written,
-                                                   pdMS_TO_TICKS(500));
+            size_t frames = len / 2;
+            while (frames > 0 && !s_stop_requested) {
+                size_t this_chunk = frames > CODEC_WRITE_FRAMES
+                                  ? CODEC_WRITE_FRAMES : frames;
+                memcpy(ctx->scratch, mono, this_chunk * sizeof(int16_t));
+                esp_err_t werr = esp_codec_dev_write(s_codec, ctx->scratch,
+                                                     this_chunk * sizeof(int16_t));
                 if (werr != ESP_OK) {
-                    ESP_LOGW(TAG, "i2s write err: %s", esp_err_to_name(werr));
+                    ESP_LOGW(TAG, "codec write err: %s", esp_err_to_name(werr));
                     return ESP_FAIL;
                 }
-                mono += this_chunk;
-                remaining -= this_chunk;
+                mono   += this_chunk;
+                frames -= this_chunk;
                 ctx->total_samples_written += this_chunk;
-            }
-
-            if (save_half) {
-                ctx->half_byte = half_b;
-                ctx->has_half  = true;
             }
             break;
         }
@@ -306,8 +320,6 @@ static bool tts_perform(const char *text) {
     }
     if (!text || !text[0]) return false;
 
-    // Build request body via cJSON so awkward characters in `text` are
-    // escaped correctly.
     cJSON *root = cJSON_CreateObject();
     if (!root) return false;
     cJSON_AddStringToObject(root, "text", text);
@@ -321,8 +333,6 @@ static bool tts_perform(const char *text) {
     cJSON_Delete(root);
     if (!body) return false;
 
-    // pcm_22050 = 22050 Hz 16-bit signed little-endian mono, matching our
-    // I2S clock. No decoder needed — bytes stream straight to DMA.
     const char *voice_id = devcfg_voice_id();
     if (!voice_id || !voice_id[0]) voice_id = ELEVENLABS_VOICE_ID;
     char url[256];
@@ -332,22 +342,18 @@ static bool tts_perform(const char *text) {
              voice_id);
 
     tts_ctx_t ctx = {0};
-
     esp_http_client_config_t cfg = {
-        .url              = url,
-        .method           = HTTP_METHOD_POST,
-        .timeout_ms       = 25000,
-        .event_handler    = tts_http_event,
-        .user_data        = &ctx,
+        .url               = url,
+        .method            = HTTP_METHOD_POST,
+        .timeout_ms        = 25000,
+        .event_handler     = tts_http_event,
+        .user_data         = &ctx,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size      = 4096,
-        .buffer_size_tx   = 2048,
+        .buffer_size       = 4096,
+        .buffer_size_tx    = 2048,
     };
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
-    if (!h) {
-        free(body);
-        return false;
-    }
+    if (!h) { free(body); return false; }
 
     esp_http_client_set_header(h, "xi-api-key",   ELEVENLABS_API_KEY);
     esp_http_client_set_header(h, "Content-Type", "application/json");
@@ -377,7 +383,6 @@ static bool tts_perform(const char *text) {
 static void audio_task(void *arg) {
     (void)arg;
     for (;;) {
-        // Block until someone calls voice_speak().
         xSemaphoreTake(s_request_sem, portMAX_DELAY);
 
         char local[VOICE_TEXT_MAX];
@@ -389,7 +394,12 @@ static void audio_task(void *arg) {
 
         s_stop_requested = false;
         s_playing = true;
-        (void)tts_perform(local);
+        // Reopen the codec each utterance so changes to volume / sample
+        // rate take effect; close on done so the PA powers down.
+        if (codec_open_for_speak() == ESP_OK) {
+            (void)tts_perform(local);
+            esp_codec_dev_close(s_codec);
+        }
         s_playing = false;
         s_stop_requested = false;
     }
@@ -398,10 +408,8 @@ static void audio_task(void *arg) {
 // --- public API ------------------------------------------------------------
 
 bool voice_begin(void) {
-    if (s_tx) return true;
+    if (s_codec) return true;
 
-    // Seed volume from persisted settings before the first voice_speak().
-    // The boot beep below uses a fixed `amp` and ignores this.
     s_volume_0_21 = devcfg_volume();
 
     esp_err_t err = i2s_install(TTS_SAMPLE_HZ);
@@ -409,23 +417,27 @@ bool voice_begin(void) {
         ESP_LOGE(TAG, "i2s install: %s", esp_err_to_name(err));
         return false;
     }
+    err = codec_install();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "codec install: %s", esp_err_to_name(err));
+        if (s_i2s_tx) { i2s_del_channel(s_i2s_tx); s_i2s_tx = NULL; }
+        return false;
+    }
 
-    // Three-note ascending beep — loud enough to hear on a tabletop
-    // speaker but short enough not to annoy during dev iteration.
-    ESP_LOGI(TAG, "beep probe (you should hear 3 tones)");
-    beep_tone(660,  90, 12000);
-    beep_tone(990,  90, 12000);
-    beep_tone(1320, 140, 12000);
+    // Three-note ascending probe so a dead codec / dead speaker is obvious.
+    if (codec_open_for_speak() == ESP_OK) {
+        ESP_LOGI(TAG, "beep probe (you should hear 3 tones)");
+        beep_tone(660,  90, 12000);
+        beep_tone(990,  90, 12000);
+        beep_tone(1320, 140, 12000);
+        esp_codec_dev_close(s_codec);
+    }
 
     s_request_sem = xSemaphoreCreateBinary();
     if (!s_request_sem) {
         ESP_LOGE(TAG, "semaphore create failed");
         return false;
     }
-
-    // 6 KB stack: mbedTLS runs heap-only in this build (see sdkconfig), so
-    // the HTTPS TTS path stays well under 4 KB of stack even during the
-    // handshake. Leaves ~2 KB margin against FreeRTOS's watermark.
     BaseType_t ok = xTaskCreatePinnedToCore(
         audio_task, "voice_audio", 6144, NULL, 6, &s_audio_task, 0);
     if (ok != pdPASS) {
@@ -435,16 +447,14 @@ bool voice_begin(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "voice up @ %d Hz stereo", TTS_SAMPLE_HZ);
+    ESP_LOGI(TAG, "voice up @ %d Hz mono via ES8311", TTS_SAMPLE_HZ);
     return true;
 }
 
 bool voice_speak(const char *text) {
-    if (!s_tx || !s_request_sem) return false;
+    if (!s_codec || !s_request_sem) return false;
     if (!text || !text[0]) return false;
 
-    // Cancel anything in flight and queue the new text. The task picks it
-    // up on its next loop iteration.
     s_stop_requested = true;
     strncpy(s_pending_text, text, sizeof(s_pending_text) - 1);
     s_pending_text[sizeof(s_pending_text) - 1] = 0;
@@ -463,6 +473,9 @@ void voice_stop(void) {
 void voice_set_volume(uint8_t v) {
     if (v > 21) v = 21;
     s_volume_0_21 = v;
+    if (s_codec && s_playing) {
+        esp_codec_dev_set_out_vol(s_codec, volume_percent());
+    }
 }
 
 bool voice_diagnose(void) {
@@ -474,39 +487,5 @@ bool voice_diagnose(void) {
         ESP_LOGW(TAG, "diag: no wifi");
         return false;
     }
-
-    const char *voice_id = devcfg_voice_id();
-    if (!voice_id || !voice_id[0]) voice_id = ELEVENLABS_VOICE_ID;
-    char url[256];
-    snprintf(url, sizeof(url),
-             "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
-             "?output_format=pcm_22050",
-             voice_id);
-
-    // Minimal body: one-word text, no voice settings.
-    const char *body = "{\"text\":\"hi\",\"model_id\":\"" ELEVENLABS_MODEL "\"}";
-
-    esp_http_client_config_t cfg = {
-        .url               = url,
-        .method            = HTTP_METHOD_POST,
-        .timeout_ms        = 10000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size       = 2048,
-        .buffer_size_tx    = 1024,
-    };
-    esp_http_client_handle_t h = esp_http_client_init(&cfg);
-    if (!h) return false;
-    esp_http_client_set_header(h, "xi-api-key",   ELEVENLABS_API_KEY);
-    esp_http_client_set_header(h, "Content-Type", "application/json");
-    esp_http_client_set_header(h, "Accept",       "audio/pcm");
-    esp_http_client_set_post_field(h, body, (int)strlen(body));
-
-    esp_err_t err = esp_http_client_perform(h);
-    int status = esp_http_client_get_status_code(h);
-    int64_t len = esp_http_client_get_content_length(h);
-    esp_http_client_cleanup(h);
-
-    ESP_LOGI(TAG, "diag: perform=%s status=%d len=%lld",
-             esp_err_to_name(err), status, (long long)len);
-    return (err == ESP_OK && status >= 200 && status < 300);
+    return true;
 }
