@@ -23,3 +23,6 @@ src/generated/
 *.pyc
 __pycache__/
 .venv/
+
+# Claude Code local state (settings.local.json, worktrees, etc).
+.claude/
