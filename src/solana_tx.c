@@ -220,16 +220,31 @@ int solana_build_signed_tx_base64(const solana_tx_input_t *in,
 // ---------------------------------------------------------------------------
 
 // Caps the number of distinct accounts a single tx can reference. The vault
-// payment path uses ~10; Jupiter swaps via vault_execute will be ~20-30.
-#define V2_MAX_ACCOUNTS 32
+// payment path uses ~10; Jupiter swaps via vault_execute can have 50+ unique
+// accounts inline before ALT partitioning pushes most of them out.
+#define V2_MAX_ACCOUNTS 80
 #define V2_MAX_IXS      8
-#define V2_MSG_BUF      1280   // Solana hard cap is 1232 bytes; keep slack.
+#define V2_MAX_ALTS     6     // Jupiter routes referenced 3-4 ALTs in practice
+#define V2_MSG_BUF      1280  // Solana hard cap is 1232 bytes; keep slack.
 
 typedef struct {
     uint8_t pubkey[32];
     bool    is_signer;
     bool    is_writable;
+    int8_t  alt_index;       // -1 = static keys; otherwise idx into in->alts[]
+    uint8_t pos_in_alt;      // position in alts[alt_index].addresses[] (0..255)
 } v2_key_t;
+
+// Per-ALT emission scratch — built after ALT classification, consumed at emit.
+// writable_indexes[] / readonly_indexes[] hold the position-in-table values
+// (the bytes we ship in the on-wire address_table_lookups), and the same
+// position determines runtime ordering of the ALT-loaded accounts.
+typedef struct {
+    uint8_t writable_indexes[V2_MAX_ACCOUNTS];
+    uint8_t readonly_indexes[V2_MAX_ACCOUNTS];
+    uint8_t writable_count;
+    uint8_t readonly_count;
+} v2_alt_emit_t;
 
 // Returns the index of `pk` in keys[], adding it (with the given flags) if
 // missing. ORs the flags on hit so the strictest classification wins. Returns
@@ -248,18 +263,65 @@ static int v2_intern(v2_key_t *keys, size_t *n, const uint8_t pk[32],
     memcpy(keys[*n].pubkey, pk, 32);
     keys[*n].is_signer   = is_signer;
     keys[*n].is_writable = is_writable;
+    keys[*n].alt_index   = -1;
+    keys[*n].pos_in_alt  = 0;
     return (int)(*n)++;
 }
 
-// After interning, sort into Solana's required order:
-//     [signed-writable] [signed-readonly] [unsigned-writable] [unsigned-readonly]
-// while keeping fee_payer pinned at index 0 (Solana's wire spec — slot 0 is
-// always the fee-payer's signature slot). Everything else (including a
-// distinct signer_pubkey, when present) gets sorted into rank order. Stable
-// insertion sort.
-static void v2_classify_sort(v2_key_t *keys, size_t n) {
-    if (n < 2) return;
-    for (size_t i = 2; i < n; i++) {
+// For each non-signer key, look it up in the supplied ALTs. First match
+// wins (deterministic by ALT order, then by position in that ALT). Signers
+// must remain in the static keys list — the runtime requires their signing
+// slot to be discoverable from message header counts alone.
+static void v2_classify_alts(v2_key_t *keys, size_t nkeys,
+                             const solana_alt_t *alts, size_t nalts)
+{
+    if (!alts || nalts == 0) return;
+    for (size_t k = 0; k < nkeys; k++) {
+        if (keys[k].is_signer) continue;
+        for (size_t a = 0; a < nalts; a++) {
+            const solana_alt_t *t = &alts[a];
+            if (!t->addresses || t->address_count == 0) continue;
+            for (size_t p = 0; p < t->address_count && p < 256; p++) {
+                if (memcmp(keys[k].pubkey, t->addresses[p], 32) == 0) {
+                    keys[k].alt_index  = (int8_t)a;
+                    keys[k].pos_in_alt = (uint8_t)p;
+                    goto next_key;
+                }
+            }
+        }
+        next_key:;
+    }
+}
+
+// Stable in-place partition: move all alt_index==-1 entries to the front,
+// ALT-indexed entries to the back. Returns the number of static keys.
+// O(n²) but n is bounded by V2_MAX_ACCOUNTS, and we save ~3 KB of stack
+// vs a scratch-buffer copy. The fee_payer is interned first and is
+// signer+writable so it never gets ALT-classified — it stays at slot 0.
+static size_t v2_partition_static(v2_key_t *keys, size_t nkeys) {
+    size_t i = 0;
+    while (i < nkeys) {
+        if (keys[i].alt_index < 0) { i++; continue; }
+        size_t j;
+        for (j = i + 1; j < nkeys; j++) {
+            if (keys[j].alt_index < 0) break;
+        }
+        if (j >= nkeys) break;
+        // Rotate keys[i..j+1] right by 1: keys[j] -> keys[i], keys[i..j-1] -> keys[i+1..j].
+        v2_key_t saved = keys[j];
+        for (size_t k = j; k > i; k--) keys[k] = keys[k - 1];
+        keys[i] = saved;
+        i++;
+    }
+    return i;
+}
+
+// Sort the static-keys prefix [0..nstatic) into Solana's required order:
+//   [signed-writable] [signed-readonly] [unsigned-writable] [unsigned-readonly]
+// while keeping fee_payer pinned at index 0. Stable insertion sort.
+static void v2_classify_sort(v2_key_t *keys, size_t nstatic) {
+    if (nstatic < 2) return;
+    for (size_t i = 2; i < nstatic; i++) {
         v2_key_t cur = keys[i];
         int cur_rank = (cur.is_signer ? 0 : 2) + (cur.is_writable ? 0 : 1);
         size_t j = i;
@@ -274,10 +336,71 @@ static void v2_classify_sort(v2_key_t *keys, size_t n) {
     }
 }
 
-// Index of `pk` in the (already-sorted) key table.
+// Build per-ALT emit metadata. Walks the ALT-indexed keys (keys[nstatic..nkeys])
+// and groups them by alt_index, splitting into writable / readonly per their
+// is_writable flag. The on-wire indexes are pos_in_alt values, in the order
+// the keys appear after partition (== order of first reference in input ixs,
+// thanks to stable partition).
+static void v2_build_alt_emit(const v2_key_t *keys, size_t nkeys, size_t nstatic,
+                              size_t nalts, v2_alt_emit_t *out)
+{
+    for (size_t a = 0; a < nalts; a++) {
+        out[a].writable_count = 0;
+        out[a].readonly_count = 0;
+    }
+    for (size_t i = nstatic; i < nkeys; i++) {
+        int a = keys[i].alt_index;
+        if (a < 0 || (size_t)a >= nalts) continue;
+        if (keys[i].is_writable) {
+            if (out[a].writable_count < V2_MAX_ACCOUNTS) {
+                out[a].writable_indexes[out[a].writable_count++] = keys[i].pos_in_alt;
+            }
+        } else {
+            if (out[a].readonly_count < V2_MAX_ACCOUNTS) {
+                out[a].readonly_indexes[out[a].readonly_count++] = keys[i].pos_in_alt;
+            }
+        }
+    }
+}
+
+// Index of `pk` in the keys table (full range).
 static int v2_index_of(const v2_key_t *keys, size_t n, const uint8_t pk[32]) {
     for (size_t i = 0; i < n; i++) {
         if (memcmp(keys[i].pubkey, pk, 32) == 0) return (int)i;
+    }
+    return -1;
+}
+
+// Resolve a pubkey to its runtime account index — the index into the
+// final loaded-accounts list, which is:
+//   [static_keys] + sum(per-ALT writables) + sum(per-ALT readonlies)
+// Returns -1 on not-found.
+static int v2_runtime_idx(const v2_key_t *keys, size_t nkeys,
+                          size_t nstatic,
+                          const v2_alt_emit_t *alt_emit, size_t nalts,
+                          size_t total_writable_alt,
+                          const uint8_t pk[32])
+{
+    int k = v2_index_of(keys, nkeys, pk);
+    if (k < 0) return -1;
+    if (keys[k].alt_index < 0) {
+        // Static keys: position in [0..nstatic) is the runtime index.
+        return k;
+    }
+    int a = keys[k].alt_index;
+    uint8_t pos = keys[k].pos_in_alt;
+    if (keys[k].is_writable) {
+        size_t offset = nstatic;
+        for (int i = 0; i < a; i++) offset += alt_emit[i].writable_count;
+        for (uint8_t p = 0; p < alt_emit[a].writable_count; p++) {
+            if (alt_emit[a].writable_indexes[p] == pos) return (int)(offset + p);
+        }
+    } else {
+        size_t offset = nstatic + total_writable_alt;
+        for (int i = 0; i < a; i++) offset += alt_emit[i].readonly_count;
+        for (uint8_t p = 0; p < alt_emit[a].readonly_count; p++) {
+            if (alt_emit[a].readonly_indexes[p] == pos) return (int)(offset + p);
+        }
     }
     return -1;
 }
@@ -294,6 +417,12 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
     }
     if (!wallet_can_sign()) {
         ESP_LOGE(TAG, "wallet has no signing key");
+        return -1;
+    }
+
+    if (in->alt_count > V2_MAX_ALTS) {
+        ESP_LOGE(TAG, "too many ALTs (%u > %u)",
+                 (unsigned)in->alt_count, V2_MAX_ALTS);
         return -1;
     }
 
@@ -319,14 +448,22 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
         }
     }
 
-    // ---- 2. order keys --------------------------------------------------
-    v2_classify_sort(keys, nkeys);
+    // ---- 2. classify ALT membership + partition + sort static keys ------
+    v2_classify_alts(keys, nkeys, in->alts, in->alt_count);
+    size_t nstatic = v2_partition_static(keys, nkeys);
+    v2_classify_sort(keys, nstatic);
 
-    // ---- 3. derive header counts ----------------------------------------
+    v2_alt_emit_t alt_emit[V2_MAX_ALTS] = {0};
+    v2_build_alt_emit(keys, nkeys, nstatic, in->alt_count, alt_emit);
+
+    size_t total_writable_alt = 0;
+    for (size_t i = 0; i < in->alt_count; i++) total_writable_alt += alt_emit[i].writable_count;
+
+    // ---- 3. derive header counts (over static keys only) ----------------
     uint8_t num_required_sigs    = 0;
     uint8_t num_readonly_signed  = 0;
     uint8_t num_readonly_unsigned = 0;
-    for (size_t i = 0; i < nkeys; i++) {
+    for (size_t i = 0; i < nstatic; i++) {
         if (keys[i].is_signer) {
             num_required_sigs++;
             if (!keys[i].is_writable) num_readonly_signed++;
@@ -344,15 +481,17 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
     wc_u8(&w, num_readonly_signed);
     wc_u8(&w, num_readonly_unsigned);
 
-    wc_shortvec(&w, (uint16_t)nkeys);
-    for (size_t i = 0; i < nkeys; i++) wc_bytes(&w, keys[i].pubkey, 32);
+    wc_shortvec(&w, (uint16_t)nstatic);
+    for (size_t i = 0; i < nstatic; i++) wc_bytes(&w, keys[i].pubkey, 32);
 
     wc_bytes(&w, in->blockhash, 32);
 
     // 2 prefix CU instructions + ix_count caller instructions.
     wc_shortvec(&w, (uint16_t)(2 + in->ix_count));
 
-    int cb_idx = v2_index_of(keys, nkeys, cb_program);
+    int cb_idx = v2_runtime_idx(keys, nkeys, nstatic,
+                                alt_emit, in->alt_count, total_writable_alt,
+                                cb_program);
     if (cb_idx < 0) return -1;
 
     // SetComputeUnitLimit (program_idx, no accounts, [0x02][u32 LE])
@@ -372,12 +511,16 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
     // Caller instructions
     for (size_t i = 0; i < in->ix_count; i++) {
         const solana_ix_v2_t *ix = &in->ixs[i];
-        int pidx = v2_index_of(keys, nkeys, ix->program_id);
+        int pidx = v2_runtime_idx(keys, nkeys, nstatic,
+                                  alt_emit, in->alt_count, total_writable_alt,
+                                  ix->program_id);
         if (pidx < 0) return -1;
         wc_u8(&w, (uint8_t)pidx);
         wc_shortvec(&w, (uint16_t)ix->account_count);
         for (size_t j = 0; j < ix->account_count; j++) {
-            int aidx = v2_index_of(keys, nkeys, ix->accounts[j].pubkey);
+            int aidx = v2_runtime_idx(keys, nkeys, nstatic,
+                                      alt_emit, in->alt_count, total_writable_alt,
+                                      ix->accounts[j].pubkey);
             if (aidx < 0) return -1;
             wc_u8(&w, (uint8_t)aidx);
         }
@@ -388,19 +531,21 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
     // Address-table lookups. Empty when in->alts == NULL (the x402 /
     // refill paths) — Jupiter swaps fill this in when /swap-instructions
     // returns deep routes that need account addresses resolved at
-    // runtime.
+    // runtime. The writable / readonly index arrays were synthesized
+    // above from the partition; we just emit them.
     if (!in->alts || in->alt_count == 0) {
         wc_shortvec(&w, 0);
     } else {
         wc_shortvec(&w, (uint16_t)in->alt_count);
         for (size_t i = 0; i < in->alt_count; i++) {
-            const solana_alt_lookup_t *alt = &in->alts[i];
+            const solana_alt_t *alt = &in->alts[i];
+            const v2_alt_emit_t *em = &alt_emit[i];
             if (!alt->table_pubkey) { w.overflow = true; break; }
             wc_bytes(&w, alt->table_pubkey, 32);
-            wc_shortvec(&w, (uint16_t)alt->writable_count);
-            if (alt->writable_count) wc_bytes(&w, alt->writable_indexes, alt->writable_count);
-            wc_shortvec(&w, (uint16_t)alt->readonly_count);
-            if (alt->readonly_count) wc_bytes(&w, alt->readonly_indexes, alt->readonly_count);
+            wc_shortvec(&w, (uint16_t)em->writable_count);
+            if (em->writable_count) wc_bytes(&w, em->writable_indexes, em->writable_count);
+            wc_shortvec(&w, (uint16_t)em->readonly_count);
+            if (em->readonly_count) wc_bytes(&w, em->readonly_indexes, em->readonly_count);
         }
     }
 

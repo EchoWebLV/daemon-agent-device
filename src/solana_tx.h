@@ -66,18 +66,17 @@ typedef struct {
     size_t                      data_len;
 } solana_ix_v2_t;
 
-// Address-Lookup-Table entry. Accounts referenced through this ALT are
-// expressed as 1-byte indexes into the table at validate time, which is
-// how Jupiter fits deep routes into the 1232-byte tx limit. Each ALT
-// entry lists the table's pubkey plus per-direction (writable/readonly)
-// index arrays — the same shape Jupiter's /swap-instructions returns.
+// Address-Lookup-Table entry. Carries the table's pubkey plus its full
+// address list — the builder partitions ix accounts into static-keys vs
+// ALT-indexed slots itself, and synthesizes the per-direction index
+// arrays from the result. This matches the data Jupiter hands us from
+// /swap-instructions (just the table addresses) plus what we read from
+// each table account via getAccountInfo.
 typedef struct {
-    const uint8_t *table_pubkey;        // 32 bytes
-    const uint8_t *writable_indexes;    // each entry is a u8 index into the table
-    size_t         writable_count;
-    const uint8_t *readonly_indexes;
-    size_t         readonly_count;
-} solana_alt_lookup_t;
+    const uint8_t  *table_pubkey;         // 32 bytes
+    const uint8_t (*addresses)[32];       // table contents, .address_count entries
+    size_t          address_count;        // 0..256
+} solana_alt_t;
 
 typedef struct {
     const uint8_t        *fee_payer;       // 32 bytes (slot-0 signer)
@@ -87,10 +86,12 @@ typedef struct {
     size_t                ix_count;
     uint32_t              cu_limit;
     uint64_t              cu_price_micro;
-    // Optional address-table lookups. Pass NULL / 0 for the original
-    // "no ALT" path (every account inline in the static keys table).
-    const solana_alt_lookup_t *alts;
-    size_t                     alt_count;
+    // Optional address tables. Pass NULL / 0 for the no-ALT path (every
+    // account inline in the static keys table). When present, every
+    // non-signer account that appears in any of these tables gets pushed
+    // out of the static keys list into the ALT it was found in.
+    const solana_alt_t *alts;
+    size_t              alt_count;
 } solana_tx_input_v2_t;
 
 // Same wire shape as solana_build_signed_tx_base64: signed VersionedTransaction
