@@ -231,7 +231,7 @@ demos, and is bisectable.
 
 | # | Milestone | What works at the end | Estimate |
 |---|---|---|---|
-| 1 | **Boot + display + touch** | BOX-3B boots. `display.c` clears to navy. LVGL up with a single test screen showing "tap me"; taps register at correct landscape coords. No screens registered yet. | 1–2 days |
+| 1 | **Boot + display + touch** | BOX-3B boots. `display.c` clears to navy. `ui_init()` runs and the existing production screens load (they look rotated/clipped because they're still in 240×320 portrait — that's expected and M2 fixes it). Tapping the panel produces correct landscape-coord events into LVGL's pointer indev. Init order verified: 5× power-cycle never breaks touch (shared LCD/touch reset hazard). | 1–2 days |
 | 2 | **All 8 screens re-laid-out** | Whole app tappable end-to-end. Wi-Fi connects, web UI works, x402 chat completes (typed input only). `voice.c` exists but skips actual playback. "The whole app, silent." | 2–4 days |
 | 3 | **Audio out + audio in** | TTS speaks via ES8311. `mic_init()` runs; 1 Hz RMS task logs to serial. No app consumer for mic. | 2–3 days |
 | 4 | **User inputs** | BOOT button debounced and pops screen stack. MUTE switch transitions log to serial. | 0.5 day |
@@ -246,7 +246,7 @@ separate branches needed since we are replacing, not coexisting.
 
 | Milestone | Verification |
 |---|---|
-| 1 | Visual: navy clear-screen, then "tap me" pill at center. Tap any corner; check coords logged match the corner. Verify shared-RST init order doesn't break touch by power-cycling 5× and confirming touch responds every boot. |
+| 1 | Visual: navy clear-screen during boot, then whichever production screen `ui_init()` lands on (likely creature_screen, rendered in its old portrait layout — visually wrong but proves LVGL is alive). Tap each corner; LVGL's pointer cursor follows your finger. Power-cycle 5×; confirm `TT21100 bound to LVGL` appears on every boot. |
 | 2 | Tap through every screen. Wi-Fi onboarding from cold. Web UI loads at `http://<ip>/`. Type a chat message, confirm x402 round-trip lands a paid response. (No audio expected.) |
 | 3 | Trigger a TTS reply; speaker plays clean audio. Tap the device while it speaks; confirm `voice_stop()` cuts cleanly. Cup mic with hand; serial RMS log drops; release; log rises. |
 | 4 | Press BOOT from any screen — pops to previous. Slide MUTE between positions — each transition logs `mute=on` / `mute=off`. |
