@@ -138,7 +138,7 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
     if (!h) { heap_caps_free(body); return false; }
 
-    char auth[160];
+    char auth[256];
     snprintf(auth, sizeof(auth), "Bearer %s", OPENAI_API_KEY);
     esp_http_client_set_header(h, "Authorization", auth);
     esp_http_client_set_header(h, "Content-Type",
