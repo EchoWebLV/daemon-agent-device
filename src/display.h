@@ -1,10 +1,12 @@
 #pragma once
 // ---------------------------------------------------------------------------
-//  ST7789 240x320 over SPI2 — Waveshare ESP32-S3-Touch-LCD-2.8.
+//  ILI9342C 320x240 landscape over SPI3 — ESP32-S3-BOX-3B.
 //
-//  Thin wrapper around esp_lcd's built-in ST7789 driver. Initialises the
-//  SPI bus, panel IO and panel, turns the backlight on and exposes the
-//  panel handle so the LVGL port (next step) can draw into it.
+//  Thin wrapper around the espressif/esp_lcd_ili9341 managed component
+//  (it covers both 9341 and 9342C). Initialises the SPI bus, panel IO and
+//  panel, draws a navy clear as a smoke test, and exposes the panel handle
+//  so esp_lvgl_port can draw into it. Backlight is owned by devcfg.c via
+//  LEDC PWM and brought up there, not here.
 // ---------------------------------------------------------------------------
 #include "esp_err.h"
 #include "esp_lcd_types.h"
@@ -16,7 +18,10 @@ extern "C" {
 #define DISPLAY_WIDTH  320
 #define DISPLAY_HEIGHT 240
 
-// Bring up SPI bus + ST7789 + backlight. Safe to call once at boot.
+// Bring up SPI bus + ILI9342C panel. Safe to call once at boot. MUST run
+// before touch_init() — the touch IC's reset is level-shifted from
+// LCD_RST, so a late panel reset would yank the touch IC out from under
+// LVGL's pointer indev.
 esp_err_t display_init(void);
 
 // Panel handle (NULL before display_init returns ESP_OK).

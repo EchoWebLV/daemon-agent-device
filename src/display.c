@@ -103,10 +103,9 @@ esp_err_t display_init(void) {
         ESP_LOGW(TAG, "no PSRAM for clear buffer; skipping");
     }
 
-    ESP_LOGI(TAG, "ILI9342C %dx%d up @ %d MHz SPI%d",
+    ESP_LOGI(TAG, "ILI9342C %dx%d up @ %d MHz on SPI3",
              DISPLAY_WIDTH, DISPLAY_HEIGHT,
-             BOARD_LCD_PIXEL_CLOCK_HZ / 1000000,
-             BOARD_LCD_SPI_HOST == SPI3_HOST ? 3 : 2);
+             BOARD_LCD_PIXEL_CLOCK_HZ / 1000000);
     return ESP_OK;
 }
 
