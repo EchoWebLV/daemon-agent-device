@@ -336,8 +336,8 @@ static void handle_x402_call(const char *url) {
     // bare {} so the facilitator sees a valid JSON request. This avoids
     // a parallel GET verb while keeping the harness URL-agnostic.
     const char *body;
-    if (strstr(url, "/chat/completions")) {
-        body = "{\"model\":\"claude-haiku-4.5\","
+    if (strstr(url, "/chat/completions") || strstr(url, "/api/openai") || strstr(url, "/api/anthropic")) {
+        body = "{\"model\":\"claude-haiku-4-5\","
                "\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],"
                "\"max_tokens\":16}";
     } else {

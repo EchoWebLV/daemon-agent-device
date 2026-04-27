@@ -27,17 +27,19 @@
 
 static const char *TAG = "ai";
 
-// OpenAI-compatible endpoints behind x402 paywalls. Dispatch is by model-id
-// prefix; the last entry (NULL prefix) is the fallback. Adding a provider
-// here is a one-liner as long as it speaks OpenAI chat-completions.
+// Two paid x402 endpoints, both fronted by our own Next.js facilitator
+// (daemon-x402s on Vercel). Dispatch is by `<provider>/...` prefix on the
+// configured model id; the last entry (NULL prefix) is the fallback when
+// the prefix is missing or unrecognised.
 typedef struct {
-    const char *prefix;   // model-id prefix to match ("shannon/"), NULL = default
+    const char *prefix;   // model-id prefix to match, NULL = default
     const char *url;
 } llm_endpoint_t;
 
 static const llm_endpoint_t LLM_ENDPOINTS[] = {
-    { "shannon/", "https://daemon-x402s-seven.vercel.app/api/call" },
-    { NULL,       "https://sol.blockrun.ai/api/v1/chat/completions" },
+    { "openai/",    "https://daemon-x402s-seven.vercel.app/api/openai" },
+    { "anthropic/", "https://daemon-x402s-seven.vercel.app/api/anthropic" },
+    { NULL,         "https://daemon-x402s-seven.vercel.app/api/anthropic" },
 };
 
 static const char *resolve_llm_url(const char *model) {
@@ -50,18 +52,13 @@ static const char *resolve_llm_url(const char *model) {
     return LLM_ENDPOINTS[sizeof(LLM_ENDPOINTS) / sizeof(LLM_ENDPOINTS[0]) - 1].url;
 }
 
-// Shannon's wrapper forwards `model` verbatim to the Shannon API, which wants
-// the bare id ("shannon-1.6-lite") — not our catalog-qualified "shannon/…"
-// form. Peel the provider segment off before putting it on the wire. Other
-// endpoints (blockrun, OpenRouter-style) keep the provider/model form.
+// Both upstream providers want the bare API model id ("gpt-4o-mini",
+// "claude-haiku-4-5") not our catalog-qualified "openai/…" / "anthropic/…"
+// form. Strip the provider segment before putting it on the wire.
 static const char *wire_model(const char *model) {
     if (!model) return "";
-    if (strncmp(model, "shannon/", 8) == 0) return model + 8;
-    return model;
-}
-
-static bool is_shannon(const char *model) {
-    return model && strncmp(model, "shannon/", 8) == 0;
+    const char *slash = strchr(model, '/');
+    return slash ? slash + 1 : model;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +114,9 @@ static void pop_last_turn(void) {
     if (s_hist_len > 0) s_hist_len--;
 }
 
-// blockrun silently reroutes unprefixed model ids to a free fallback that
-// drops the `tools` array. Require a `<provider>/<model>` form.
+// Models must use the `<provider>/<model>` form so resolve_llm_url can pick
+// the right facilitator endpoint. An unprefixed id falls through to the
+// default endpoint and would silently route to the wrong provider.
 static bool is_supported_model(const char *m) {
     return m && m[0] && strchr(m, '/') != NULL;
 }
@@ -605,41 +603,7 @@ static int build_chat_body(char *out, size_t cap,
 
     const char *model = devcfg_llm_model();
     if (!is_supported_model(model)) {
-        model = "anthropic/claude-haiku-4.5";
-    }
-
-    // Shannon's wrapper expects a flat `{ "message": "..." }` body — no
-    // model/messages/tools at all. Flatten persona + history + current turn
-    // into a single string. Tool calling is unsupported on Shannon for now.
-    if (is_shannon(model)) {
-        char *flat = malloc(CHAT_BODY_CAP);
-        if (!flat) { cJSON_Delete(root); return -1; }
-        size_t off = 0;
-        char *sysprompt = malloc(SYS_PROMPT_CAP);
-        if (sysprompt) {
-            build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
-            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s\n\n", sysprompt);
-            free(sysprompt);
-        }
-        if (use_history && s_hist_len > 0) {
-            for (int i = 0; i < s_hist_len && off < CHAT_BODY_CAP; ++i) {
-                off += snprintf(flat + off, CHAT_BODY_CAP - off,
-                                "%s: %s\n",
-                                s_history[i].role, s_history[i].text);
-            }
-        } else if (one_shot_prompt && one_shot_prompt[0]) {
-            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s", one_shot_prompt);
-        }
-        cJSON_AddStringToObject(root, "message", flat);
-        // Pass max_tokens through too — if Shannon's wrapper forwards it,
-        // the model will be bounded; if it ignores it, the persona's hard
-        // length rule is still our backstop.
-        cJSON_AddNumberToObject(root, "max_tokens", max_tokens);
-        free(flat);
-        bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
-        cJSON_Delete(root);
-        if (!ok) { ESP_LOGW(TAG, "shannon body overflow (cap=%u)", (unsigned)cap); return -1; }
-        return (int)strlen(out);
+        model = "anthropic/claude-haiku-4-5";
     }
 
     cJSON_AddStringToObject(root, "model", wire_model(model));

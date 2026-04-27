@@ -1,10 +1,13 @@
 // ---------------------------------------------------------------------------
-//  stt.h — speech-to-text via the same x402 gateway the chat path uses.
+//  stt.h — speech-to-text via OpenAI Whisper.
 //
 //  POSTs a 16 kHz/16-bit/mono PCM buffer (wrapped as a WAV) to
-//  https://sol.blockrun.ai/api/v1/audio/transcriptions and returns the
-//  transcript. Pays per-call via the existing x402 facility (same path as
-//  ai.c's chat round-trip) so no user-supplied API key is needed.
+//  https://api.openai.com/v1/audio/transcriptions and returns the transcript.
+//
+//  Whisper is paid via OPENAI_API_KEY on the user's account — NOT via x402,
+//  because the existing x402.c client only speaks application/json and the
+//  audio endpoint requires multipart/form-data. When/if our facilitator
+//  sprouts a multipart variant we'll route this through there too.
 // ---------------------------------------------------------------------------
 #pragma once
 

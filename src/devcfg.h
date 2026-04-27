@@ -47,9 +47,10 @@ const char *devcfg_wifi_password(void);
 void        devcfg_set_wifi(const char *ssid, const char *password);
 void        devcfg_clear_wifi(void);
 
-// LLM model id (uses the same provider/model format as the Chrome
-// extension + sol.blockrun.ai, e.g. "google/gemini-3.1-pro",
-// "openai/gpt-4o-mini"). Empty string means "use the default baked in".
+// LLM model id in `<provider>/<model>` form. The provider segment selects
+// the daemon-x402s endpoint (openai → /api/openai, anthropic → /api/anthropic),
+// the model segment is forwarded to the upstream API verbatim. Empty string
+// means "use the default baked in" (currently anthropic/claude-haiku-4-5).
 const char *devcfg_llm_model(void);
 void        devcfg_set_llm_model(const char *model);
 

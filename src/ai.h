@@ -1,11 +1,11 @@
 // ---------------------------------------------------------------------------
 //  Chat client for the Daemon creature.
 //
-//  Wraps a short rolling conversation history around calls to sol.blockrun.ai
-//  — an OpenAI-compatible /v1/chat/completions endpoint behind an x402 USDC
-//  paywall. Every reply the creature utters is a USDC-charged round-trip
-//  through x402_post(), which signs and submits the payment transaction
-//  on the fly.
+//  Wraps a short rolling conversation history around calls to our own
+//  daemon-x402s facilitator (Next.js on Vercel). The facilitator gates
+//  /api/openai and /api/anthropic behind an x402 USDC paywall, so every
+//  reply the creature utters is a USDC-charged round-trip through
+//  x402_post(), which signs and submits the payment transaction on the fly.
 //
 //  System prompt is rebuilt on every request so fresh wallet balances +
 //  SOL price show up in the context the model sees.
