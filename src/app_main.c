@@ -158,30 +158,30 @@ void app_main(void) {
         server_set_status("idle");
     }
 
-    // M1: chat path disabled. ai_begin() is fine to call (no GPIO use)
-    // but the resulting ui_deliver_reply() chain hits voice_speak()
-    // through ui.c, which expects voice_begin() to have run. Restored
-    // in M2 once the screens are working.
+    // AI client + /say handler. ai_begin() resets conversation history and
+    // wires the model id. server_set_say_handler() routes POST /say from
+    // the web UI through say_with_ui() at the top of this file, which calls
+    // ai_handle_say() (x402 chat round-trip) then ui_deliver_reply() to
+    // forward the reply to the creature subtitle + voice path.
+    ai_begin();
+    server_set_say_handler(say_with_ui);
 
-    // M1 (BOX-3B migration): voice path disabled. Original code grabbed
-    // I2S on GPIO47/48/38 which conflict with LCD_BL and LCD_RST on the
-    // BOX-3B. M3 rewrites voice.c around the ES8311 codec; until then
-    // voice_begin() is intentionally not called.
+    // Voice path stays disabled until M3 (ES8311 codec rewrite of voice.c).
+    // voice_speak()'s internal NULL guards make it a safe no-op while
+    // voice_begin() hasn't run, so the chat -> ui_deliver_reply() chain
+    // doesn't crash — replies just appear silently as subtitle text.
 
-    // No IMU on BOX-3B — shake-to-talk is gone. Replaced in a future
-    // branch by push-to-talk on the BOOT button (M4) once the mic
-    // capture path lands in M3.
+    // No IMU on BOX-3B. Shake-to-talk is gone; M4 will replace it with
+    // push-to-talk on the BOOT button once mic capture lands in M3.
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.
     // Refreshes only attempt network traffic when wifi_sta_is_connected().
     wallet_begin();
-    // M1 (BOX-3B): wallet incoming-cb intentionally not installed. The
-    // callback chains into ui_deliver_reply -> voice_speak (a no-op while
-    // voice_begin() is disabled) and would also flicker the creature
-    // mouth animation on a real wallet credit. Kept off so M1's display
-    // verification isn't muddied by stray wallet-driven UI events.
-    // Restored in M2 alongside the chat path.
+    // React when incoming SOL / USDC / SPL crosses the announcement
+    // threshold. Chains into ui_deliver_reply, which silently no-ops on
+    // voice_speak until the M3 codec lands.
+    wallet_set_incoming_cb(on_wallet_incoming);
     price_begin();
     if (wifi_err == ESP_OK) {
         wallet_request_refresh();
@@ -208,8 +208,12 @@ void app_main(void) {
         }
     }
 
-    // M1: boot greeting disabled (would call voice_speak()). Restored
-    // in M2.
+    // Boot greeting. ai/voice path is back online; voice_speak no-ops
+    // silently until M3 lands the codec, but the subtitle still shows
+    // and the chat pipeline gets exercised on every cold boot.
+    if (wifi_err == ESP_OK) {
+        ui_deliver_reply("Hello, I am Daemon.");
+    }
 
     // Host-driven smoke-test harness. Spawns a task that blocks on stdin and
     // dispatches "TEST ..." lines. Always on — the task idles on fgets() when
