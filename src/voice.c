@@ -48,8 +48,11 @@ static const char *TAG = "voice";
 // so both directions must run at the same effective sample rate.
 // Whisper-class STT also expects 16 kHz, so this is a no-loss choice for
 // voice input. ElevenLabs returns pcm_16000 cleanly.
-#define TTS_SAMPLE_HZ  16000
-#define BEEP_SAMPLE_HZ 16000
+// 22050 matches the BSP's bsp_audio_init default — keeps everyone (boot
+// beep, ElevenLabs TTS, mic capture, STT WAV) on one rate so we don't
+// rely on esp_codec_dev_open silently reconfiguring the I2S clock.
+#define TTS_SAMPLE_HZ  22050
+#define BEEP_SAMPLE_HZ 22050
 #define VOICE_TEXT_MAX 512
 #define CODEC_WRITE_FRAMES 512
 
@@ -252,7 +255,7 @@ static bool tts_perform(const char *text) {
     char url[256];
     snprintf(url, sizeof(url),
              "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
-             "?output_format=pcm_16000&optimize_streaming_latency=3",
+             "?output_format=pcm_22050&optimize_streaming_latency=3",
              voice_id);
 
     tts_ctx_t ctx = {0};
@@ -394,4 +397,27 @@ bool voice_diagnose(void) {
 // declaration could be removed in a follow-up.
 const audio_codec_data_if_t *voice_audio_data_if(void) {
     return NULL;
+}
+
+bool voice_play_pcm(const int16_t *pcm, size_t frames) {
+    if (!s_codec || !pcm || frames == 0) return false;
+    if (codec_open_for_speak() != ESP_OK) return false;
+    static int16_t scratch[CODEC_WRITE_FRAMES * 2];
+    size_t off = 0;
+    while (off < frames) {
+        size_t this_chunk = frames - off > CODEC_WRITE_FRAMES
+                            ? CODEC_WRITE_FRAMES : frames - off;
+        mono_to_stereo(pcm + off, scratch, this_chunk);
+        esp_err_t err = esp_codec_dev_write(s_codec, scratch,
+                                            this_chunk * 2 * sizeof(int16_t));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "loopback write err: %s", esp_err_to_name(err));
+            esp_codec_dev_close(s_codec);
+            return false;
+        }
+        off += this_chunk;
+    }
+    esp_codec_dev_close(s_codec);
+    ESP_LOGI(TAG, "loopback played %u frames", (unsigned)frames);
+    return true;
 }

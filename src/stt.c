@@ -28,7 +28,7 @@
 
 static const char *TAG = "stt";
 
-#define STT_SAMPLE_HZ 16000
+#define STT_SAMPLE_HZ 22050   // matches BSP I2S default + mic capture rate
 #define STT_BOUNDARY  "----DaemonBoundary17X9k2pQ"
 #define STT_URL       "https://api.openai.com/v1/audio/transcriptions"
 #define STT_MODEL     "whisper-1"

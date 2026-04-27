@@ -31,6 +31,7 @@
 #include "stt.h"
 #include "ai.h"
 #include "ui.h"
+#include "voice.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -412,6 +413,16 @@ static void speech_task(void *arg) {
     extern volatile size_t s_speech_frames;
     frames = s_speech_frames;
     s_speech_frames = 0;
+
+    // Loopback diagnostic: play the captured PCM back through the speaker
+    // BEFORE we send it to Whisper. If you hear yourself clearly, the
+    // capture path is fine and any "You" hallucination from STT is a
+    // network/header issue, not a mic issue. If you hear garbage, the
+    // capture is broken regardless of what Whisper does with it.
+    ESP_LOGI(TAG, "loopback: playing captured PCM (%u frames)",
+             (unsigned)frames);
+    ui_set_subtitle("Playing back...");
+    voice_play_pcm(pcm, frames);
 
     char transcript[512] = {0};
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));

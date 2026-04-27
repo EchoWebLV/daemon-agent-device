@@ -27,6 +27,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_codec_dev.h"
@@ -40,6 +41,13 @@ extern "C" {
 // same I2S port without trying to re-initialize the channels. Returns
 // NULL before voice_begin() has run.
 const audio_codec_data_if_t *voice_audio_data_if(void);
+
+// Synchronously play back a buffer of raw mono int16 PCM at the codec's
+// sample rate (22050 Hz). Used for the mic-loopback diagnostic — verifies
+// that captured audio is real speech before we trust STT to handle it.
+// Blocks for the duration of the audio. Safe to call from any task that
+// can hold up for ~1 second; not safe from the LVGL UI thread.
+bool voice_play_pcm(const int16_t *pcm, size_t frames);
 
 // Install I2S + spawn the audio task. Plays a short 3-note boot beep so a
 // dead codec / bad wiring is obvious before the first TTS attempt.

@@ -27,7 +27,12 @@
 
 static const char *TAG = "mic";
 
-#define MIC_SAMPLE_HZ        16000
+// 22050 Hz matches the BSP's bsp_audio_init default. Earlier we ran at
+// 16 kHz expecting esp_codec_dev_open to reconfigure I2S, but every
+// captured chunk still came back hallucinated as "You" — strongly
+// suggesting the reconfig didn't actually land and we were sending
+// 22 kHz audio with a 16 kHz WAV header. Whisper accepts 22050 fine.
+#define MIC_SAMPLE_HZ        22050
 #define MIC_MAX_RECORD_SECS  10
 #define MIC_MAX_FRAMES       (MIC_SAMPLE_HZ * MIC_MAX_RECORD_SECS)
 #define MIC_READ_FRAMES      512
@@ -59,16 +64,12 @@ static void record_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    // ES7210's open() hardcodes 30 dB on all channels. We adjust afterward.
-    // Pre-open calls return INVALID_STATE silently because the underlying
-    // _es7210_set_channel_gain refuses to write to a closed codec.
-    // 12 dB is below the open-default 30 to avoid clipping on tabletop
-    // speech which we measured peaking at full-scale at 30 dB.
     esp_codec_dev_set_in_gain(s_dev, 12.0);
 
     int16_t scratch[MIC_READ_FRAMES * 2];
     size_t  scratch_bytes = sizeof(scratch);
     int16_t peak_l_overall = 0, peak_r_overall = 0;
+    int chunk_idx = 0;
 
     while (!s_stop_req && s_frames_written < MIC_MAX_FRAMES) {
         esp_err_t err = esp_codec_dev_read(s_dev, scratch, scratch_bytes);
@@ -79,19 +80,30 @@ static void record_task(void *arg) {
         size_t avail = MIC_MAX_FRAMES - s_frames_written;
         size_t to_copy = MIC_READ_FRAMES < avail ? MIC_READ_FRAMES : avail;
         int16_t *dst = s_buf + s_frames_written;
-        // Diagnostic: track L and R peaks across the whole capture so we
-        // can see if one channel is dead. Use LEFT only into the mono
-        // buffer — averaging halves volume if R is silent.
+        int16_t chunk_peak_l = 0, chunk_peak_r = 0;
+        int64_t chunk_sum_sq = 0;
         for (size_t i = 0; i < to_copy; i++) {
             int16_t l = scratch[i * 2];
             int16_t r = scratch[i * 2 + 1];
             int16_t la = l < 0 ? -l : l;
             int16_t ra = r < 0 ? -r : r;
+            if (la > chunk_peak_l)   chunk_peak_l   = la;
+            if (ra > chunk_peak_r)   chunk_peak_r   = ra;
             if (la > peak_l_overall) peak_l_overall = la;
             if (ra > peak_r_overall) peak_r_overall = ra;
+            chunk_sum_sq += (int64_t)l * (int64_t)l;
             dst[i] = l;
         }
         s_frames_written += to_copy;
+
+        // Per-chunk RMS log every 10 chunks (~250 ms at 22050 Hz / 512
+        // frames per chunk). Lets us see in real time whether any chunk
+        // captures real audio or it's silence the whole way through.
+        if (++chunk_idx % 10 == 0) {
+            int rms = (int)__builtin_sqrt((double)chunk_sum_sq / (double)to_copy);
+            ESP_LOGI(TAG, "chunk %d: L_peak=%d R_peak=%d L_rms=%d",
+                     chunk_idx, chunk_peak_l, chunk_peak_r, rms);
+        }
     }
     ESP_LOGI(TAG, "channel peaks during capture: L=%d  R=%d",
              (int)peak_l_overall, (int)peak_r_overall);
