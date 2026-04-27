@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
+#include "base58.h"
 #include "ed25519.h"
 #include "refill.h"
 #include "swap_screen.h"
@@ -345,6 +346,181 @@ static bool jup_build_swap(const jup_quote_t *q, const char *user_pubkey,
 }
 
 // Tiny helper — raises 10 to the power n without relying on GNU pow10().
+// ---------------------------------------------------------------------------
+//  Phase 2a-swap (in progress): /swap-instructions parser. See swap.h for
+//  the typed surface. Standalone — does not yet hook into swap_request;
+//  callers will compose vault_execute wrappers + a v0 message in a
+//  follow-up. Tonight's deliverable is the parser itself, build-clean and
+//  no behaviour change to the existing swap path.
+// ---------------------------------------------------------------------------
+
+static bool decode_pubkey_field(const cJSON *parent, const char *key,
+                                uint8_t out[32])
+{
+    const cJSON *j = cJSON_GetObjectItem(parent, key);
+    if (!cJSON_IsString(j) || !j->valuestring) return false;
+    return base58_decode(j->valuestring, out, 32) == 32;
+}
+
+// Decode the {programId, accounts[], data} shape Jupiter uses for every ix.
+static bool decode_one_ix(const cJSON *src, jup_ix_t *out) {
+    memset(out, 0, sizeof *out);
+    if (!cJSON_IsObject(src)) return false;
+    if (!decode_pubkey_field(src, "programId", out->program_id)) return false;
+
+    const cJSON *accs = cJSON_GetObjectItem(src, "accounts");
+    if (!cJSON_IsArray(accs)) return false;
+    int n = cJSON_GetArraySize(accs);
+    if (n < 0) return false;
+    if (n > 0) {
+        out->accounts = calloc((size_t)n, sizeof(jup_acct_t));
+        if (!out->accounts) return false;
+    }
+    for (int i = 0; i < n; i++) {
+        const cJSON *a = cJSON_GetArrayItem(accs, i);
+        if (!cJSON_IsObject(a)) return false;
+        if (!decode_pubkey_field(a, "pubkey", out->accounts[i].pubkey)) return false;
+        const cJSON *s = cJSON_GetObjectItem(a, "isSigner");
+        const cJSON *w = cJSON_GetObjectItem(a, "isWritable");
+        out->accounts[i].is_signer   = cJSON_IsBool(s) ? cJSON_IsTrue(s) : false;
+        out->accounts[i].is_writable = cJSON_IsBool(w) ? cJSON_IsTrue(w) : false;
+    }
+    out->account_count = (size_t)n;
+
+    const cJSON *data = cJSON_GetObjectItem(src, "data");
+    if (cJSON_IsString(data) && data->valuestring) {
+        size_t in_len = strlen(data->valuestring);
+        if (in_len > 0) {
+            // Decode-size = ceil(in_len/4)*3 (mbedtls reports exact required
+            // size on a sizing call, but in_len*3/4 + 4 is a safe ceiling).
+            size_t cap = in_len * 3 / 4 + 4;
+            out->data = malloc(cap);
+            if (!out->data) return false;
+            size_t olen = 0;
+            int rc = mbedtls_base64_decode(out->data, cap, &olen,
+                                           (const uint8_t *)data->valuestring, in_len);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "ix data base64 decode rc=-0x%04x", -rc);
+                return false;
+            }
+            out->data_len = olen;
+        }
+    }
+    return true;
+}
+
+static void free_one_ix(jup_ix_t *ix) {
+    if (!ix) return;
+    free(ix->accounts); ix->accounts = NULL; ix->account_count = 0;
+    free(ix->data);     ix->data     = NULL; ix->data_len      = 0;
+}
+
+void jup_swap_instructions_free(jup_swap_instructions_t *s) {
+    if (!s) return;
+    if (s->setup) {
+        for (size_t i = 0; i < s->setup_count; i++) free_one_ix(&s->setup[i]);
+        free(s->setup); s->setup = NULL;
+    }
+    s->setup_count = 0;
+    if (s->has_swap)    { free_one_ix(&s->swap);    s->has_swap    = false; }
+    if (s->has_cleanup) { free_one_ix(&s->cleanup); s->has_cleanup = false; }
+    free(s->alt_addresses); s->alt_addresses = NULL; s->alt_count = 0;
+    s->priority_lamports = 0;
+}
+
+bool jup_swap_instructions_build(const char *quote_json,
+                                 const char *user_pubkey,
+                                 jup_swap_instructions_t *out)
+{
+    if (!quote_json || !user_pubkey || !out) return false;
+    memset(out, 0, sizeof *out);
+
+    size_t pk_len = strlen(user_pubkey);
+    if (pk_len < 32 || pk_len > 44) return false;
+
+    size_t body_cap = strlen(quote_json) + 256;
+    char  *body     = malloc(body_cap);
+    if (!body) return false;
+    int n = snprintf(body, body_cap,
+        "{\"quoteResponse\":%s,"
+        "\"userPublicKey\":\"%s\","
+        "\"wrapAndUnwrapSol\":true,"
+        "\"dynamicComputeUnitLimit\":true,"
+        "\"prioritizationFeeLamports\":1}",
+        quote_json, user_pubkey);
+    if (n < 0 || (size_t)n >= body_cap) { free(body); return false; }
+
+    char *rsp = heap_caps_malloc(JUP_SWAP_RSP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rsp) { free(body); return false; }
+    bool http_ok = https_post_json("https://lite-api.jup.ag/swap/v1/swap-instructions",
+                                   body, rsp, JUP_SWAP_RSP_CAP);
+    free(body);
+    if (!http_ok) { free(rsp); ESP_LOGW(TAG, "swap-ix: http failed"); return false; }
+
+    cJSON *root = cJSON_Parse(rsp);
+    free(rsp);
+    if (!root) { ESP_LOGW(TAG, "swap-ix: parse fail"); return false; }
+
+    bool ok = false;
+    do {
+        // setupInstructions[]: 0..N
+        const cJSON *setup = cJSON_GetObjectItem(root, "setupInstructions");
+        if (cJSON_IsArray(setup)) {
+            int sn = cJSON_GetArraySize(setup);
+            if (sn > 0) {
+                out->setup = calloc((size_t)sn, sizeof(jup_ix_t));
+                if (!out->setup) break;
+                for (int i = 0; i < sn; i++) {
+                    if (!decode_one_ix(cJSON_GetArrayItem(setup, i), &out->setup[i])) break;
+                    out->setup_count++;
+                }
+                if (out->setup_count != (size_t)sn) break;
+            }
+        }
+
+        // swapInstruction: required
+        const cJSON *swap = cJSON_GetObjectItem(root, "swapInstruction");
+        if (!cJSON_IsObject(swap)) { ESP_LOGW(TAG, "swap-ix: missing swapInstruction"); break; }
+        if (!decode_one_ix(swap, &out->swap)) break;
+        out->has_swap = true;
+
+        // cleanupInstruction: optional, may be null
+        const cJSON *cleanup = cJSON_GetObjectItem(root, "cleanupInstruction");
+        if (cJSON_IsObject(cleanup)) {
+            if (!decode_one_ix(cleanup, &out->cleanup)) break;
+            out->has_cleanup = true;
+        }
+
+        // addressLookupTableAddresses[]
+        const cJSON *alts = cJSON_GetObjectItem(root, "addressLookupTableAddresses");
+        if (cJSON_IsArray(alts)) {
+            int an = cJSON_GetArraySize(alts);
+            if (an > 0) {
+                out->alt_addresses = calloc((size_t)an, 32);
+                if (!out->alt_addresses) break;
+                int decoded = 0;
+                for (int i = 0; i < an; i++) {
+                    const cJSON *a = cJSON_GetArrayItem(alts, i);
+                    if (!cJSON_IsString(a) || !a->valuestring) break;
+                    if (base58_decode(a->valuestring, out->alt_addresses[i], 32) != 32) break;
+                    decoded++;
+                }
+                if (decoded != an) break;
+                out->alt_count = (size_t)an;
+            }
+        }
+
+        const cJSON *pri = cJSON_GetObjectItem(root, "prioritizationFeeLamports");
+        out->priority_lamports = cJSON_IsNumber(pri) ? (uint64_t)pri->valuedouble : 1;
+
+        ok = true;
+    } while (0);
+
+    cJSON_Delete(root);
+    if (!ok) jup_swap_instructions_free(out);
+    return ok;
+}
+
 static double swap_pow10(uint8_t n) {
     double v = 1.0;
     for (uint8_t i = 0; i < n; ++i) v *= 10.0;
