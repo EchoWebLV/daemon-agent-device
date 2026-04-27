@@ -1,35 +1,37 @@
 // ---------------------------------------------------------------------------
-//  ST7789 display bring-up. Pins match the Arduino TFT_eSPI setup so the
-//  same physical board keeps working without hardware changes.
+//  display.c — ILI9342C bring-up for the ESP32-S3-BOX-3B.
+//
+//  Uses esp_lcd over SPI3 (BOX-3 routes the LCD bus to SPI3, NOT SPI2 like
+//  the Waveshare predecessor). Driver comes from espressif/esp_lcd_ili9341,
+//  which covers both ILI9341 and ILI9342C parts (the IC inside BOX-3 is a
+//  9342C — same command set as 9341, slightly different gamma defaults; the
+//  driver handles both transparently).
+//
+//  Orientation: panel is mounted as 320x240 landscape. We achieve that by
+//  swapping x/y and mirroring x — same trick as the Arduino BSP.
+//
+//  Public API (display_init / display_panel / display_io / DISPLAY_WIDTH /
+//  DISPLAY_HEIGHT) is unchanged so ui.c and the *_screen.c files compile
+//  without modification.
+//
+//  Init order constraint: this MUST run before touch_init(). Touch RST is
+//  level-shifted from LCD_RST (GPIO48); a late panel-reset pulse will yank
+//  the touch IC out from under the LVGL pointer indev. board.h documents
+//  the same.
 // ---------------------------------------------------------------------------
 #include "display.h"
+#include "board.h"
 
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_ili9341.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
 static const char *TAG = "display";
 
-// ---- Pin map (Waveshare 2.8") -----------------------------------------------
-// Backlight (GPIO5) is owned by devcfg via LEDC PWM; not touched here.
-#define PIN_MOSI   45
-#define PIN_SCLK   40
-#define PIN_CS     42
-#define PIN_DC     41
-#define PIN_RST    39
-
-// SPI2 on the S3 is the general-purpose GP-SPI host; SPI3 has more DMA
-// restrictions on certain pin combos so we stick with SPI2 here.
-#define LCD_HOST   SPI2_HOST
-
-// 80 MHz is the sweet spot for this ST7789 panel — we confirmed it on the
-// Arduino build and pushed full-sprite refresh in ~15 ms.
-#define PIXEL_CLOCK_HZ (80 * 1000 * 1000)
-
-// ST7789 LCD command + parameter widths. Both 8-bit for this part.
 #define LCD_CMD_BITS   8
 #define LCD_PARAM_BITS 8
 
@@ -37,62 +39,62 @@ static esp_lcd_panel_handle_t    s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_io    = NULL;
 
 esp_err_t display_init(void) {
-    // ---- SPI bus ------------------------------------------------------------
-    // max_transfer_sz picks the upper bound on a single DMA-enabled SPI burst.
-    // Sizing for 80 scan lines @ 240 px * 2 B (RGB565) lets us push half the
-    // screen in one go, which LVGL is happy with.
+    // ---- SPI bus (SPI3 on BOX-3) -------------------------------------------
+    // max_transfer_sz sized so half a landscape frame fits one DMA burst:
+    // 320 * 120 * 2 B (RGB565) = 76.8 KB. LVGL's two flush buffers are well
+    // under this cap.
     spi_bus_config_t buscfg = {
-        .sclk_io_num     = PIN_SCLK,
-        .mosi_io_num     = PIN_MOSI,
+        .sclk_io_num     = BOARD_LCD_PIN_SCLK,
+        .mosi_io_num     = BOARD_LCD_PIN_MOSI,
         .miso_io_num     = -1,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = DISPLAY_WIDTH * 80 * sizeof(uint16_t),
+        .max_transfer_sz = DISPLAY_WIDTH * 120 * sizeof(uint16_t),
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(BOARD_LCD_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-    // ---- Panel IO (SPI-mode wrapper around the bus) -------------------------
+    // ---- Panel IO (SPI-mode wrapper around the bus) ------------------------
     esp_lcd_panel_io_spi_config_t io_cfg = {
-        .dc_gpio_num       = PIN_DC,
-        .cs_gpio_num       = PIN_CS,
-        .pclk_hz           = PIXEL_CLOCK_HZ,
+        .dc_gpio_num       = BOARD_LCD_PIN_DC,
+        .cs_gpio_num       = BOARD_LCD_PIN_CS,
+        .pclk_hz           = BOARD_LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits      = LCD_CMD_BITS,
         .lcd_param_bits    = LCD_PARAM_BITS,
         .spi_mode          = 0,
         .trans_queue_depth = 10,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
-        (esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &s_io));
+        (esp_lcd_spi_bus_handle_t)BOARD_LCD_SPI_HOST, &io_cfg, &s_io));
 
-    // ---- ST7789 panel -------------------------------------------------------
+    // ---- ILI9342C panel ----------------------------------------------------
     esp_lcd_panel_dev_config_t panel_cfg = {
-        .reset_gpio_num = PIN_RST,
-        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
+        .reset_gpio_num = BOARD_LCD_PIN_RST,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,   // BOX-3 wires panel BGR
         .bits_per_pixel = 16,
     };
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(s_io, &panel_cfg, &s_panel));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(s_io, &panel_cfg, &s_panel));
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-    // ST7789 ships with colour inversion required to show correct colours.
+    // ILI9342 ships with colour inversion ON for typical mounting — same as
+    // ST7789, the Arduino BSP, and the Waveshare predecessor.
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    // Landscape: swap_xy + mirror x. The mirror combo we want was confirmed
+    // empirically on the BOX-3; if your panel comes up flipped, try mirror(false, true)
+    // or (true, true) — only one of the four combinations renders right-side-up.
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, false));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    // ---- Clear to a solid colour so we know the pipeline works --------------
-    // Use PSRAM since the full-frame buffer is 240*320*2 = 150 KB, which is
-    // too big to waste on internal RAM for a one-off clear.
+    // ---- Clear to navy so we can tell "panel up" from "panel dark" ----------
     size_t   pixels = (size_t)DISPLAY_WIDTH * DISPLAY_HEIGHT;
     uint16_t *buf   = heap_caps_malloc(pixels * sizeof(uint16_t),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf) {
-        // Muted navy — deliberately not pure black so "display is dark" vs
-        // "display is working but drew black" is distinguishable.
-        //
-        // ST7789 expects RGB565 big-endian on the SPI wire; the ESP32 is
-        // little-endian, so we byte-swap before the fill. Without this, the
-        // panel reads {LSB, MSB} and 0x0014 (navy) decodes as 0x1400 — a
-        // medium green with a faint red tint. Ask me how I know.
-        const uint16_t navy = __builtin_bswap16(0x0014);  // RGB565 dark blue, wire order
+        // ILI9342 expects RGB565 big-endian on the SPI wire; ESP32 is little-
+        // endian, so byte-swap before fill. Without this, navy decodes as a
+        // dim green — same gotcha as ST7789, see git log for the history.
+        const uint16_t navy = __builtin_bswap16(0x0014);
         for (size_t i = 0; i < pixels; ++i) buf[i] = navy;
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
                                   DISPLAY_WIDTH, DISPLAY_HEIGHT, buf);
@@ -101,8 +103,10 @@ esp_err_t display_init(void) {
         ESP_LOGW(TAG, "no PSRAM for clear buffer; skipping");
     }
 
-    ESP_LOGI(TAG, "ST7789 %dx%d up @ %d MHz SPI",
-             DISPLAY_WIDTH, DISPLAY_HEIGHT, PIXEL_CLOCK_HZ / 1000000);
+    ESP_LOGI(TAG, "ILI9342C %dx%d up @ %d MHz SPI%d",
+             DISPLAY_WIDTH, DISPLAY_HEIGHT,
+             BOARD_LCD_PIXEL_CLOCK_HZ / 1000000,
+             BOARD_LCD_SPI_HOST == SPI3_HOST ? 3 : 2);
     return ESP_OK;
 }
 

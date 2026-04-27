@@ -13,8 +13,8 @@
 extern "C" {
 #endif
 
-#define DISPLAY_WIDTH  240
-#define DISPLAY_HEIGHT 320
+#define DISPLAY_WIDTH  320
+#define DISPLAY_HEIGHT 240
 
 // Bring up SPI bus + ST7789 + backlight. Safe to call once at boot.
 esp_err_t display_init(void);
