@@ -34,6 +34,8 @@
 #include "voice.h"
 #include "wallet.h"
 #include "wifi_sta.h"
+#include "wizard.h"
+#include "wizard_screen.h"
 
 static const char *TAG = "daemon";
 
@@ -239,6 +241,21 @@ void app_main(void) {
         // wifi failure — no listener without a network to listen on.
         ESP_ERROR_CHECK(server_start());
         server_set_status("idle");
+    }
+
+    // Wizard auto-trigger. Fresh devices with no Wi-Fi creds (and no
+    // PIN-sealed seed signaling prior provisioning) drop into the
+    // captive portal: AP up, splash on the LCD, daemon halts here. The
+    // wizard's POST handler reboots the device after persisting form
+    // values, so this branch never returns.
+    if (wifi_err != ESP_OK && wizard_is_first_run() && !pin_is_set()) {
+        ESP_LOGI(TAG, "fresh device — running wizard");
+        ESP_ERROR_CHECK(server_start());     // wizard borrows this httpd
+        char ssid[33] = {0};
+        wizard_compute_ap_ssid(ssid, sizeof ssid);
+        wizard_screen_show(ssid);
+        ESP_ERROR_CHECK(wizard_start());
+        for (;;) vTaskDelay(pdMS_TO_TICKS(60000));   // wait for /wizard reboot
     }
 
     // AI client: clears conversation history and registers the /say handler.

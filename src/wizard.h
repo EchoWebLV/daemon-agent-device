@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -52,6 +53,11 @@ esp_err_t wizard_apply_form(const wizard_form_t *form);
 // Read the NVS-backed owner pubkey, if any. Returns NULL if unset (the
 // wallet falls back to secrets.h's OWNER_PUBKEY in that case).
 const char *wizard_owner_pubkey(void);
+
+// Compute the AP SSID this device would broadcast — "daemon-setup-XXXX"
+// where XXXX is the last 4 hex of the SoftAP MAC. Stable across reboots.
+// Caller-owned buffer, returns true on success.
+bool wizard_compute_ap_ssid(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

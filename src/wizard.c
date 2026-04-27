@@ -263,6 +263,14 @@ static const httpd_uri_t s_uri_post = {
 // ---------------------------------------------------------------------------
 // Wi-Fi AP bring-up
 // ---------------------------------------------------------------------------
+bool wizard_compute_ap_ssid(char *out, size_t cap) {
+    if (!out || cap < 18) return false;
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) != ESP_OK) return false;
+    snprintf(out, cap, "daemon-setup-%02X%02X", mac[4], mac[5]);
+    return true;
+}
+
 static esp_err_t bring_up_ap(void) {
     if (s_ap_netif) return ESP_OK;
 
@@ -272,11 +280,8 @@ static esp_err_t bring_up_ap(void) {
         return ESP_FAIL;
     }
 
-    // SSID = "daemon-setup-XXXX" with last 4 hex of MAC for uniqueness.
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     char ssid[33];
-    snprintf(ssid, sizeof ssid, "daemon-setup-%02X%02X", mac[4], mac[5]);
+    if (!wizard_compute_ap_ssid(ssid, sizeof ssid)) return ESP_FAIL;
 
     wifi_config_t ap_cfg = {
         .ap = {
