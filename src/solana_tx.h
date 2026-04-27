@@ -66,6 +66,19 @@ typedef struct {
     size_t                      data_len;
 } solana_ix_v2_t;
 
+// Address-Lookup-Table entry. Accounts referenced through this ALT are
+// expressed as 1-byte indexes into the table at validate time, which is
+// how Jupiter fits deep routes into the 1232-byte tx limit. Each ALT
+// entry lists the table's pubkey plus per-direction (writable/readonly)
+// index arrays — the same shape Jupiter's /swap-instructions returns.
+typedef struct {
+    const uint8_t *table_pubkey;        // 32 bytes
+    const uint8_t *writable_indexes;    // each entry is a u8 index into the table
+    size_t         writable_count;
+    const uint8_t *readonly_indexes;
+    size_t         readonly_count;
+} solana_alt_lookup_t;
+
 typedef struct {
     const uint8_t        *fee_payer;       // 32 bytes (slot-0 signer)
     const uint8_t        *signer_pubkey;   // 32 bytes — our wallet (slot-1 signer)
@@ -74,6 +87,10 @@ typedef struct {
     size_t                ix_count;
     uint32_t              cu_limit;
     uint64_t              cu_price_micro;
+    // Optional address-table lookups. Pass NULL / 0 for the original
+    // "no ALT" path (every account inline in the static keys table).
+    const solana_alt_lookup_t *alts;
+    size_t                     alt_count;
 } solana_tx_input_v2_t;
 
 // Same wire shape as solana_build_signed_tx_base64: signed VersionedTransaction

@@ -385,8 +385,24 @@ int solana_build_tx_v2_base64(const solana_tx_input_v2_t *in,
         if (ix->data_len) wc_bytes(&w, ix->data, ix->data_len);
     }
 
-    // No address-table lookups.
-    wc_shortvec(&w, 0);
+    // Address-table lookups. Empty when in->alts == NULL (the x402 /
+    // refill paths) — Jupiter swaps fill this in when /swap-instructions
+    // returns deep routes that need account addresses resolved at
+    // runtime.
+    if (!in->alts || in->alt_count == 0) {
+        wc_shortvec(&w, 0);
+    } else {
+        wc_shortvec(&w, (uint16_t)in->alt_count);
+        for (size_t i = 0; i < in->alt_count; i++) {
+            const solana_alt_lookup_t *alt = &in->alts[i];
+            if (!alt->table_pubkey) { w.overflow = true; break; }
+            wc_bytes(&w, alt->table_pubkey, 32);
+            wc_shortvec(&w, (uint16_t)alt->writable_count);
+            if (alt->writable_count) wc_bytes(&w, alt->writable_indexes, alt->writable_count);
+            wc_shortvec(&w, (uint16_t)alt->readonly_count);
+            if (alt->readonly_count) wc_bytes(&w, alt->readonly_indexes, alt->readonly_count);
+        }
+    }
 
     if (w.overflow) {
         ESP_LOGE(TAG, "v2 message overflow");
