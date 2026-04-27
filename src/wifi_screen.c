@@ -353,24 +353,32 @@ bool wifi_screen_init(void) {
     lv_obj_remove_flag(s_modal, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
 
+    // Landscape modal layout (320×240). Vertical budget: 240 px total.
+    //   title       y=2..18    (16 px)
+    //   pw input    y=20..50   (30 px)
+    //   btn row     y=54..82   (28 px)
+    //   keyboard    y=86..240  (154 px)
+    // Earlier portrait layout had a 180 px keyboard at BOTTOM_MID overlap-
+    // -ping the buttons + input, which made the keyboard's mode-switch keys
+    // dispatch through to the buttons underneath ("numbers exited the
+    // keyboard"). Tighter layout below eliminates the overlap.
     s_modal_title = lv_label_create(s_modal);
     lv_label_set_text(s_modal_title, "Connect");
     lv_obj_set_style_text_color(s_modal_title, SCR_COLOR_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_modal_title, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_align(s_modal_title, LV_ALIGN_TOP_LEFT, 4, 2);
 
     s_pw_input = lv_textarea_create(s_modal);
-    lv_obj_set_size(s_pw_input, SCR_W - 32, 40);
-    lv_obj_align(s_pw_input, LV_ALIGN_TOP_LEFT, 4, 32);
+    lv_obj_set_size(s_pw_input, SCR_W - 32, 30);
+    lv_obj_align(s_pw_input, LV_ALIGN_TOP_LEFT, 4, 20);
     lv_textarea_set_password_mode(s_pw_input, true);
     lv_textarea_set_one_line(s_pw_input, true);
     lv_textarea_set_placeholder_text(s_pw_input, "password");
     lv_obj_set_style_bg_color(s_pw_input, SCR_COLOR_PANEL, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_pw_input, SCR_COLOR_TEXT, LV_PART_MAIN);
 
-    // Buttons row (above the keyboard so they stay visible while typing).
     s_cancel_btn = lv_button_create(s_modal);
-    lv_obj_set_size(s_cancel_btn, 90, 36);
-    lv_obj_align(s_cancel_btn, LV_ALIGN_TOP_LEFT, 8, 84);
+    lv_obj_set_size(s_cancel_btn, 84, 28);
+    lv_obj_align(s_cancel_btn, LV_ALIGN_TOP_LEFT, 8, 54);
     lv_obj_set_style_bg_color(s_cancel_btn, SCR_COLOR_DIVIDER, LV_PART_MAIN);
     lv_obj_add_event_cb(s_cancel_btn, cancel_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *cl = lv_label_create(s_cancel_btn);
@@ -379,8 +387,8 @@ bool wifi_screen_init(void) {
     lv_obj_center(cl);
 
     s_connect_btn = lv_button_create(s_modal);
-    lv_obj_set_size(s_connect_btn, 90, 36);
-    lv_obj_align(s_connect_btn, LV_ALIGN_TOP_RIGHT, -8, 84);
+    lv_obj_set_size(s_connect_btn, 84, 28);
+    lv_obj_align(s_connect_btn, LV_ALIGN_TOP_RIGHT, -8, 54);
     lv_obj_set_style_bg_color(s_connect_btn, SCR_COLOR_ACCENT, LV_PART_MAIN);
     lv_obj_add_event_cb(s_connect_btn, connect_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *ol = lv_label_create(s_connect_btn);
@@ -388,11 +396,9 @@ bool wifi_screen_init(void) {
     lv_obj_set_style_text_color(ol, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(ol);
 
-    // On-screen keyboard. Bound to the password textarea so key taps go
-    // straight in; READY/CANCEL codes forward to connect/cancel.
     s_keyboard = lv_keyboard_create(s_modal);
     lv_keyboard_set_textarea(s_keyboard, s_pw_input);
-    lv_obj_set_size(s_keyboard, SCR_W, 180);
+    lv_obj_set_size(s_keyboard, SCR_W, 154);
     lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(s_keyboard, keyboard_ready, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(s_keyboard, keyboard_ready, LV_EVENT_CANCEL, NULL);
