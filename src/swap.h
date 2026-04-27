@@ -15,6 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "solana_tx.h"   // solana_ix_account_t — wrapped ix outputs feed the v2 builder
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -120,6 +122,35 @@ bool jup_swap_instructions_build(const char *quote_json,
 // Free heap-allocated arrays inside the struct. Idempotent.
 void jup_swap_instructions_free(jup_swap_instructions_t *out);
 
+// Wrap a single Jupiter instruction in agent_program::vault_execute. Bridges
+// the parser shape (jup_ix_t, inline pubkey arrays) to the v2 builder shape
+// (solana_ix_account_t, pointer-based metas). Outputs:
+//   - `out_ix_data[..ix_len]`     — the outer ix data (Anchor disc + InnerIx)
+//   - `out_metas[..*out_meta_count]` — outer account metas, in this order:
+//        [0]    vault          (writable, NOT signer at outer level)
+//        [1]    current_signer (signer)
+//        [2..]  inner ix's accounts (signer flag stripped — PDA signs them
+//               via CPI seeds inside the program)
+//        [last] inner program account (read-only)
+//
+// The metas' pubkey pointers reference `vault_pubkey`, `current_signer`,
+// `src->program_id`, and `src->accounts[i].pubkey`. The caller MUST keep
+// those bytes alive until the resulting tx is serialized.
+//
+// Buffer sizing — caller must provide:
+//   `out_ix_cap`   >= 8 + 32 + 4 + (32+1+1)*src->account_count + 4 + src->data_len
+//   `out_meta_cap` >= 2 + src->account_count + 1
+//
+// Returns ix-data length (bytes written) on success, -1 on failure.
+int jup_ix_wrap_vault_execute(const jup_ix_t      *src,
+                              const uint8_t        vault_pubkey[32],
+                              const uint8_t        current_signer[32],
+                              uint8_t             *out_ix_data,
+                              size_t               out_ix_cap,
+                              solana_ix_account_t *out_metas,
+                              size_t              *out_meta_count,
+                              size_t               out_meta_cap);
+
 // Diagnostic — exercises jup_swap_instructions_build against live Jupiter,
 // using the vault PDA as user_pubkey. Returns a JSON summary of the parsed
 // shape (per-bucket counts, ALT count, priority lamports). Used by the
@@ -127,6 +158,14 @@ void jup_swap_instructions_free(jup_swap_instructions_t *out);
 bool swap_ix_summary_for_test(const char *from_sym, const char *to_sym,
                               double amount_ui, uint16_t slippage_bps,
                               char *out_json, size_t cap);
+
+// Diagnostic — runs the parser AND the per-ix vault_execute wrapper against
+// a live Jupiter response, returns a JSON shape summary including the
+// outer ix-data lengths and outer meta counts for each parsed instruction.
+// Used by the host harness only.
+bool swap_ix_wrap_for_test(const char *from_sym, const char *to_sym,
+                           double amount_ui, uint16_t slippage_bps,
+                           char *out_json, size_t cap);
 
 #ifdef __cplusplus
 }

@@ -927,6 +927,24 @@ static void dispatch_line(const char *line) {
             }
             return;
         }
+        // WRAP <from> <to> <amount> [slippage_bps]  →  parse a live Jupiter
+        // response AND wrap each instruction in vault_execute, reporting
+        // outer-data lengths + outer-meta counts as JSON.
+        if ((args = match_token(rest, "WRAP"))) {
+            char from[12] = {0}, to[12] = {0};
+            double amount = 0;
+            unsigned slip = 0;
+            int parsed = sscanf(args, "%11s %11s %lf %u",
+                                from, to, &amount, &slip);
+            if (parsed < 3) { resp_err("usage SWAP WRAP <from> <to> <amount> [slippage_bps]"); return; }
+            char buf[512];
+            if (swap_ix_wrap_for_test(from, to, amount, (uint16_t)slip, buf, sizeof(buf))) {
+                resp_ok(buf);
+            } else {
+                resp_err(buf);
+            }
+            return;
+        }
         resp_err("swap bad_subverb");
         return;
     }

@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
+#include "agent_pda.h"
 #include "base58.h"
 #include "ed25519.h"
 #include "refill.h"
@@ -521,6 +522,67 @@ bool jup_swap_instructions_build(const char *quote_json,
     return ok;
 }
 
+int jup_ix_wrap_vault_execute(const jup_ix_t      *src,
+                              const uint8_t        vault_pubkey[32],
+                              const uint8_t        current_signer[32],
+                              uint8_t             *out_ix_data,
+                              size_t               out_ix_cap,
+                              solana_ix_account_t *out_metas,
+                              size_t              *out_meta_count,
+                              size_t               out_meta_cap)
+{
+    if (!src || !vault_pubkey || !current_signer) return -1;
+    if (!out_ix_data || !out_metas || !out_meta_count) return -1;
+    // agent_pda_build_vault_execute_ix has its own sanity caps (64 metas,
+    // 1024 data). Mirror the meta cap here so we fail fast before the
+    // scratch alloc.
+    if (src->account_count > 64) return -1;
+
+    // jup_acct_t carries the pubkey inline (32-byte array); agent_pda's
+    // builder takes pointer-based metas. Translate.
+    agent_meta_t *inner = NULL;
+    if (src->account_count > 0) {
+        inner = malloc(src->account_count * sizeof(*inner));
+        if (!inner) return -1;
+        for (size_t i = 0; i < src->account_count; i++) {
+            inner[i].pubkey      = src->accounts[i].pubkey;
+            inner[i].is_signer   = src->accounts[i].is_signer;
+            inner[i].is_writable = src->accounts[i].is_writable;
+        }
+    }
+
+    // The builder writes to an agent_meta_t output; the v2 tx builder
+    // wants solana_ix_account_t. Same shape, different type — copy
+    // field-by-field after the build.
+    size_t need_outer = 2 + src->account_count + 1;
+    if (need_outer > out_meta_cap) { free(inner); return -1; }
+
+    agent_meta_t *outer = malloc(need_outer * sizeof(*outer));
+    if (!outer) { free(inner); return -1; }
+
+    size_t outer_count = 0;
+    int ix_len = agent_pda_build_vault_execute_ix(
+        vault_pubkey, current_signer, src->program_id,
+        inner, src->account_count,
+        src->data, src->data_len,
+        out_ix_data, out_ix_cap,
+        outer, &outer_count, need_outer);
+
+    free(inner);
+
+    if (ix_len < 0) { free(outer); return -1; }
+
+    for (size_t i = 0; i < outer_count; i++) {
+        out_metas[i].pubkey      = outer[i].pubkey;
+        out_metas[i].is_signer   = outer[i].is_signer;
+        out_metas[i].is_writable = outer[i].is_writable;
+    }
+    *out_meta_count = outer_count;
+
+    free(outer);
+    return ix_len;
+}
+
 static double swap_pow10(uint8_t n) {
     double v = 1.0;
     for (uint8_t i = 0; i < n; ++i) v *= 10.0;
@@ -972,4 +1034,131 @@ bool swap_ix_summary_for_test(const char *from_sym, const char *to_sym,
         (unsigned long long)ix.priority_lamports);
     jup_swap_instructions_free(&ix);
     return n > 0 && (size_t)n < cap;
+}
+
+// Append "{\"d\":<ix_len>,\"m\":<meta_count>}" for one wrapped ix, after
+// optionally writing a leading comma. Returns chars written (>=0) on
+// success, -1 on overflow / wrap failure. Caller-owned scratch buffers
+// are passed through so we don't re-alloc per ix.
+static int swap_wrap_one_for_test(const jup_ix_t *src,
+                                  const uint8_t   vault[32],
+                                  const uint8_t   signer[32],
+                                  uint8_t        *raw_scratch,
+                                  size_t          raw_cap,
+                                  solana_ix_account_t *meta_scratch,
+                                  size_t          meta_cap,
+                                  char           *out, size_t cap,
+                                  bool with_leading_comma)
+{
+    size_t mc = 0;
+    int ix_len = jup_ix_wrap_vault_execute(src, vault, signer,
+                                           raw_scratch, raw_cap,
+                                           meta_scratch, &mc, meta_cap);
+    if (ix_len < 0) return -1;
+    return snprintf(out, cap, "%s{\"d\":%d,\"m\":%u}",
+                    with_leading_comma ? "," : "", ix_len, (unsigned)mc);
+}
+
+bool swap_ix_wrap_for_test(const char *from_sym, const char *to_sym,
+                           double amount_ui, uint16_t slippage_bps,
+                           char *out_json, size_t cap)
+{
+    if (!out_json || cap == 0) return false;
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        snprintf(out_json, cap, "{\"error\":\"unknown_symbol\"}"); return false;
+    }
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        snprintf(out_json, cap, "{\"error\":\"quote_failed\"}"); return false;
+    }
+    const char *user = wallet_vault_pda();
+    if (!user || !*user) user = wallet_pubkey();
+    const uint8_t *vault_bytes  = wallet_vault_pda_bytes();
+    const uint8_t *signer_bytes = wallet_pubkey_bytes();
+    if (!user || !*user || !vault_bytes || !signer_bytes) {
+        free(q.quote_json);
+        snprintf(out_json, cap, "{\"error\":\"no_keys\"}"); return false;
+    }
+
+    jup_swap_instructions_t ix = {0};
+    bool parsed = jup_swap_instructions_build(q.quote_json, user, &ix);
+    free(q.quote_json);
+    if (!parsed) {
+        snprintf(out_json, cap, "{\"error\":\"ix_build_failed\"}"); return false;
+    }
+
+    // Per-ix scratch buffers, reused across all wrapped instructions.
+    // Sizing matches agent_pda's caps: 64 inner metas → 67 outer; ix data
+    // up to 8+32+4+34*64+4+1024 ≈ 3.2 KB.
+    const size_t raw_cap  = 4096;
+    const size_t meta_cap = 72;
+    uint8_t             *raw  = malloc(raw_cap);
+    solana_ix_account_t *meta = malloc(meta_cap * sizeof(*meta));
+    if (!raw || !meta) {
+        free(raw); free(meta); jup_swap_instructions_free(&ix);
+        snprintf(out_json, cap, "{\"error\":\"oom\"}"); return false;
+    }
+
+    char  *p = out_json;
+    size_t left = cap;
+    int    n;
+    bool   ok = false;
+
+    do {
+        n = snprintf(p, left, "{\"setup\":[");
+        if (n < 0 || (size_t)n >= left) break;
+        p += n; left -= n;
+
+        bool fail = false;
+        for (size_t i = 0; i < ix.setup_count; i++) {
+            int w = swap_wrap_one_for_test(&ix.setup[i], vault_bytes, signer_bytes,
+                                           raw, raw_cap, meta, meta_cap,
+                                           p, left, i > 0);
+            if (w < 0 || (size_t)w >= left) { fail = true; break; }
+            p += w; left -= w;
+        }
+        if (fail) break;
+
+        n = snprintf(p, left, "],\"swap\":");
+        if (n < 0 || (size_t)n >= left) break;
+        p += n; left -= n;
+
+        if (!ix.has_swap) { snprintf(p, left, "null"); break; }
+        int w = swap_wrap_one_for_test(&ix.swap, vault_bytes, signer_bytes,
+                                       raw, raw_cap, meta, meta_cap,
+                                       p, left, false);
+        if (w < 0 || (size_t)w >= left) break;
+        p += w; left -= w;
+
+        n = snprintf(p, left, ",\"cleanup\":");
+        if (n < 0 || (size_t)n >= left) break;
+        p += n; left -= n;
+
+        if (ix.has_cleanup) {
+            w = swap_wrap_one_for_test(&ix.cleanup, vault_bytes, signer_bytes,
+                                       raw, raw_cap, meta, meta_cap,
+                                       p, left, false);
+            if (w < 0 || (size_t)w >= left) break;
+            p += w; left -= w;
+        } else {
+            n = snprintf(p, left, "null");
+            if (n < 0 || (size_t)n >= left) break;
+            p += n; left -= n;
+        }
+
+        n = snprintf(p, left, ",\"alts\":%u}", (unsigned)ix.alt_count);
+        if (n < 0 || (size_t)n >= left) break;
+        ok = true;
+    } while (0);
+
+    free(raw); free(meta);
+    jup_swap_instructions_free(&ix);
+
+    if (!ok) {
+        snprintf(out_json, cap, "{\"error\":\"wrap_or_overflow\"}");
+        return false;
+    }
+    return true;
 }
