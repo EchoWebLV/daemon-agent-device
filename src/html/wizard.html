@@ -23,14 +23,36 @@
     legend { padding: 0 8px; color: #66FF80; font-weight: 600; font-size: 13px; letter-spacing: 0.4px; }
     label { display: block; font-size: 12px; color: #0D5A1A; margin: 12px 0 4px; letter-spacing: 0.3px; }
     label:first-of-type { margin-top: 0; }
-    input {
+    input, select {
       width: 100%; box-sizing: border-box;
       background: #000; color: #2BFF4A;
       border: 1px solid #0A3311; border-radius: 6px;
       padding: 10px 12px; font: inherit;
     }
-    input:focus { outline: none; border-color: #2BFF4A; }
+    select { appearance: none; -webkit-appearance: none; background-image:
+      linear-gradient(45deg, transparent 50%, #2BFF4A 50%),
+      linear-gradient(135deg, #2BFF4A 50%, transparent 50%);
+      background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+      background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
+      padding-right: 32px; }
+    input:focus, select:focus { outline: none; border-color: #2BFF4A; }
     .hint { font-size: 11px; color: #0D5A1A; margin-top: 4px; }
+    .row { display: flex; gap: 8px; align-items: stretch; }
+    .row select { flex: 1; }
+    .row .rescan {
+      width: auto; padding: 0 14px; margin: 0; font-size: 12px;
+      background: #041A08; color: #2BFF4A; border: 1px solid #0A3311;
+      cursor: pointer; letter-spacing: 0; font-weight: 400;
+    }
+    .row .rescan:hover { border-color: #2BFF4A; background: #0A3311; }
+    .row .rescan:disabled { opacity: 0.5; cursor: progress; }
+    .toggle {
+      background: none; border: 0; color: #0D5A1A;
+      padding: 6px 0 0; margin: 0; width: auto;
+      font-size: 11px; text-decoration: underline; cursor: pointer;
+      letter-spacing: 0; font-weight: 400;
+    }
+    .toggle:hover { color: #2BFF4A; background: none; }
     button {
       width: 100%; padding: 14px;
       background: #2BFF4A; color: #000;
@@ -53,10 +75,23 @@
     <form id="f" autocomplete="off">
       <fieldset>
         <legend>1. Wi-Fi</legend>
-        <label for="ssid">SSID</label>
-        <input id="ssid" name="ssid" required maxlength="32" />
+        <label for="ssid_pick">Network</label>
+        <div class="row">
+          <select id="ssid_pick">
+            <option value="">Scanning...</option>
+          </select>
+          <button type="button" id="rescan" class="rescan">↻</button>
+        </div>
+        <button type="button" id="manual_toggle" class="toggle">Hidden network? Enter SSID manually</button>
+
+        <label for="ssid_manual" id="ssid_manual_label" style="display:none">SSID</label>
+        <input id="ssid_manual" name="ssid_manual" maxlength="32"
+               style="display:none" />
+
+        <input id="ssid" name="ssid" type="hidden" />
         <label for="password">Password</label>
         <input id="password" name="password" type="password" maxlength="64" />
+        <div class="hint" id="pw_hint">Leave blank for open networks.</div>
       </fieldset>
 
       <fieldset>
@@ -87,13 +122,101 @@
     const form = document.getElementById('f');
     const status = document.getElementById('status');
     const submitBtn = document.getElementById('submit');
+    const ssidPick = document.getElementById('ssid_pick');
+    const ssidHidden = document.getElementById('ssid');
+    const ssidManual = document.getElementById('ssid_manual');
+    const ssidManualLabel = document.getElementById('ssid_manual_label');
+    const manualToggle = document.getElementById('manual_toggle');
+    const rescanBtn = document.getElementById('rescan');
+    const passwordEl = document.getElementById('password');
+    const pwHint = document.getElementById('pw_hint');
+    let manualMode = false;
+    let lastNetworks = [];
+
     function setStatus(text, kind) {
       status.style.display = 'block';
       status.className = 'status ' + kind;
       status.textContent = text;
     }
+
+    // Render an SSID with a signal-strength glyph and an open-vs-locked tag.
+    function fmtOption(net) {
+      const bars = net.rssi > -55 ? '••••' :
+                   net.rssi > -65 ? '••• ' :
+                   net.rssi > -75 ? '••  ' : '•   ';
+      const lock = net.open ? '   ' : ' 🔒';
+      return `${bars}${lock}  ${net.ssid}`;
+    }
+
+    function updatePasswordVisibility() {
+      const ssid = currentSsid();
+      const net = lastNetworks.find(n => n.ssid === ssid);
+      const isOpen = net && net.open;
+      passwordEl.disabled = !!isOpen;
+      passwordEl.required = !isOpen && !!ssid;
+      pwHint.textContent = isOpen
+        ? 'Open network — no password.'
+        : 'Required for secured networks.';
+    }
+
+    function currentSsid() {
+      if (manualMode) return ssidManual.value.trim();
+      return ssidPick.value;
+    }
+
+    async function scan() {
+      rescanBtn.disabled = true;
+      ssidPick.innerHTML = '<option value="">Scanning...</option>';
+      ssidPick.disabled = true;
+      try {
+        const r = await fetch('/wizard/scan');
+        const j = await r.json();
+        lastNetworks = (j.networks || []);
+        if (lastNetworks.length === 0) {
+          ssidPick.innerHTML = '<option value="">No networks found</option>';
+        } else {
+          ssidPick.innerHTML =
+            '<option value="" disabled selected>Pick a network</option>' +
+            lastNetworks.map(n =>
+              `<option value="${n.ssid.replace(/"/g, '&quot;')}">${fmtOption(n)}</option>`
+            ).join('');
+        }
+        ssidPick.disabled = false;
+      } catch (err) {
+        ssidPick.innerHTML = '<option value="">Scan failed: ' + err.message + '</option>';
+      } finally {
+        rescanBtn.disabled = false;
+      }
+    }
+
+    ssidPick.addEventListener('change', () => {
+      ssidHidden.value = ssidPick.value;
+      updatePasswordVisibility();
+    });
+    ssidManual.addEventListener('input', () => {
+      ssidHidden.value = ssidManual.value.trim();
+      updatePasswordVisibility();
+    });
+    rescanBtn.addEventListener('click', scan);
+    manualToggle.addEventListener('click', () => {
+      manualMode = !manualMode;
+      ssidPick.style.display       = manualMode ? 'none' : '';
+      rescanBtn.style.display      = manualMode ? 'none' : '';
+      ssidManual.style.display     = manualMode ? '' : 'none';
+      ssidManualLabel.style.display= manualMode ? '' : 'none';
+      manualToggle.textContent     = manualMode
+        ? 'Pick from scan results instead'
+        : 'Hidden network? Enter SSID manually';
+      ssidHidden.value = currentSsid();
+      updatePasswordVisibility();
+    });
+
+    scan();   // kick off on page load
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      const ssid = currentSsid();
+      if (!ssid) { setStatus('Pick a network or enter one manually.', 'err'); return; }
       const f = new FormData(form);
       if (f.get('pin') !== document.getElementById('pin_confirm').value) {
         setStatus('PINs don\'t match', 'err'); return;
@@ -105,7 +228,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            ssid: f.get('ssid'),
+            ssid: ssid,
             password: f.get('password') || '',
             owner_pubkey: f.get('owner_pubkey').trim(),
             pin: f.get('pin'),

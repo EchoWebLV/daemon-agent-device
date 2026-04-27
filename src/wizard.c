@@ -36,6 +36,7 @@
 #include "pin.h"
 #include "secrets.h"
 #include "server.h"
+#include "wifi_sta.h"
 
 static const char *TAG = "wizard";
 
@@ -181,6 +182,44 @@ static esp_err_t handle_wizard_get(httpd_req_t *req) {
     return httpd_resp_send(req, wizard_html_start, wizard_html_len);
 }
 
+// Triggers a STA-side scan and returns the deduped, RSSI-sorted result as
+// JSON. Cleanly escapes SSIDs (most are plain ASCII but some legitimately
+// contain spaces, punctuation, or UTF-8). The radio is in APSTA mode while
+// the wizard runs — connected clients may see a brief glitch as the radio
+// hops channels during the scan, but the HTTP request itself rides through.
+static esp_err_t handle_wizard_scan(httpd_req_t *req) {
+    const size_t MAX_APS = 16;
+    wifi_sta_scan_ap_t *aps = calloc(MAX_APS, sizeof *aps);
+    if (!aps) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_FAIL;
+    }
+    size_t n = wifi_sta_scan(aps, MAX_APS);
+
+    cJSON *root  = cJSON_CreateObject();
+    cJSON *arr   = cJSON_AddArrayToObject(root, "networks");
+    if (!root || !arr) { cJSON_Delete(root); free(aps); return ESP_FAIL; }
+    for (size_t i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "ssid", aps[i].ssid);
+        cJSON_AddNumberToObject(o, "rssi", aps[i].rssi);
+        cJSON_AddBoolToObject  (o, "open", aps[i].auth_open != 0);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(aps);
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    free(body);
+    return ESP_OK;
+}
+
 static esp_err_t handle_wizard_post(httpd_req_t *req) {
     if (req->content_len > 1024) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "too large");
@@ -259,6 +298,12 @@ static const httpd_uri_t s_uri_post = {
     .handler  = handle_wizard_post,
     .user_ctx = NULL,
 };
+static const httpd_uri_t s_uri_scan = {
+    .uri      = "/wizard/scan",
+    .method   = HTTP_GET,
+    .handler  = handle_wizard_scan,
+    .user_ctx = NULL,
+};
 
 // ---------------------------------------------------------------------------
 // Wi-Fi AP bring-up
@@ -315,6 +360,7 @@ esp_err_t wizard_start(void) {
 
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &s_uri_get),  TAG, "register GET");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &s_uri_post), TAG, "register POST");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &s_uri_scan), TAG, "register scan");
     ESP_LOGI(TAG, "wizard started; visit http://192.168.4.1/wizard");
     return ESP_OK;
 }
@@ -323,6 +369,7 @@ esp_err_t wizard_stop(void) {
     if (s_httpd) {
         httpd_unregister_uri_handler(s_httpd, "/wizard", HTTP_GET);
         httpd_unregister_uri_handler(s_httpd, "/wizard", HTTP_POST);
+        httpd_unregister_uri_handler(s_httpd, "/wizard/scan", HTTP_GET);
         s_httpd = NULL;   // borrowed handle, don't stop it
     }
     if (s_ap_netif) {
