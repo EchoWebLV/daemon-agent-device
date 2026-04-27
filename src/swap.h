@@ -167,6 +167,47 @@ bool swap_ix_wrap_for_test(const char *from_sym, const char *to_sym,
                            double amount_ui, uint16_t slippage_bps,
                            char *out_json, size_t cap);
 
+// ---------------------------------------------------------------------------
+//  Phase 2a-swap: Address Lookup Table (ALT) contents fetch.
+//
+//  Jupiter's /swap-instructions response lists ALT addresses but not their
+//  contents. To partition each ix's accounts into static-keys vs ALT-indexed
+//  slots when building a v0 message, we have to fetch each ALT account
+//  ourselves via getAccountInfo and decode its address list.
+//
+//  On-wire ALT account layout (Solana SDK):
+//    bytes 0..56     LookupTableMeta header (fixed-width, even with no auth)
+//    bytes 56..end   contiguous packed Pubkey[] (32 B each)
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    uint8_t   table_pubkey[32];   // copy of caller-supplied address
+    uint8_t (*addresses)[32];     // heap-allocated, .count entries
+    size_t    count;              // 0..256
+} jup_alt_table_t;
+
+typedef struct {
+    jup_alt_table_t *tables;      // heap-allocated, .table_count entries
+    size_t           table_count;
+} jup_alt_set_t;
+
+// Fetch every ALT in `table_pubkeys[n]` via getAccountInfo and decode the
+// addresses. Returns true on success; on success the output owns heap
+// arrays that the caller must release with jup_alt_set_free. On any
+// per-table failure the partial state is freed and false is returned.
+bool jup_alt_set_fetch(const uint8_t (*table_pubkeys)[32], size_t n,
+                       jup_alt_set_t *out);
+
+// Idempotent free. Zeroes the struct.
+void jup_alt_set_free(jup_alt_set_t *s);
+
+// Diagnostic — runs the parser AND fetches each referenced ALT, returning
+// a JSON summary with per-ALT entry counts (and the first-address base58
+// for each, so the host can spot-check which tables were hit).
+bool swap_alts_for_test(const char *from_sym, const char *to_sym,
+                        double amount_ui, uint16_t slippage_bps,
+                        char *out_json, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

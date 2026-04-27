@@ -945,6 +945,24 @@ static void dispatch_line(const char *line) {
             }
             return;
         }
+        // ALTS <from> <to> <amount> [slippage_bps]  →  parse a Jupiter
+        // response, fetch each referenced ALT via getAccountInfo, report
+        // per-ALT entry counts and a sample first-address as JSON.
+        if ((args = match_token(rest, "ALTS"))) {
+            char from[12] = {0}, to[12] = {0};
+            double amount = 0;
+            unsigned slip = 0;
+            int parsed = sscanf(args, "%11s %11s %lf %u",
+                                from, to, &amount, &slip);
+            if (parsed < 3) { resp_err("usage SWAP ALTS <from> <to> <amount> [slippage_bps]"); return; }
+            char buf[512];
+            if (swap_alts_for_test(from, to, amount, (uint16_t)slip, buf, sizeof(buf))) {
+                resp_ok(buf);
+            } else {
+                resp_err(buf);
+            }
+            return;
+        }
         resp_err("swap bad_subverb");
         return;
     }

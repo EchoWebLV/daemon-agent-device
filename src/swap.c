@@ -583,6 +583,125 @@ int jup_ix_wrap_vault_execute(const jup_ix_t      *src,
     return ix_len;
 }
 
+// ---------------------------------------------------------------------------
+//  ALT contents fetch — getAccountInfo per table, decode to address[].
+// ---------------------------------------------------------------------------
+
+// Solana SDK constant. Header is fixed-width regardless of authority Some/None.
+#define SOLANA_LOOKUP_TABLE_META_SIZE 56
+
+// One ALT account is at most 56 + 256*32 = 8248 raw bytes; base64 ~11 KB;
+// plus the JSON-RPC envelope it can run another ~500 B. 16 KB covers it
+// comfortably and fits a single PSRAM block.
+#define ALT_RPC_RSP_CAP (16 * 1024)
+
+// Fetch a single ALT account and decode its addresses into `out`. Returns
+// true on success; on success the caller owns `out->addresses` (free()).
+static bool alt_fetch_one(const uint8_t table_pubkey[32], jup_alt_table_t *out)
+{
+    memset(out, 0, sizeof *out);
+    memcpy(out->table_pubkey, table_pubkey, 32);
+
+    char addr_b58[BASE58_ENCODE_MAX_LEN(32)];
+    if (base58_encode(table_pubkey, 32, addr_b58, sizeof addr_b58) <= 0) {
+        return false;
+    }
+
+    char req[256];
+    int  rn = snprintf(req, sizeof req,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\","
+        "\"params\":[\"%s\","
+        "{\"encoding\":\"base64\",\"commitment\":\"processed\"}]}",
+        addr_b58);
+    if (rn <= 0 || (size_t)rn >= sizeof req) return false;
+
+    char *rsp = heap_caps_malloc(ALT_RPC_RSP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rsp) return false;
+    char url[160];
+    wallet_rpc_url(url, sizeof url);
+    bool http_ok = https_post_json(url, req, rsp, ALT_RPC_RSP_CAP);
+    if (!http_ok) { free(rsp); ESP_LOGW(TAG, "alt: http fail %s", addr_b58); return false; }
+
+    cJSON *root = cJSON_Parse(rsp);
+    free(rsp);
+    if (!root) { ESP_LOGW(TAG, "alt: parse fail %s", addr_b58); return false; }
+
+    bool ok = false;
+    do {
+        const cJSON *result = cJSON_GetObjectItem(root, "result");
+        const cJSON *value  = result ? cJSON_GetObjectItem(result, "value") : NULL;
+        if (!cJSON_IsObject(value)) {
+            ESP_LOGW(TAG, "alt: missing value (account?) %s", addr_b58);
+            break;
+        }
+        const cJSON *data = cJSON_GetObjectItem(value, "data");
+        // RPC returns ["<b64>", "base64"] — a 2-element array.
+        if (!cJSON_IsArray(data) || cJSON_GetArraySize(data) < 1) break;
+        const cJSON *b64 = cJSON_GetArrayItem(data, 0);
+        if (!cJSON_IsString(b64) || !b64->valuestring) break;
+
+        size_t b64_len = strlen(b64->valuestring);
+        size_t raw_cap = b64_len * 3 / 4 + 4;
+        uint8_t *raw = malloc(raw_cap);
+        if (!raw) break;
+        size_t raw_len = 0;
+        int rc = mbedtls_base64_decode(raw, raw_cap, &raw_len,
+                                       (const uint8_t *)b64->valuestring, b64_len);
+        if (rc != 0) { ESP_LOGW(TAG, "alt: b64 rc=-0x%04x", -rc); free(raw); break; }
+        if (raw_len < SOLANA_LOOKUP_TABLE_META_SIZE) { free(raw); break; }
+
+        size_t body = raw_len - SOLANA_LOOKUP_TABLE_META_SIZE;
+        if (body % 32 != 0) { ESP_LOGW(TAG, "alt: body %u not /32", (unsigned)body); free(raw); break; }
+        size_t n = body / 32;
+        if (n > 256) { free(raw); break; }   // sanity: ALT max is 256
+
+        if (n > 0) {
+            out->addresses = malloc(n * 32);
+            if (!out->addresses) { free(raw); break; }
+            memcpy(out->addresses, raw + SOLANA_LOOKUP_TABLE_META_SIZE, n * 32);
+        }
+        out->count = n;
+        free(raw);
+        ok = true;
+    } while (0);
+
+    cJSON_Delete(root);
+    return ok;
+}
+
+bool jup_alt_set_fetch(const uint8_t (*table_pubkeys)[32], size_t n,
+                       jup_alt_set_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (n == 0 || !table_pubkeys) return true;   // empty set is valid
+
+    out->tables = calloc(n, sizeof *out->tables);
+    if (!out->tables) return false;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!alt_fetch_one(table_pubkeys[i], &out->tables[i])) {
+            jup_alt_set_free(out);
+            return false;
+        }
+        out->table_count = i + 1;   // for partial cleanup on later fail
+    }
+    return true;
+}
+
+void jup_alt_set_free(jup_alt_set_t *s)
+{
+    if (!s) return;
+    if (s->tables) {
+        for (size_t i = 0; i < s->table_count; i++) {
+            free(s->tables[i].addresses);
+        }
+        free(s->tables);
+    }
+    s->tables = NULL;
+    s->table_count = 0;
+}
+
 static double swap_pow10(uint8_t n) {
     double v = 1.0;
     for (uint8_t i = 0; i < n; ++i) v *= 10.0;
@@ -1161,4 +1280,80 @@ bool swap_ix_wrap_for_test(const char *from_sym, const char *to_sym,
         return false;
     }
     return true;
+}
+
+bool swap_alts_for_test(const char *from_sym, const char *to_sym,
+                        double amount_ui, uint16_t slippage_bps,
+                        char *out_json, size_t cap)
+{
+    if (!out_json || cap == 0) return false;
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        snprintf(out_json, cap, "{\"error\":\"unknown_symbol\"}"); return false;
+    }
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        snprintf(out_json, cap, "{\"error\":\"quote_failed\"}"); return false;
+    }
+    const char *user = wallet_vault_pda();
+    if (!user || !*user) user = wallet_pubkey();
+    if (!user || !*user) {
+        free(q.quote_json);
+        snprintf(out_json, cap, "{\"error\":\"no_user_pubkey\"}"); return false;
+    }
+    jup_swap_instructions_t ix = {0};
+    bool parsed = jup_swap_instructions_build(q.quote_json, user, &ix);
+    free(q.quote_json);
+    if (!parsed) {
+        snprintf(out_json, cap, "{\"error\":\"ix_build_failed\"}"); return false;
+    }
+
+    if (ix.alt_count == 0) {
+        jup_swap_instructions_free(&ix);
+        snprintf(out_json, cap, "{\"alts\":[]}");
+        return true;
+    }
+
+    jup_alt_set_t set = {0};
+    bool fetched = jup_alt_set_fetch(ix.alt_addresses, ix.alt_count, &set);
+    jup_swap_instructions_free(&ix);
+    if (!fetched) {
+        snprintf(out_json, cap, "{\"error\":\"alt_fetch_failed\"}");
+        return false;
+    }
+
+    char  *p    = out_json;
+    size_t left = cap;
+    int    n    = snprintf(p, left, "{\"alts\":[");
+    if (n < 0 || (size_t)n >= left) goto overflow;
+    p += n; left -= n;
+
+    for (size_t i = 0; i < set.table_count; i++) {
+        char tbl_b58[BASE58_ENCODE_MAX_LEN(32)];
+        char first_b58[BASE58_ENCODE_MAX_LEN(32)];
+        tbl_b58[0]   = 0;
+        first_b58[0] = 0;
+        base58_encode(set.tables[i].table_pubkey, 32, tbl_b58, sizeof tbl_b58);
+        if (set.tables[i].count > 0) {
+            base58_encode(set.tables[i].addresses[0], 32, first_b58, sizeof first_b58);
+        }
+        n = snprintf(p, left,
+            "%s{\"t\":\"%.20s\",\"n\":%u,\"first\":\"%.20s\"}",
+            i > 0 ? "," : "",
+            tbl_b58, (unsigned)set.tables[i].count, first_b58);
+        if (n < 0 || (size_t)n >= left) goto overflow;
+        p += n; left -= n;
+    }
+
+    n = snprintf(p, left, "]}");
+    if (n < 0 || (size_t)n >= left) goto overflow;
+
+    jup_alt_set_free(&set);
+    return true;
+
+overflow:
+    jup_alt_set_free(&set);
+    snprintf(out_json, cap, "{\"error\":\"out_overflow\"}");
+    return false;
 }
