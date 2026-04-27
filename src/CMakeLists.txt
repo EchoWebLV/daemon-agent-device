@@ -69,9 +69,7 @@ idf_component_register(
         esp_lvgl_port
         # LCD panel drivers — ILI9342 (BOX-3B) over esp_lcd, plus the
         # generic touch abstraction and the TT21100 vendor driver.
-        # CST328 stays one more task while touch.c still uses it.
         esp_lcd_ili9341
         esp_lcd_touch
         esp_lcd_touch_tt21100
-        esp_lcd_touch_cst328
 )

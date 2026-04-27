@@ -14,6 +14,3 @@ dependencies:
   # ILI9342C driver (covers ILI9341 + ILI9342). Replaces the built-in
   # ST7789 wiring used by the Waveshare panel.
   espressif/esp_lcd_ili9341:       "^2.0.0"
-  # CST328 dep stays one more task — touch.c still includes its header.
-  # Removed in Task 5 once touch.c is on TT21100.
-  waveshare/esp_lcd_touch_cst328:  "^1.0.4"
