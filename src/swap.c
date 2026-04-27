@@ -932,3 +932,44 @@ bool swap_dry_run_for_test(const char *from_sym, const char *to_sym,
     free(q.quote_json);
     return true;
 }
+
+bool swap_ix_summary_for_test(const char *from_sym, const char *to_sym,
+                              double amount_ui, uint16_t slippage_bps,
+                              char *out_json, size_t cap) {
+    if (!out_json || cap == 0) return false;
+    swap_token_t a, b;
+    if (!resolve_token(from_sym, &a) || !resolve_token(to_sym, &b)) {
+        snprintf(out_json, cap, "{\"error\":\"unknown_symbol\"}"); return false;
+    }
+    uint16_t slip = clamp_slippage(slippage_bps, default_slippage(&a, &b));
+    jup_quote_t q;
+    if (!jup_get_quote(&a, &b, amount_ui, slip, &q)) {
+        snprintf(out_json, cap, "{\"error\":\"quote_failed\"}"); return false;
+    }
+    const char *user = wallet_vault_pda();
+    if (!user || !*user) user = wallet_pubkey();
+    if (!user || !*user) {
+        free(q.quote_json);
+        snprintf(out_json, cap, "{\"error\":\"no_user_pubkey\"}"); return false;
+    }
+    jup_swap_instructions_t ix = {0};
+    bool ok = jup_swap_instructions_build(q.quote_json, user, &ix);
+    free(q.quote_json);
+    if (!ok) {
+        snprintf(out_json, cap, "{\"error\":\"ix_build_failed\"}"); return false;
+    }
+    size_t swap_metas    = ix.has_swap    ? ix.swap.account_count    : 0;
+    size_t cleanup_metas = ix.has_cleanup ? ix.cleanup.account_count : 0;
+    int n = snprintf(out_json, cap,
+        "{\"setup\":%u,\"swap_metas\":%u,\"swap_data\":%u,"
+        "\"cleanup\":%u,\"cleanup_metas\":%u,\"alts\":%u,\"priority\":%llu}",
+        (unsigned)ix.setup_count,
+        (unsigned)swap_metas,
+        (unsigned)(ix.has_swap ? ix.swap.data_len : 0),
+        (unsigned)(ix.has_cleanup ? 1 : 0),
+        (unsigned)cleanup_metas,
+        (unsigned)ix.alt_count,
+        (unsigned long long)ix.priority_lamports);
+    jup_swap_instructions_free(&ix);
+    return n > 0 && (size_t)n < cap;
+}

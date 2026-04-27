@@ -120,6 +120,14 @@ bool jup_swap_instructions_build(const char *quote_json,
 // Free heap-allocated arrays inside the struct. Idempotent.
 void jup_swap_instructions_free(jup_swap_instructions_t *out);
 
+// Diagnostic — exercises jup_swap_instructions_build against live Jupiter,
+// using the vault PDA as user_pubkey. Returns a JSON summary of the parsed
+// shape (per-bucket counts, ALT count, priority lamports). Used by the
+// host harness only.
+bool swap_ix_summary_for_test(const char *from_sym, const char *to_sym,
+                              double amount_ui, uint16_t slippage_bps,
+                              char *out_json, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

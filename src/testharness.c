@@ -909,6 +909,24 @@ static void dispatch_line(const char *line) {
             }
             return;
         }
+        // IX <from> <to> <amount> [slippage_bps]  →  exercise the parser
+        // against a live Jupiter /swap-instructions response and report
+        // the parsed shape as JSON. No tx is built or signed.
+        if ((args = match_token(rest, "IX"))) {
+            char from[12] = {0}, to[12] = {0};
+            double amount = 0;
+            unsigned slip = 0;
+            int parsed = sscanf(args, "%11s %11s %lf %u",
+                                from, to, &amount, &slip);
+            if (parsed < 3) { resp_err("usage SWAP IX <from> <to> <amount> [slippage_bps]"); return; }
+            char buf[256];
+            if (swap_ix_summary_for_test(from, to, amount, (uint16_t)slip, buf, sizeof(buf))) {
+                resp_ok(buf);
+            } else {
+                resp_err(buf);
+            }
+            return;
+        }
         resp_err("swap bad_subverb");
         return;
     }
