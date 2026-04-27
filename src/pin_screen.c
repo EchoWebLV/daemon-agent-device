@@ -269,14 +269,25 @@ void pin_screen_open(int min_len, int max_len,
     lvgl_port_unlock();
 }
 
-void pin_screen_close(void) {
-    if (!s_ctx.open) return;
-    if (!lvgl_port_lock(0)) {
-        ESP_LOGE(TAG, "pin_screen_close: lock failed");
-        return;
-    }
+// Actual teardown — runs on the LVGL task. Either invoked synchronously
+// (when caller already holds the lock) or via lv_async_call (when called
+// from outside the LVGL task or to defer past the current event handler).
+static void close_now(void *user) {
+    (void)user;
     if (s_ctx.prev_scr) lv_scr_load(s_ctx.prev_scr);
     if (s_ctx.scr)      lv_obj_del(s_ctx.scr);
-    lvgl_port_unlock();
     memset(&s_ctx, 0, sizeof s_ctx);
+}
+
+void pin_screen_close(void) {
+    if (!s_ctx.open) return;
+    // Mark closing so a second call (e.g. from a re-entrant button event)
+    // doesn't queue the async twice.
+    s_ctx.open = false;
+    // Defer the actual lv_obj_del + lv_scr_load to the next LVGL tick.
+    // We're commonly called from inside an event handler — ripping out
+    // the screen mid-event leaves the indev with stale state and breaks
+    // gesture detection on the screen we restore. lv_async_call runs
+    // close_now after the current event finishes processing.
+    lv_async_call(close_now, NULL);
 }
