@@ -39,14 +39,17 @@ typedef struct {
     int              len;             // currently entered length
     char             buf[PIN_BUF_MAX];
     bool             open;
-    int64_t          last_fire_us;    // last button-event time (CST328 debounce)
+    bool             touch_active;    // true between PRESSED and RELEASED
+    int64_t          unlock_at_us;    // earliest timestamp the next press may fire
 } pin_ctx_t;
 
-// CST328 reports release jitter as a burst of CLICKED events on the
-// same widget. swap_screen.c already eats these via a poll-based hold
-// detector; we use a simpler 120 ms global cooldown — any second event
-// within the window after a successful keypress is dropped.
-#define PIN_BTN_DEBOUNCE_US 120000
+// CST328 reports release jitter as multiple PRESSED/RELEASED cycles per
+// continuous physical touch. A debounce window alone isn't enough — long
+// holds let multiple presses through after the cooldown. Instead we lock
+// on the first PRESSED of a touch and don't unlock until we see a real
+// RELEASED followed by SETTLE_US of quiet. Subsequent jitter events
+// during the same hold are ignored, regardless of how long the hold is.
+#define PIN_BTN_SETTLE_US 200000        // 200 ms of no events = touch ended
 
 static pin_ctx_t s_ctx = {0};
 
@@ -75,66 +78,74 @@ void pin_screen_set_status(const char *text) {
 // ---------------------------------------------------------------------------
 // Button event handlers
 // ---------------------------------------------------------------------------
-// Returns true if enough time has passed since the last button event,
-// false if we should drop this event as touch-jitter from the previous tap.
-static bool debounce_ok(void) {
+// True iff this PRESSED event is the first one of a fresh physical touch.
+// Sets touch_active so subsequent jitter PRESSED events during the same
+// hold are dropped. RELEASED arms a settle timer (unlock_at_us); until
+// SETTLE_US has passed since the last release, no new press counts.
+static bool press_acquire(void) {
     int64_t now = esp_timer_get_time();
-    if (s_ctx.last_fire_us != 0 &&
-        now - s_ctx.last_fire_us < PIN_BTN_DEBOUNCE_US) {
-        return false;
-    }
-    s_ctx.last_fire_us = now;
+    if (s_ctx.touch_active)               return false;   // jitter mid-hold
+    if (now < s_ctx.unlock_at_us)         return false;   // still in settle window
+    s_ctx.touch_active = true;
     return true;
 }
 
-static void on_digit(lv_event_t *e) {
-    if (!debounce_ok()) return;
-    int d = (int)(intptr_t)lv_event_get_user_data(e);
-    if (s_ctx.len >= s_ctx.max_len) return;
-    s_ctx.buf[s_ctx.len++] = (char)('0' + d);
-    s_ctx.buf[s_ctx.len]   = '\0';
-    redraw_dots();
+static void release_arm_settle(void) {
+    s_ctx.touch_active = false;
+    s_ctx.unlock_at_us = esp_timer_get_time() + PIN_BTN_SETTLE_US;
 }
 
-static void on_backspace(lv_event_t *e) {
-    (void)e;
-    if (!debounce_ok()) return;
-    if (s_ctx.len <= 0) return;
-    s_ctx.len--;
-    s_ctx.buf[s_ctx.len] = '\0';
-    redraw_dots();
-}
-
-static void on_ok(lv_event_t *e) {
-    (void)e;
-    if (!debounce_ok()) return;
-    if (s_ctx.len < s_ctx.min_len) {
-        pin_screen_set_status("PIN too short");
+static void on_btn_event(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        release_arm_settle();
         return;
     }
-    pin_screen_cb_t cb = s_ctx.cb;
-    void           *user = s_ctx.user;
-    char            pin[PIN_BUF_MAX];
-    strlcpy(pin, s_ctx.buf, sizeof pin);
-    if (cb) cb(PIN_SCR_OK, pin, user);
-    // Caller decides whether to close or call clear_input + set_status
-    // and let the user try again.
-}
+    if (code != LV_EVENT_PRESSED) return;
+    if (!press_acquire()) return;
 
-static void on_cancel(lv_event_t *e) {
-    (void)e;
-    if (!debounce_ok()) return;
-    pin_screen_cb_t cb = s_ctx.cb;
-    void           *user = s_ctx.user;
-    if (cb) cb(PIN_SCR_CANCEL, NULL, user);
+    // Dispatch by user_data tag set up in build_ui:
+    //   0..9 → digit, 10 → backspace, 11 → OK, 12 → cancel
+    int tag = (int)(intptr_t)lv_event_get_user_data(e);
+    if (tag >= 0 && tag <= 9) {
+        if (s_ctx.len < s_ctx.max_len) {
+            s_ctx.buf[s_ctx.len++] = (char)('0' + tag);
+            s_ctx.buf[s_ctx.len]   = '\0';
+            redraw_dots();
+        }
+    } else if (tag == 10) {
+        if (s_ctx.len > 0) {
+            s_ctx.len--;
+            s_ctx.buf[s_ctx.len] = '\0';
+            redraw_dots();
+        }
+    } else if (tag == 11) {
+        if (s_ctx.len < s_ctx.min_len) {
+            pin_screen_set_status("PIN too short");
+            return;
+        }
+        pin_screen_cb_t cb = s_ctx.cb;
+        void           *user = s_ctx.user;
+        char            pin[PIN_BUF_MAX];
+        strlcpy(pin, s_ctx.buf, sizeof pin);
+        if (cb) cb(PIN_SCR_OK, pin, user);
+    } else if (tag == 12) {
+        pin_screen_cb_t cb = s_ctx.cb;
+        void           *user = s_ctx.user;
+        if (cb) cb(PIN_SCR_CANCEL, NULL, user);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Build / teardown
 // ---------------------------------------------------------------------------
+// Tag values map to the unified on_btn_event dispatcher:
+//   0..9 = digit 0..9
+//   10   = backspace
+//   11   = OK
+//   12   = cancel (×)
 static lv_obj_t *make_button(lv_obj_t *parent, const char *label,
-                             int x, int y, int w, int h,
-                             lv_event_cb_t cb, void *user)
+                             int x, int y, int w, int h, int tag)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, w, h);
@@ -151,7 +162,11 @@ static lv_obj_t *make_button(lv_obj_t *parent, const char *label,
     lv_obj_set_style_text_color(lbl, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
     lv_obj_center(lbl);
 
-    if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user);
+    // Hook BOTH PRESSED and RELEASED on a single dispatcher. on_btn_event
+    // arbitrates which events actually act based on the touch lock state.
+    lv_obj_add_event_cb(btn, on_btn_event, LV_EVENT_PRESSED,    (void *)(intptr_t)tag);
+    lv_obj_add_event_cb(btn, on_btn_event, LV_EVENT_RELEASED,   (void *)(intptr_t)tag);
+    lv_obj_add_event_cb(btn, on_btn_event, LV_EVENT_PRESS_LOST, (void *)(intptr_t)tag);
     return btn;
 }
 
@@ -166,9 +181,9 @@ static void build_ui(void) {
     lv_obj_set_style_text_color(title, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
-    // Cancel button (top-right)
+    // Cancel button (top-right) — tag 12
     lv_obj_t *cancel = make_button(s_ctx.scr, LV_SYMBOL_CLOSE,
-                                   SCR_W - 50, 6, 44, 32, on_cancel, NULL);
+                                   SCR_W - 50, 6, 44, 32, 12);
     lv_obj_set_style_border_color(cancel, SCR_COLOR_DIM, LV_PART_MAIN);
 
     // Dots row — center the (max_len) dots, 18 px each, 6 px gap
@@ -201,20 +216,16 @@ static void build_ui(void) {
         int col = i % 3;
         int x = grid_x + col * (btn_w + hg);
         int y = grid_y + row * (btn_h + vg);
-        make_button(s_ctx.scr, DIGITS[i], x, y, btn_w, btn_h,
-                    on_digit, (void *)(intptr_t)(i + 1));
+        make_button(s_ctx.scr, DIGITS[i], x, y, btn_w, btn_h, /*tag=*/i + 1);
     }
-    // Row 4: backspace, 0, OK
+    // Row 4: backspace (tag 10), 0 (tag 0), OK (tag 11)
     int row4_y = grid_y + 3 * (btn_h + vg);
     make_button(s_ctx.scr, LV_SYMBOL_BACKSPACE,
-                grid_x + 0 * (btn_w + hg), row4_y, btn_w, btn_h,
-                on_backspace, NULL);
+                grid_x + 0 * (btn_w + hg), row4_y, btn_w, btn_h, 10);
     make_button(s_ctx.scr, "0",
-                grid_x + 1 * (btn_w + hg), row4_y, btn_w, btn_h,
-                on_digit, (void *)(intptr_t)0);
+                grid_x + 1 * (btn_w + hg), row4_y, btn_w, btn_h, 0);
     lv_obj_t *ok_btn = make_button(s_ctx.scr, LV_SYMBOL_OK,
-                                   grid_x + 2 * (btn_w + hg), row4_y, btn_w, btn_h,
-                                   on_ok, NULL);
+                                   grid_x + 2 * (btn_w + hg), row4_y, btn_w, btn_h, 11);
     lv_obj_set_style_border_color(ok_btn, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
 
     // Status line
