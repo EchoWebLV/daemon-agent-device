@@ -467,6 +467,10 @@ void creature_screen_on_press_end_(struct _lv_event_t *e) {
         ui_set_subtitle("");
         return;
     }
+    // Backchannel: a short tone confirms "I heard you" while STT + LLM
+    // grind in the background. Cuts ~700 ms of perceived dead-air silence
+    // before any audio comes back. No-op if voice subsystem is muted/down.
+    voice_chirp();
     ui_set_subtitle("Thinking...");
     s_speech_frames = frames;
     s_speech_in_flight = true;

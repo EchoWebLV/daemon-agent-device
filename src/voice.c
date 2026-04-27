@@ -61,6 +61,7 @@ static TaskHandle_t            s_audio_task = NULL;
 static SemaphoreHandle_t       s_request_sem = NULL;
 
 static char     s_pending_text[VOICE_TEXT_MAX] = "";
+static volatile bool s_pending_chirp   = false;
 static volatile bool s_playing         = false;
 static volatile bool s_stop_requested  = false;
 static volatile uint8_t s_volume_0_21  = 0;
@@ -277,6 +278,17 @@ static void audio_task(void *arg) {
     for (;;) {
         xSemaphoreTake(s_request_sem, portMAX_DELAY);
 
+        // Chirp first if requested. ~80 ms soft tone — fits between two
+        // semaphore wakeups and never blocks a real TTS request because
+        // voice_chirp() declines to enqueue while s_playing is true.
+        if (s_pending_chirp) {
+            s_pending_chirp = false;
+            if (codec_open_for_speak() == ESP_OK) {
+                beep_tone(520, 80, 5000);
+                esp_codec_dev_close(s_codec);
+            }
+        }
+
         char local[VOICE_TEXT_MAX];
         strncpy(local, s_pending_text, sizeof(local) - 1);
         local[sizeof(local) - 1] = 0;
@@ -343,6 +355,15 @@ bool voice_speak(const char *text) {
     s_pending_text[sizeof(s_pending_text) - 1] = 0;
     xSemaphoreGive(s_request_sem);
     return true;
+}
+
+void voice_chirp(void) {
+    // Skip if voice isn't up yet, or if TTS is in flight (chirp would queue
+    // behind it and play minutes too late). The whole point is immediate
+    // feedback when the user releases the talk button.
+    if (!s_codec || !s_request_sem || s_playing) return;
+    s_pending_chirp = true;
+    xSemaphoreGive(s_request_sem);
 }
 
 bool voice_is_speaking(void) {

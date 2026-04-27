@@ -48,6 +48,12 @@ void voice_stop(void);
 // before they go to I2S. 0 = mute, 21 = unity gain.
 void voice_set_volume(uint8_t v);
 
+// Play a tiny acknowledgement tone (~80 ms). Used as immediate audible
+// feedback when the user releases the push-to-talk button so the wait
+// for STT + LLM doesn't feel like a dead device. Non-blocking; queues
+// onto the audio task. No-op if voice isn't up or TTS is already playing.
+void voice_chirp(void);
+
 #ifdef __cplusplus
 }
 #endif

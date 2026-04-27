@@ -475,7 +475,6 @@ void x402_call(const char *method,
         return;
     }
 
-    // ---- Phase 1: initial POST (capturing potential 402 headers) --------
     // PSRAM: 3 × 6 KB header scratch is a big chunk of internal heap during
     // a live TLS session. The header scratch is only touched by the event
     // handler + the post-request decoder — no DMA, safe in PSRAM.
@@ -493,7 +492,17 @@ void x402_call(const char *method,
         .pr = pr, .xpr = xpr, .wa = wa,
     };
 
-    esp_http_client_config_t cfg1 = {
+    // One handle for both the 402 challenge AND the paid retry. ESP-IDF's
+    // esp_http_client keeps the TLS session open between performs by
+    // default (HTTP/1.1 keep-alive), so the second perform skips the
+    // handshake — saves ~800-1500 ms per chat turn vs the original
+    // init/cleanup-per-phase pattern.
+    //
+    // Buffer sizing: 8 KB rx fits the worst-case 4-5 KB payment-required
+    // header from the facilitator alongside content-type / auth /
+    // standard headers. 16 KB tx is sized for the paid retry: our
+    // base64(payment envelope) PAYMENT-SIGNATURE header can hit ~12 KB.
+    esp_http_client_config_t cfg = {
         .url               = url,
         .method            = http_method,
         .transport_type    = HTTP_TRANSPORT_OVER_SSL,
@@ -501,37 +510,34 @@ void x402_call(const char *method,
         .event_handler     = on_x402_event,
         .user_data         = &state,
         .timeout_ms        = 60000,
-        // The 402 response carries a base64(JSON) payment-required header
-        // that can reach 4–5 KB on sol.blockrun.ai; esp_http_client's
-        // default 512-byte header buffer truncates it and the facilitator
-        // ends up rejecting the retry with another 402. 8 KB leaves
-        // headroom for content-type + auth + other standard response
-        // headers alongside it.
         .buffer_size       = 8192,
+        .buffer_size_tx    = 16384,
+        .keep_alive_enable = true,
     };
-    esp_http_client_handle_t h1 = esp_http_client_init(&cfg1);
-    if (!h1) {
+    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+    if (!h) {
         strlcpy(out->error, "client init", sizeof(out->error));
         goto done;
     }
-    if (has_body) esp_http_client_set_header(h1, "Content-Type", "application/json");
+    if (has_body) esp_http_client_set_header(h, "Content-Type", "application/json");
     if (auth_bearer && auth_bearer[0]) {
-        char h[160];
-        snprintf(h, sizeof(h), "Bearer %s", auth_bearer);
-        esp_http_client_set_header(h1, "Authorization", h);
+        char hdr[160];
+        snprintf(hdr, sizeof(hdr), "Bearer %s", auth_bearer);
+        esp_http_client_set_header(h, "Authorization", hdr);
     }
-    if (has_body) esp_http_client_set_post_field(h1, json_body, (int)strlen(json_body));
+    if (has_body) esp_http_client_set_post_field(h, json_body, (int)strlen(json_body));
 
-    esp_err_t err1 = esp_http_client_perform(h1);
-    int       code1 = esp_http_client_get_status_code(h1);
-    esp_http_client_cleanup(h1);
+    // ---- Phase 1: initial request (capturing potential 402 headers) -----
+    esp_err_t err1  = esp_http_client_perform(h);
+    int       code1 = esp_http_client_get_status_code(h);
 
     if (err1 != ESP_OK) {
         snprintf(out->error, sizeof(out->error), "perform: %s", esp_err_to_name(err1));
+        esp_http_client_cleanup(h);
         goto done;
     }
 
-    // ---- Phase 2: if 402, build payment and retry ------------------------
+    // ---- Phase 2: if 402, build payment and retry on the same handle ----
     if (code1 == 402) {
         char *desc = (char *)heap_caps_malloc(X402_DESC_CAP, MALLOC_CAP_SPIRAM);
         char *b64  = (char *)heap_caps_malloc(X402_B64_CAP,  MALLOC_CAP_SPIRAM);
@@ -539,6 +545,7 @@ void x402_call(const char *method,
             free(desc); free(b64);
             strlcpy(out->error, "oom", sizeof(out->error));
             out->status = 402;
+            esp_http_client_cleanup(h);
             goto done;
         }
         bool have_desc = decode_payment_description(&state, desc, X402_DESC_CAP);
@@ -547,6 +554,7 @@ void x402_call(const char *method,
             strlcpy(out->error, "402 no description", sizeof(out->error));
             out->status = 402;
             free(desc); free(b64);
+            esp_http_client_cleanup(h);
             goto done;
         }
 
@@ -557,6 +565,7 @@ void x402_call(const char *method,
             strlcpy(out->error, "payment build failed", sizeof(out->error));
             out->status = 402;
             free(b64);
+            esp_http_client_cleanup(h);
             goto done;
         }
 
@@ -566,41 +575,13 @@ void x402_call(const char *method,
         // Don't need the header slots anymore; avoid re-populating them.
         state.pr = state.xpr = state.wa = NULL;
 
-        esp_http_client_config_t cfg2 = {
-            .url               = url,
-            .method            = http_method,
-            .transport_type    = HTTP_TRANSPORT_OVER_SSL,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .event_handler     = on_x402_event,
-            .user_data         = &state,
-            .timeout_ms        = 60000,
-            // Phase-2 retry carries our base64(payment envelope) in the
-            // PAYMENT-SIGNATURE request header — that envelope can hit
-            // ~12 KB. The default 512-byte TX buffer truncates it on the
-            // wire and the facilitator sees a garbled signature, then
-            // replies 402 again. Size TX for the worst case, keep RX at
-            // 8 KB so the 200-OK response headers still fit comfortably.
-            .buffer_size       = 8192,
-            .buffer_size_tx    = 16384,
-        };
-        esp_http_client_handle_t h2 = esp_http_client_init(&cfg2);
-        if (!h2) {
-            strlcpy(out->error, "retry init", sizeof(out->error));
-            free(b64);
-            goto done;
-        }
-        if (has_body) esp_http_client_set_header(h2, "Content-Type", "application/json");
-        esp_http_client_set_header(h2, "PAYMENT-SIGNATURE", b64);
-        if (auth_bearer && auth_bearer[0]) {
-            char h[160];
-            snprintf(h, sizeof(h), "Bearer %s", auth_bearer);
-            esp_http_client_set_header(h2, "Authorization", h);
-        }
-        if (has_body) esp_http_client_set_post_field(h2, json_body, (int)strlen(json_body));
+        // Add the payment header. esp_http_client_set_header overwrites by
+        // key, so Content-Type / Authorization / post_field carry over from
+        // phase 1 unchanged.
+        esp_http_client_set_header(h, "PAYMENT-SIGNATURE", b64);
 
-        esp_err_t err2  = esp_http_client_perform(h2);
-        int       code2 = esp_http_client_get_status_code(h2);
-        esp_http_client_cleanup(h2);
+        esp_err_t err2  = esp_http_client_perform(h);
+        int       code2 = esp_http_client_get_status_code(h);
         free(b64);
 
         out->status   = code2;
@@ -614,6 +595,7 @@ void x402_call(const char *method,
         } else {
             snprintf(out->error, sizeof(out->error), "retry status %d", code2);
         }
+        esp_http_client_cleanup(h);
         goto done;
     }
 
@@ -623,6 +605,7 @@ void x402_call(const char *method,
     if (code1 != 200) {
         snprintf(out->error, sizeof(out->error), "status %d", code1);
     }
+    esp_http_client_cleanup(h);
 
 done:
     free(pr); free(xpr); free(wa);
