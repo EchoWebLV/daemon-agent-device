@@ -40,6 +40,7 @@ typedef struct {
 static const llm_endpoint_t LLM_ENDPOINTS[] = {
     { "openai/",    "https://daemon-x402s-seven.vercel.app/api/openai" },
     { "anthropic/", "https://daemon-x402s-seven.vercel.app/api/anthropic" },
+    { "shannon/",   "https://daemon-x402s-seven.vercel.app/api/call" },
     { NULL,         "https://daemon-x402s-seven.vercel.app/api/anthropic" },
 };
 
@@ -60,6 +61,12 @@ static const char *wire_model(const char *model) {
     if (!model) return "";
     const char *slash = strchr(model, '/');
     return slash ? slash + 1 : model;
+}
+
+// Shannon's /api/call wrapper takes a flat `{ "message": "..." }` body —
+// no model/messages/tools array. Different chat-body shape.
+static bool is_shannon(const char *model) {
+    return model && strncmp(model, "shannon/", 8) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +614,38 @@ static int build_chat_body(char *out, size_t cap,
         model = "anthropic/claude-haiku-4-5";
     }
 
+    // Shannon's /api/call wrapper wants a flat single-string body — no
+    // model/messages/tools. Flatten persona + history + current turn into
+    // one prompt string and post that. Tool calling is unsupported on
+    // this path; the model can describe but not invoke.
+    if (is_shannon(model)) {
+        char *flat = malloc(CHAT_BODY_CAP);
+        if (!flat) { cJSON_Delete(root); return -1; }
+        size_t off = 0;
+        char *sysprompt = malloc(SYS_PROMPT_CAP);
+        if (sysprompt) {
+            build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
+            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s\n\n", sysprompt);
+            free(sysprompt);
+        }
+        if (use_history && s_hist_len > 0) {
+            for (int i = 0; i < s_hist_len && off < CHAT_BODY_CAP; ++i) {
+                off += snprintf(flat + off, CHAT_BODY_CAP - off,
+                                "%s: %s\n",
+                                s_history[i].role, s_history[i].text);
+            }
+        } else if (one_shot_prompt && one_shot_prompt[0]) {
+            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s", one_shot_prompt);
+        }
+        cJSON_AddStringToObject(root, "message", flat);
+        cJSON_AddNumberToObject(root, "max_tokens", max_tokens);
+        free(flat);
+        bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
+        cJSON_Delete(root);
+        if (!ok) { ESP_LOGW(TAG, "shannon body overflow (cap=%u)", (unsigned)cap); return -1; }
+        return (int)strlen(out);
+    }
+
     cJSON_AddStringToObject(root, "model", wire_model(model));
     cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
     cJSON_AddNumberToObject(root, "temperature", temperature);
@@ -907,15 +946,35 @@ void ai_handle_say(const char *user, char *reply_out, size_t reply_cap) {
 // ---------------------------------------------------------------------------
 // Streaming chat path. Voice-only — used by the long-press push-to-talk
 // flow so audio starts playing well before the LLM has finished generating.
-// Tools are intentionally not supported here; the streaming wire format
-// would need extra deltacode and the swap-tool round-trips don't fit a
-// "speak as you go" interaction anyway. If services are enabled, callers
-// should fall back to ai_ask().
+//
+// Tool calling: supported on `openai/*` models. The OpenAI chat-completion-
+// chunk SSE delivers tool_calls as a series of deltas with index + partial
+// id/name/arguments fields; we accumulate them into stream_ctx.tool_calls
+// across the stream, then on stream end (finish_reason="tool_calls") we
+// execute each one, append the assistant message + tool replies to the
+// next-round messages, and start a new stream. Mirrors ai_ask's tool loop
+// but with sentence-by-sentence TTS dispatch on the final-text round.
+//
+// `anthropic/*` models do NOT support tools on this path because the
+// /api/anthropic/stream Vercel route translates OpenAI message format
+// to Anthropic Messages API but doesn't carry tool calls through. Picking
+// an Anthropic model means tool-using questions get a hallucinated answer.
 // ---------------------------------------------------------------------------
 
-#define STREAM_RAW_BUF      2048   // accumulator for partial SSE lines
-#define STREAM_SENT_CAP     320    // max characters in one sentence
-#define STREAM_REPLY_CAP    768    // full reply we hand back for history
+#define STREAM_RAW_BUF        2048   // accumulator for partial SSE lines
+#define STREAM_SENT_CAP        320   // max characters in one sentence
+#define STREAM_REPLY_CAP       768   // full reply we hand back for history
+#define STREAM_MAX_TOOL_CALLS    4   // parallel tool_calls in one assistant turn
+#define STREAM_TC_ID_CAP        96
+#define STREAM_TC_NAME_CAP      96
+#define STREAM_TC_ARGS_CAP    1024   // accumulated JSON args per call
+
+typedef struct {
+    char   id[STREAM_TC_ID_CAP];
+    char   name[STREAM_TC_NAME_CAP];
+    char   args[STREAM_TC_ARGS_CAP];
+    size_t args_len;
+} stream_tc_t;
 
 typedef struct {
     char    raw[STREAM_RAW_BUF];   // partial SSE bytes spanning HTTP chunks
@@ -928,7 +987,31 @@ typedef struct {
     size_t  reply_len;
 
     bool    done;                  // saw the [DONE] marker
+
+    // Tool-call accumulator. OpenAI streams tool_calls as deltas:
+    //   {tool_calls:[{index:0, id, type, function:{name, arguments:""}}]}
+    //   {tool_calls:[{index:0, function:{arguments:"<chunk>"}}]}  (repeated)
+    // We concatenate by index. finish_reason="tool_calls" on stream end
+    // means the model wants us to invoke them.
+    stream_tc_t tool_calls[STREAM_MAX_TOOL_CALLS];
+    int         tool_call_count;
+    char        finish_reason[32];
 } stream_ctx_t;
+
+// Reset just the per-round transient fields. Tool_calls are reset on a
+// fresh round; the message scratch raw/sent buffers also start empty.
+// reply_len is preserved so the caller can read the streamed text from
+// the FINAL round (we drop earlier-round preamble like "let me check…").
+static void stream_ctx_reset(stream_ctx_t *c) {
+    if (!c) return;
+    c->raw_len  = 0;  c->raw[0]  = '\0';
+    c->sent_len = 0;  c->sent[0] = '\0';
+    c->reply_len = 0; c->reply[0] = '\0';
+    c->done = false;
+    c->tool_call_count = 0;
+    memset(c->tool_calls, 0, sizeof(c->tool_calls));
+    c->finish_reason[0] = '\0';
+}
 
 // True if `c` ends a sentence in the canonical sense (followed by space
 // or end-of-stream we'll catch on the final flush).
@@ -981,10 +1064,25 @@ static void absorb_text(stream_ctx_t *c, const char *text, size_t n) {
     }
 }
 
+// Append a chunk to a per-tool-call args buffer, capped.
+static void tc_args_append(stream_tc_t *tc, const char *chunk) {
+    if (!chunk || !chunk[0]) return;
+    size_t room = STREAM_TC_ARGS_CAP - 1 - tc->args_len;
+    if (room == 0) return;
+    size_t take = strlen(chunk);
+    if (take > room) take = room;
+    memcpy(tc->args + tc->args_len, chunk, take);
+    tc->args_len += take;
+    tc->args[tc->args_len] = '\0';
+}
+
 // Parse one complete SSE record (`record_buf` of `record_len`, no trailing
 // "\n\n"). We only care about `data: ...` lines; the rest are ignored.
 // `data: [DONE]` flips ctx->done. Anything else is parsed as a JSON
-// chat-completion-chunk; we extract choices[0].delta.content and absorb.
+// chat-completion-chunk; we extract:
+//   - choices[0].delta.content    → sentence-buffered text → TTS
+//   - choices[0].delta.tool_calls → accumulated by index → executed at end
+//   - choices[0].finish_reason    → "tool_calls" / "stop" / etc.
 static void process_sse_record(stream_ctx_t *c, const char *record, size_t len) {
     const char *p = record;
     const char *end = record + len;
@@ -1006,11 +1104,57 @@ static void process_sse_record(stream_ctx_t *c, const char *record, size_t len) 
                     cJSON *first   = cJSON_IsArray(choices)
                                      ? cJSON_GetArrayItem(choices, 0) : NULL;
                     cJSON *delta   = first ? cJSON_GetObjectItem(first, "delta") : NULL;
+
+                    // Text content → TTS pipeline.
                     cJSON *content = delta ? cJSON_GetObjectItem(delta, "content") : NULL;
                     if (cJSON_IsString(content) && content->valuestring) {
                         absorb_text(c, content->valuestring,
                                     strlen(content->valuestring));
                     }
+
+                    // Tool-call deltas. First delta carries id + function.name;
+                    // subsequent deltas carry function.arguments chunks.
+                    cJSON *tcs = delta ? cJSON_GetObjectItem(delta, "tool_calls") : NULL;
+                    if (cJSON_IsArray(tcs)) {
+                        cJSON *tc = NULL;
+                        cJSON_ArrayForEach(tc, tcs) {
+                            cJSON *idx_j = cJSON_GetObjectItem(tc, "index");
+                            int idx = cJSON_IsNumber(idx_j) ? idx_j->valueint : 0;
+                            if (idx < 0 || idx >= STREAM_MAX_TOOL_CALLS) continue;
+                            if (idx >= c->tool_call_count) {
+                                c->tool_call_count = idx + 1;
+                            }
+                            cJSON *id_j = cJSON_GetObjectItem(tc, "id");
+                            if (cJSON_IsString(id_j) && id_j->valuestring &&
+                                id_j->valuestring[0]) {
+                                strlcpy(c->tool_calls[idx].id,
+                                        id_j->valuestring, STREAM_TC_ID_CAP);
+                            }
+                            cJSON *fn = cJSON_GetObjectItem(tc, "function");
+                            if (fn) {
+                                cJSON *name_j = cJSON_GetObjectItem(fn, "name");
+                                if (cJSON_IsString(name_j) && name_j->valuestring &&
+                                    name_j->valuestring[0]) {
+                                    strlcpy(c->tool_calls[idx].name,
+                                            name_j->valuestring, STREAM_TC_NAME_CAP);
+                                }
+                                cJSON *args_j = cJSON_GetObjectItem(fn, "arguments");
+                                if (cJSON_IsString(args_j) && args_j->valuestring) {
+                                    tc_args_append(&c->tool_calls[idx],
+                                                   args_j->valuestring);
+                                }
+                            }
+                        }
+                    }
+
+                    // Stream's terminal finish_reason. "tool_calls" means
+                    // we should invoke and continue; "stop" means done.
+                    cJSON *fr = first ? cJSON_GetObjectItem(first, "finish_reason") : NULL;
+                    if (cJSON_IsString(fr) && fr->valuestring) {
+                        strlcpy(c->finish_reason, fr->valuestring,
+                                sizeof(c->finish_reason));
+                    }
+
                     cJSON_Delete(root);
                 }
             }
@@ -1047,17 +1191,51 @@ static bool stream_chunk_cb(const char *data, size_t len, void *user) {
     return !c->done;   // stop reading once the upstream said [DONE]
 }
 
-// Build the chat body for the streaming variant: same OpenAI shape as the
-// non-streaming path but with `stream: true` and no tools (the streaming
-// wire format would need delta-call decoding we don't ship).
+// Build the chat body for the streaming variant. Same OpenAI shape as
+// the non-streaming path with `stream: true` plus full tool support
+// (system prompt lists tools, body carries the `tools` array).
+//
+// The `extra_msgs` array carries inter-round assistant tool_call replies
+// + tool-role responses across the streaming tool-call loop, exactly
+// like build_chat_body's extra_msgs param.
 static int build_chat_body_stream(char *out, size_t cap,
-                                  int max_tokens, float temperature) {
+                                  int max_tokens, float temperature,
+                                  const cJSON *services, const cJSON *enabled,
+                                  const cJSON *extra_msgs) {
     if (!out || cap == 0) return -1;
     cJSON *root = cJSON_CreateObject();
     if (!root) return -1;
 
     const char *model = devcfg_llm_model();
     if (!is_supported_model(model)) model = "anthropic/claude-haiku-4-5";
+
+    // Shannon's /api/call doesn't speak streaming — its wrapper takes a
+    // flat `{ "message": "..." }` body. We don't expect to land here in
+    // the streaming path because the caller switches off streaming for
+    // shannon/* models, but guard anyway: emit the flat body so the
+    // request still works (just buffered, not streamed).
+    if (is_shannon(model)) {
+        char *flat = malloc(CHAT_BODY_CAP);
+        if (!flat) { cJSON_Delete(root); return -1; }
+        size_t off = 0;
+        char *sysprompt = malloc(SYS_PROMPT_CAP);
+        if (sysprompt) {
+            build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
+            off += snprintf(flat + off, CHAT_BODY_CAP - off, "%s\n\n", sysprompt);
+            free(sysprompt);
+        }
+        for (int i = 0; i < s_hist_len && off < CHAT_BODY_CAP; ++i) {
+            off += snprintf(flat + off, CHAT_BODY_CAP - off,
+                            "%s: %s\n",
+                            s_history[i].role, s_history[i].text);
+        }
+        cJSON_AddStringToObject(root, "message", flat);
+        cJSON_AddNumberToObject(root, "max_tokens", max_tokens);
+        free(flat);
+        bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
+        cJSON_Delete(root);
+        return ok ? (int)strlen(out) : -1;
+    }
 
     cJSON_AddStringToObject(root, "model",       wire_model(model));
     cJSON_AddNumberToObject(root, "max_tokens",  max_tokens);
@@ -1068,8 +1246,10 @@ static int build_chat_body_stream(char *out, size_t cap,
 
     char *sysprompt = malloc(SYS_PROMPT_CAP);
     if (!sysprompt) { cJSON_Delete(root); return -1; }
-    // No tool listing in streaming mode — pass empty service arrays.
-    build_system_prompt(sysprompt, SYS_PROMPT_CAP, NULL, NULL);
+    // Tool listing IS included now — model needs to know it has swap_tokens
+    // + any enabled custom services so it actually calls them instead of
+    // claiming it did and returning text.
+    build_system_prompt(sysprompt, SYS_PROMPT_CAP, services, enabled);
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role",    "system");
     cJSON_AddStringToObject(sys, "content", sysprompt);
@@ -1082,6 +1262,20 @@ static int build_chat_body_stream(char *out, size_t cap,
         cJSON_AddStringToObject(m, "content", s_history[i].text);
         cJSON_AddItemToArray(msgs, m);
     }
+
+    // Splice in inter-round tool-call traffic (assistant tool_calls +
+    // tool-role replies). Deep-copy so the caller's tree stays intact
+    // for the next round.
+    if (cJSON_IsArray(extra_msgs)) {
+        const cJSON *m = NULL;
+        cJSON_ArrayForEach(m, extra_msgs) {
+            cJSON *dup = cJSON_Duplicate(m, true);
+            if (dup) cJSON_AddItemToArray(msgs, dup);
+        }
+    }
+
+    // Wire in the tools array. The model decides whether to invoke any.
+    (void)attach_tools(root, services, enabled);
 
     bool ok = cJSON_PrintPreallocated(root, out, (int)cap, /*fmt=*/false);
     cJSON_Delete(root);
@@ -1102,17 +1296,16 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
 
     push_turn("user", user);
 
+    cJSON *services   = cJSON_Parse(devcfg_custom_services());
+    cJSON *enabled    = cJSON_Parse(devcfg_services_enabled());
+    cJSON *extra_msgs = cJSON_CreateArray();
+
     char *body = malloc(CHAT_BODY_CAP);
-    if (!body) {
+    stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!body || !ctx) {
         strlcpy(reply_out, "I'm out of memory.", reply_cap);
-        pop_last_turn();
-        return false;
-    }
-    int n = build_chat_body_stream(body, CHAT_BODY_CAP,
-                                   /*max_tokens=*/512, /*temperature=*/0.9);
-    if (n < 0) {
-        strlcpy(reply_out, "My thoughts didn't fit.", reply_cap);
-        free(body);
+        free(body); free(ctx);
+        cJSON_Delete(services); cJSON_Delete(enabled); cJSON_Delete(extra_msgs);
         pop_last_turn();
         return false;
     }
@@ -1122,43 +1315,115 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
     char stream_url[192];
     stream_url_for(base_url, stream_url, sizeof(stream_url));
 
-    stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) {
-        strlcpy(reply_out, "I'm out of memory.", reply_cap);
-        free(body);
-        pop_last_turn();
-        return false;
-    }
+    bool ok = false;
+    bool transport_ok = false;
 
-    ESP_LOGI(TAG, "POST(stream) %s (model=%s)", stream_url, devcfg_llm_model());
-    x402_result_t r = {0};
-    x402_call_stream("POST", stream_url, body, NULL,
-                     stream_chunk_cb, ctx, &r);
-    free(body);
+    for (int round = 0; round < MAX_TOOL_ROUNDS; ++round) {
+        stream_ctx_reset(ctx);
 
-    // End-of-stream flush: any trailing partial sentence (no closing
-    // punctuation) still goes to TTS so we don't drop the tail.
-    flush_sentence(ctx);
-
-    bool ok = (r.status == 200) && (ctx->reply_len > 0);
-    if (!ok) {
-        ESP_LOGW(TAG, "stream HTTP %d (err=%s) reply_len=%u",
-                 r.status, r.error, (unsigned)ctx->reply_len);
-        if (r.status == 402) {
-            strlcpy(reply_out, "I couldn't complete the USDC payment.", reply_cap);
-        } else if (r.error[0]) {
-            snprintf(reply_out, reply_cap, "Daemon's brain is offline: %s", r.error);
-        } else {
-            strlcpy(reply_out, "I forgot what I was going to say.", reply_cap);
+        int n = build_chat_body_stream(body, CHAT_BODY_CAP,
+                                       /*max_tokens=*/512,
+                                       /*temperature=*/0.9,
+                                       services, enabled, extra_msgs);
+        if (n < 0) {
+            strlcpy(reply_out, "My thoughts didn't fit.", reply_cap);
+            break;
         }
-        free(ctx);
+
+        ESP_LOGI(TAG, "POST(stream) %s (model=%s, round=%d)",
+                 stream_url, devcfg_llm_model(), round);
+        x402_result_t r = {0};
+        x402_call_stream("POST", stream_url, body, NULL,
+                         stream_chunk_cb, ctx, &r);
+
+        // End-of-stream flush: any trailing partial sentence (no closing
+        // punctuation) still goes to TTS so we don't drop the tail.
+        flush_sentence(ctx);
+
+        if (r.status != 200) {
+            ESP_LOGW(TAG, "stream HTTP %d (err=%s)", r.status, r.error);
+            if (r.status == 402) {
+                strlcpy(reply_out, "I couldn't complete the USDC payment.", reply_cap);
+            } else if (r.error[0]) {
+                snprintf(reply_out, reply_cap, "Daemon's brain is offline: %s", r.error);
+            } else {
+                strlcpy(reply_out, "I forgot what I was going to say.", reply_cap);
+            }
+            break;
+        }
+        transport_ok = true;
+
+        // No tool_calls? This was the final text round. Whatever was
+        // streamed is the assistant's reply.
+        if (ctx->tool_call_count == 0) {
+            ok = trim_to(ctx->reply, reply_out, reply_cap);
+            if (!ok) {
+                ESP_LOGW(TAG, "stream produced no text + no tool_calls (finish=%s)",
+                         ctx->finish_reason[0] ? ctx->finish_reason : "?");
+                strlcpy(reply_out, "I forgot what I was going to say.", reply_cap);
+            }
+            break;
+        }
+
+        // Tool round. Add the assistant message (with tool_calls) to
+        // extra_msgs — OpenAI requires assistant.tool_calls to precede
+        // the tool-role replies in the next request.
+        cJSON *asst = cJSON_CreateObject();
+        cJSON_AddStringToObject(asst, "role", "assistant");
+        // Content can be a partial preamble ("let me check…"); include
+        // it so the next round has the same continuity the model expects.
+        if (ctx->reply_len > 0) {
+            cJSON_AddStringToObject(asst, "content", ctx->reply);
+        } else {
+            cJSON_AddNullToObject(asst, "content");
+        }
+        cJSON *tcs = cJSON_AddArrayToObject(asst, "tool_calls");
+        for (int i = 0; i < ctx->tool_call_count; ++i) {
+            stream_tc_t *src = &ctx->tool_calls[i];
+            cJSON *tc = cJSON_CreateObject();
+            cJSON_AddStringToObject(tc, "id",   src->id);
+            cJSON_AddStringToObject(tc, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(tc, "function");
+            cJSON_AddStringToObject(fn, "name",      src->name);
+            cJSON_AddStringToObject(fn, "arguments", src->args[0] ? src->args : "{}");
+            cJSON_AddItemToArray(tcs, tc);
+        }
+        cJSON_AddItemToArray(extra_msgs, asst);
+
+        // Execute each tool and append its response.
+        for (int i = 0; i < ctx->tool_call_count; ++i) {
+            stream_tc_t *src = &ctx->tool_calls[i];
+            char *tool_out = malloc(TOOL_RESPONSE_CAP);
+            if (!tool_out) continue;
+            execute_tool(services, enabled, src->name,
+                         src->args[0] ? src->args : NULL,
+                         tool_out, TOOL_RESPONSE_CAP);
+            cJSON *tool_msg = cJSON_CreateObject();
+            cJSON_AddStringToObject(tool_msg, "role",         "tool");
+            cJSON_AddStringToObject(tool_msg, "tool_call_id", src->id);
+            cJSON_AddStringToObject(tool_msg, "content",      tool_out);
+            cJSON_AddItemToArray(extra_msgs, tool_msg);
+            free(tool_out);
+        }
+        // Loop — next round's stream will incorporate the tool results.
+    }
+
+    free(body);
+    free(ctx);
+    cJSON_Delete(extra_msgs);
+    cJSON_Delete(services);
+    cJSON_Delete(enabled);
+
+    if (!ok) {
+        // Make sure reply_out has *something* even if we hit MAX_TOOL_ROUNDS
+        // without a final text response — otherwise the caller paints a
+        // blank subtitle.
+        if (transport_ok && !reply_out[0]) {
+            strlcpy(reply_out, "I hit the tool-call limit, sorry.", reply_cap);
+        }
         pop_last_turn();
         return false;
     }
-
-    // Trim and surface the full reply for subtitle / history.
-    (void)trim_to(ctx->reply, reply_out, reply_cap);
-    free(ctx);
     push_turn("assistant", reply_out);
     return true;
 }

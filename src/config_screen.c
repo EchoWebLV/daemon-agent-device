@@ -27,14 +27,16 @@ static const char *TAG = "config_screen";
 typedef struct { const char *id; const char *name; } catalog_item_t;
 
 // Models routed through the daemon-x402s Vercel facilitator. Provider
-// prefix dispatches to /api/openai or /api/anthropic; the suffix is the
-// upstream API model id (must match what each provider actually accepts).
+// prefix dispatches to /api/openai, /api/anthropic, or /api/call (Shannon).
+// The suffix is the upstream API model id (must match what each provider
+// actually accepts).
 static const catalog_item_t MODELS[] = {
     { "anthropic/claude-haiku-4-5",   "Claude Haiku 4.5"   },
     { "anthropic/claude-sonnet-4-6",  "Claude Sonnet 4.6"  },
     { "anthropic/claude-opus-4-7",    "Claude Opus 4.7"    },
     { "openai/gpt-4o-mini",           "GPT-4o Mini"        },
     { "openai/gpt-4o",                "GPT-4o"             },
+    { "shannon/shannon-1.6-lite",     "Shannon 1.6 Lite"   },
 };
 
 // ElevenLabs stock voices: 3 male + 2 female.
