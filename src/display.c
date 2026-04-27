@@ -109,11 +109,13 @@ esp_err_t display_init(void) {
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-    // Orientation: vendor_specific_init's MADCTL=0x08 already sets BGR-with-
-    // no-rotation. The BSP layers mirror(true, true) on top, but that turns
-    // out to leave the face upside-down on this device variant. Dropping to
-    // no extra mirror lands the image right-side up.
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, false, false));
+    // BSP-canonical orientation. Per esp-bsp's explicit note: "Rotation
+    // values must be same as used in esp_lcd for initial settings of the
+    // screen" — the panel mirror MUST match the lvgl_port rotation flags
+    // in ui.c (both true,true). Earlier hardware iteration tried various
+    // mirror combos with lvgl rotation stuck at all-false; that mismatch
+    // is what kept rendering the face upside down or with wrong axes.
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     // ---- Clear to navy so we can tell "panel up" from "panel dark" ----------

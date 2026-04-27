@@ -42,15 +42,19 @@ static const char *TAG = "creature_screen";
 #define EYE_W           30
 #define EYE_H           30
 #define MOUTH_W         60
-#define EYE_L_X         75
+// Face geometry recentered for 320×240 landscape on the BOX-3:
+//   - shift X by +40 (extra horizontal room from the 240→320 panel)
+//   - shift Y by -40 (less vertical room from the 320→240 panel)
+// Result: eyes around top third, smile around lower third, all centered.
+#define EYE_L_X         115
 #define EYE_R_X        (SCR_W - EYE_L_X - EYE_W)
-#define EYE_Y          115
+#define EYE_Y           75
 
 // Shift every face block down by this much from the coordinates listed in
 // the k_* tables below. Tweak in one place to raise/lower the face without
 // touching each feature's Y column.
 #define FACE_Y_OFFSET   (-5)
-#define SMILE_MID_Y    (205 + FACE_Y_OFFSET)    // where the talking mouth centers
+#define SMILE_MID_Y    (165 + FACE_Y_OFFSET)    // where the talking mouth centers
 
 // --- widget handles --------------------------------------------------------
 static lv_obj_t *s_scr          = NULL;
@@ -85,14 +89,15 @@ static lv_timer_t *s_sub_timer      = NULL;
 
 // Pixel coordinates for static face features.
 static const int16_t k_smile[14][2] = {
+    // X +40, Y -40 from the original 240×320 design — see EYE_L_X/EYE_Y notes.
     // row 0 — outermost rising tips
-    { 50, 185}, {180, 185},
+    { 90, 145}, {220, 145},
     // row 1 — inner shoulders one column in
-    { 60, 195}, {170, 195},
+    {100, 155}, {210, 155},
     // row 2 — base of smile arc (10 pixels wide)
-    { 70, 205}, { 80, 205}, { 90, 205}, {100, 205},
-    {110, 205}, {120, 205}, {130, 205}, {140, 205},
-    {150, 205}, {160, 205},
+    {110, 165}, {120, 165}, {130, 165}, {140, 165},
+    {150, 165}, {160, 165}, {170, 165}, {180, 165},
+    {190, 165}, {200, 165},
 };
 
 // --- mood + talking state --------------------------------------------------

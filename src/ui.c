@@ -153,10 +153,14 @@ esp_err_t ui_init(void) {
         .hres          = DISPLAY_WIDTH,
         .vres          = DISPLAY_HEIGHT,
         .monochrome    = false,
+        // MUST match esp_lcd_panel_mirror() in display.c (both true,true).
+        // BSP comment: "Rotation values must be same as used in esp_lcd for
+        // initial settings of the screen." Keeping the two layers in sync
+        // is what gets the rendered content right-side up on the BOX-3.
         .rotation = {
             .swap_xy  = false,
-            .mirror_x = false,
-            .mirror_y = false,
+            .mirror_x = true,
+            .mirror_y = true,
         },
         .flags = {
             .buff_dma    = true,

@@ -137,30 +137,40 @@ bool wallet_screen_init(void) {
 
     add_close_button(bar);
 
-    // --- Top half: QR code + truncated address caption --------------------
-    // 128 px QR leaves a 2-module quiet zone around a 33-module code; scans
-    // cleanly from 10 cm. Centered on the top half of the panel.
+    // --- Landscape layout: QR on the left, address + list on the right ----
+    // Avoids the portrait-era overlap (QR + address + list all at the same
+    // Y range) that caused LVGL to allocate huge composite layers and trip
+    // the task watchdog when the wallet screen activated.
+    //   |  QR 110×110  |  address  |
+    //   |              |  list ... |
+    //   |              |     ...   |
+    // Status bar (26) + 4 px gap consumes y=0..30; everything below uses 210 px.
+    const int content_top = STATUS_BAR_H + 4;
+    const int qr_size     = 110;
+    const int qr_x        = 6;
+    const int qr_y        = content_top;
+    const int right_x     = qr_x + qr_size + 8;        // 124
+    const int right_w     = SCR_W - right_x - 6;        // 190
+
     s_qrcode = lv_qrcode_create(s_scr);
-    lv_qrcode_set_size(s_qrcode, 128);
+    lv_qrcode_set_size(s_qrcode, qr_size);
     lv_qrcode_set_dark_color(s_qrcode, lv_color_black());
     lv_qrcode_set_light_color(s_qrcode, lv_color_white());
-    // Placeholder until wallet_screen_refresh() injects the real pubkey —
-    // without this, lv_qrcode renders a red "error" square.
     lv_qrcode_set_data(s_qrcode, "daemon");
-    lv_obj_align(s_qrcode, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 6);
+    lv_obj_set_pos(s_qrcode, qr_x, qr_y);
 
     s_addr_label = lv_label_create(s_scr);
     lv_label_set_text(s_addr_label, "");
     lv_obj_set_style_text_color(s_addr_label, SCR_COLOR_DIM, LV_PART_MAIN);
-    lv_obj_align(s_addr_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_H + 6 + 128 + 4);
+    lv_obj_set_width(s_addr_label, right_w);
+    lv_label_set_long_mode(s_addr_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(s_addr_label, right_x, content_top);
 
-    // --- Bottom half: balance list (SOL, USDC, SPL tokens) -----------------
-    // Starts at y=SCR_H/2 to split the screen cleanly; fills the rest minus
-    // a small bottom margin.
-    const int list_y = SCR_H / 2;
+    // Balance list fills the remainder of the right column under the address.
+    const int list_y = content_top + 28;                // address ~24 px + 4 gap
     s_list = lv_list_create(s_scr);
-    lv_obj_set_size(s_list, SCR_W - 16, SCR_H - list_y - 6);
-    lv_obj_align(s_list, LV_ALIGN_TOP_LEFT, 8, list_y);
+    lv_obj_set_size(s_list, right_w, SCR_H - list_y - 6);
+    lv_obj_set_pos(s_list, right_x, list_y);
     lv_obj_set_style_bg_color(s_list, SCR_COLOR_PANEL, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_list, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(s_list, SCR_COLOR_DIVIDER, LV_PART_MAIN);

@@ -14,10 +14,10 @@
 extern "C" {
 #endif
 
-// Panel is 240×320 (portrait). Keep layout constants here so each screen
-// module doesn't redefine them.
-#define SCR_W            240
-#define SCR_H            320
+// Panel is 320×240 (landscape) on the ESP32-S3-BOX-3. Keep layout
+// constants here so each screen module doesn't redefine them.
+#define SCR_W            320
+#define SCR_H            240
 #define STATUS_BAR_H      26
 
 // Palette — pixel-art CRT green on pure black. The creature face is
