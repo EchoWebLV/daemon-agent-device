@@ -199,6 +199,14 @@ bool wallet_load_seed(const uint8_t *seed, size_t len) {
 }
 
 bool wallet_begin(void) {
+    // If a seed was already installed via wallet_load_seed (e.g. by the
+    // boot-time PIN unlock in app_main), don't clobber it with secrets.h.
+    // Just re-derive the chain caches in case they weren't set up yet.
+    if (s_secret_len != 0 && s_ok) {
+        ESP_LOGI(TAG, "wallet already loaded (PIN-unlocked) — skipping secrets.h");
+        return true;
+    }
+
     const char *raw = SOLANA_KEY;
     if (!raw || !raw[0] || strncmp(raw, "PASTE-", 6) == 0) {
         ESP_LOGI(TAG, "no key configured — wallet disabled");

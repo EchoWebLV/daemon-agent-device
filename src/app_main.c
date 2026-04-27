@@ -24,6 +24,8 @@
 #include "devcfg.h"
 #include "display.h"
 #include "imu.h"
+#include "pin.h"
+#include "pin_screen.h"
 #include "price.h"
 #include "server.h"
 #include "testharness.h"
@@ -34,6 +36,73 @@
 #include "wifi_sta.h"
 
 static const char *TAG = "daemon";
+
+// ---------------------------------------------------------------------------
+//  Boot-time PIN unlock. Runs before wallet_begin so the PIN-derived seed
+//  populates wallet state instead of secrets.h's. Blocks the boot task on
+//  a binary semaphore until the user enters the right PIN (or the device
+//  wipes itself after PIN_MAX_ATTEMPTS wrong tries).
+// ---------------------------------------------------------------------------
+static SemaphoreHandle_t s_boot_pin_sem = NULL;
+static bool              s_boot_unlocked = false;
+
+static void boot_pin_cb(pin_screen_result_t r, const char *pin, void *user) {
+    (void)user;
+    if (r == PIN_SCR_CANCEL) {
+        // No cancel path at boot — the user has to either enter the right
+        // PIN or burn through 5 wrong attempts to wipe.
+        pin_screen_set_status("PIN required");
+        return;
+    }
+
+    uint8_t seed[PIN_MAX_SEED_LEN]; size_t seed_len = 0;
+    pin_status_t st = pin_unlock(pin, seed, sizeof seed, &seed_len);
+    if (st == PIN_OK) {
+        bool ok = wallet_load_seed(seed, seed_len);
+        memset(seed, 0, sizeof seed);
+        if (ok) {
+            s_boot_unlocked = true;
+            pin_screen_close();
+            xSemaphoreGive(s_boot_pin_sem);
+        } else {
+            pin_screen_set_status("wallet load failed");
+        }
+        return;
+    }
+    memset(seed, 0, sizeof seed);
+    if (st == PIN_ERR_BAD_PIN) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "wrong (%d left)", pin_attempts_remaining());
+        pin_screen_set_status(buf);
+        pin_screen_clear_input();
+        return;
+    }
+    if (st == PIN_ERR_WIPED) {
+        pin_screen_set_status("WIPED — reflash to recover");
+        // Release the semaphore so boot continues; wallet will fall back
+        // to secrets.h (or stay disabled if it's empty).
+        xSemaphoreGive(s_boot_pin_sem);
+        return;
+    }
+    pin_screen_set_status("err — try again");
+    pin_screen_clear_input();
+}
+
+// Returns true if the wallet was successfully loaded via PIN; false if no
+// PIN is configured (caller should fall through to wallet_begin's
+// secrets.h-driven path) or the PIN flow was wiped.
+static bool boot_unlock_wallet(void) {
+    if (!pin_is_set()) return false;
+    s_boot_pin_sem = xSemaphoreCreateBinary();
+    if (!s_boot_pin_sem) return false;
+    s_boot_unlocked = false;
+    pin_screen_open(PIN_MIN_LEN, 6, boot_pin_cb, NULL);
+    // Block here until the callback gives the semaphore (PIN ok or wipe).
+    xSemaphoreTake(s_boot_pin_sem, portMAX_DELAY);
+    vSemaphoreDelete(s_boot_pin_sem);
+    s_boot_pin_sem = NULL;
+    return s_boot_unlocked;
+}
 
 // Wraps ai_handle_say() so the creature face + TTS kick in as a side effect
 // of answering /say. Keeping the forwarder here (rather than in ai.c or ui.c)
@@ -201,6 +270,15 @@ void app_main(void) {
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.
     // Refreshes only attempt network traffic when wifi_sta_is_connected().
+    //
+    // PIN gate: if a sealed seed exists (set up via wizard or test verb),
+    // pop the keypad now and block boot until the user unlocks. wallet_begin
+    // detects the already-loaded seed and skips its secrets.h fallback. If
+    // no PIN is configured, this is a no-op and the legacy secrets.h path
+    // handles seed loading.
+    if (boot_unlock_wallet()) {
+        ESP_LOGI(TAG, "wallet unlocked via PIN");
+    }
     wallet_begin();
     // React when incoming SOL / USDC / SPL crosses the announcement threshold.
     // Must be installed before the first refresh so the baseline snapshot
