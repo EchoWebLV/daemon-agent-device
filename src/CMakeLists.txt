@@ -17,6 +17,7 @@ idf_component_register(
         "imu.c"
         "info_screen.c"
         "menu_screen.c"
+        "onboard_screen.c"
         "pin.c"
         "pin_screen.c"
         "price.c"

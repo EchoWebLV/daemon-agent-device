@@ -24,6 +24,7 @@
 #include "devcfg.h"
 #include "display.h"
 #include "imu.h"
+#include "onboard_screen.h"
 #include "pin.h"
 #include "pin_screen.h"
 #include "price.h"
@@ -243,19 +244,21 @@ void app_main(void) {
         server_set_status("idle");
     }
 
-    // Wizard auto-trigger. Fresh devices with no Wi-Fi creds (and no
-    // PIN-sealed seed signaling prior provisioning) drop into the
-    // captive portal: AP up, splash on the LCD, daemon halts here. The
-    // wizard's POST handler reboots the device after persisting form
-    // values, so this branch never returns.
+    // Fresh-device wizard. Runs entirely on the LCD — the user picks a
+    // Wi-Fi network, types its password on an LVGL keyboard, sets a PIN,
+    // and the seed gets sealed under that PIN. Returns once provisioning
+    // commits; we reboot afterwards so the rest of init runs cleanly with
+    // the persisted Wi-Fi creds + PIN-unlock path.
     if (wifi_err != ESP_OK && wizard_is_first_run() && !pin_is_set()) {
-        ESP_LOGI(TAG, "fresh device — running wizard");
-        ESP_ERROR_CHECK(server_start());     // wizard borrows this httpd
-        char ssid[33] = {0};
-        wizard_compute_ap_ssid(ssid, sizeof ssid);
-        wizard_screen_show(ssid);
-        ESP_ERROR_CHECK(wizard_start());
-        for (;;) vTaskDelay(pdMS_TO_TICKS(60000));   // wait for /wizard reboot
+        ESP_LOGI(TAG, "fresh device — running on-device wizard");
+        bool ok = onboard_screen_run();
+        if (ok) {
+            ESP_LOGI(TAG, "wizard committed; rebooting into normal mode");
+            vTaskDelay(pdMS_TO_TICKS(300));   // let log flush
+            esp_restart();
+        }
+        ESP_LOGW(TAG, "wizard returned without commit; halting");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
     }
 
     // AI client: clears conversation history and registers the /say handler.
