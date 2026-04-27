@@ -27,9 +27,17 @@
 // ---------------------------------------------------------------------------
 #include "creature_screen.h"
 #include "screens_common.h"
+#include "mic.h"
+#include "stt.h"
+#include "ai.h"
+#include "ui.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
@@ -365,6 +373,20 @@ bool creature_screen_init(void) {
     lv_obj_set_style_text_color(s_subtitle, SCR_COLOR_TEXT, LV_PART_MAIN);
     lv_obj_align(s_subtitle, LV_ALIGN_BOTTOM_MID, 0, -8);
 
+    // --- Push-to-talk: long-press anywhere on the face to record ----------
+    // LV_EVENT_LONG_PRESSED fires once after the default ~400 ms hold; we
+    // start mic capture there and stop on RELEASED / PRESS_LOST. The
+    // recording path lives entirely in mic.c + stt.c — this handler is
+    // just the UI trigger.
+    extern void creature_screen_on_long_press_(struct _lv_event_t *e);
+    extern void creature_screen_on_press_end_(struct _lv_event_t *e);
+    lv_obj_add_event_cb(s_scr, creature_screen_on_long_press_,
+                        LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(s_scr, creature_screen_on_press_end_,
+                        LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_scr, creature_screen_on_press_end_,
+                        LV_EVENT_PRESS_LOST, NULL);
+
     // Apply the initial mood tint.
     creature_mood_t m = s_mood;
     s_mood = (creature_mood_t)-1;   // force set path on first call
@@ -373,6 +395,80 @@ bool creature_screen_init(void) {
 
     ESP_LOGI(TAG, "creature screen built (pixel face)");
     return true;
+}
+
+// --- Push-to-talk handlers --------------------------------------------------
+
+static volatile bool s_speech_in_flight = false;
+
+static void speech_task(void *arg) {
+    int16_t *pcm    = (int16_t *)arg;
+    size_t   frames = 0;
+    // The mic_record_stop call below has already been executed on the LVGL
+    // thread; we received the buffer + frame count via two static slots
+    // because lv_async_call only takes one void* and FreeRTOS task args are
+    // a single pointer. Frames are stored as the size_t suffix of the alloc
+    // header — simpler to just stash in a static. See on_press_end_.
+    extern volatile size_t s_speech_frames;
+    frames = s_speech_frames;
+    s_speech_frames = 0;
+
+    char transcript[512] = {0};
+    bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
+    mic_buffer_free(pcm);
+
+    if (!got_text || !transcript[0]) {
+        ESP_LOGW(TAG, "STT returned no text — telling the user");
+        ui_set_subtitle("I didn't catch that.");
+        s_speech_in_flight = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Mirror the typed-input path: ai_handle_say + ui_deliver_reply.
+    char reply[1024] = {0};
+    ai_handle_say(transcript, reply, sizeof(reply));
+    if (reply[0]) {
+        ui_deliver_reply(reply);
+    }
+    s_speech_in_flight = false;
+    vTaskDelete(NULL);
+}
+
+volatile size_t s_speech_frames = 0;
+
+void creature_screen_on_long_press_(struct _lv_event_t *e) {
+    (void)e;
+    if (s_speech_in_flight || mic_is_recording()) return;
+    if (mic_record_start() == ESP_OK) {
+        ui_set_subtitle("Listening...");
+    } else {
+        ESP_LOGW(TAG, "mic_record_start failed");
+    }
+}
+
+void creature_screen_on_press_end_(struct _lv_event_t *e) {
+    (void)e;
+    if (!mic_is_recording()) return;
+    int16_t *pcm    = NULL;
+    size_t   frames = 0;
+    esp_err_t err = mic_record_stop(&pcm, &frames);
+    if (err != ESP_OK || !pcm || frames < 1600) {   // <100 ms = junk
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+    ui_set_subtitle("Thinking...");
+    s_speech_frames = frames;
+    s_speech_in_flight = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        speech_task, "speech", 8192, pcm, 5, NULL, 0);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "speech_task spawn failed");
+        mic_buffer_free(pcm);
+        s_speech_in_flight = false;
+        ui_set_subtitle("");
+    }
 }
 
 lv_obj_t *creature_screen(void) { return s_scr; }

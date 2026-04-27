@@ -29,9 +29,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_codec_dev.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Returns the shared esp_codec_dev I2S data_if (TX+RX), created during
+// voice_begin(). mic.c uses this to attach the ES7210 input codec to the
+// same I2S port without trying to re-initialize the channels. Returns
+// NULL before voice_begin() has run.
+const audio_codec_data_if_t *voice_audio_data_if(void);
 
 // Install I2S + spawn the audio task. Plays a short 3-note boot beep so a
 // dead codec / bad wiring is obvious before the first TTS attempt.

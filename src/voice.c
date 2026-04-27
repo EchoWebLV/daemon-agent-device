@@ -53,16 +53,27 @@
 
 static const char *TAG = "voice";
 
-#define TTS_SAMPLE_HZ  22050
-#define BEEP_SAMPLE_HZ 22050
+// 16 kHz mono is the lowest common rate that works for both ES8311 (TTS
+// out) and ES7210 (mic in). We have to share the I2S BCLK/LRCK between the
+// two codecs on the BOX-3, so they must run at the same effective sample
+// rate. Whisper-class STT models also expect 16 kHz, so this is a no-loss
+// choice for voice input. ElevenLabs returns pcm_16000 cleanly enough.
+#define TTS_SAMPLE_HZ  16000
+#define BEEP_SAMPLE_HZ 16000
 #define VOICE_TEXT_MAX 512
 
-// Codec write chunk in frames. ~23 ms at 22050 Hz mono.
+// Codec write chunk in frames. ~32 ms at 16000 Hz mono.
 #define CODEC_WRITE_FRAMES 512
 
 // --- module state ----------------------------------------------------------
 
 static i2s_chan_handle_t       s_i2s_tx     = NULL;
+static i2s_chan_handle_t       s_i2s_rx     = NULL;
+// Shared codec data_if — wraps both TX and RX channels. Voice (ES8311 OUT)
+// and mic (ES7210 IN) both use this same handle through their respective
+// codec configs. mic.c grabs it via voice_audio_data_if() so we don't
+// double-create.
+static const audio_codec_data_if_t *s_audio_data_if = NULL;
 static esp_codec_dev_handle_t  s_codec      = NULL;   // OUT (speaker) handle
 static TaskHandle_t            s_audio_task = NULL;
 static SemaphoreHandle_t       s_request_sem = NULL;
@@ -96,12 +107,14 @@ static esp_err_t i2s_install(uint32_t sample_hz) {
     chan_cfg.dma_frame_num        = 240;
     chan_cfg.auto_clear_after_cb  = true;
 
-    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL);
+    // Both TX (ES8311 / speaker) and RX (ES7210 / mic) channels created in
+    // a single call so they share BCLK/LRCK on the BOX-3's wired bus. Mic
+    // capture (mic.c) opens the RX side later via the shared data_if.
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx);
     if (err != ESP_OK) return err;
 
-    // ES8311 wants Philips slot format, 16-bit, mono. The codec stretches
-    // mono to its internal stereo path; sending stereo here just wastes
-    // half the DMA bandwidth.
+    // ES8311/ES7210 want Philips slot format, 16-bit, mono. The codecs
+    // route mono samples to their internal stereo paths automatically.
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sample_hz),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
@@ -111,28 +124,37 @@ static esp_err_t i2s_install(uint32_t sample_hz) {
             .bclk = BOARD_I2S_PIN_BCLK,
             .ws   = BOARD_I2S_PIN_LRCK,
             .dout = BOARD_I2S_PIN_DOUT,
-            .din  = I2S_GPIO_UNUSED,
+            .din  = BOARD_I2S_PIN_DIN,
             .invert_flags = { 0 },
         },
     };
     err = i2s_channel_init_std_mode(s_i2s_tx, &std_cfg);
-    if (err != ESP_OK) {
-        i2s_del_channel(s_i2s_tx);
-        s_i2s_tx = NULL;
-        return err;
-    }
-    return i2s_channel_enable(s_i2s_tx);
+    if (err != ESP_OK) goto fail;
+    err = i2s_channel_init_std_mode(s_i2s_rx, &std_cfg);
+    if (err != ESP_OK) goto fail;
+    err = i2s_channel_enable(s_i2s_tx);
+    if (err != ESP_OK) goto fail;
+    err = i2s_channel_enable(s_i2s_rx);
+    if (err != ESP_OK) goto fail;
+    return ESP_OK;
+
+fail:
+    if (s_i2s_tx) { i2s_del_channel(s_i2s_tx); s_i2s_tx = NULL; }
+    if (s_i2s_rx) { i2s_del_channel(s_i2s_rx); s_i2s_rx = NULL; }
+    return err;
 }
 
 static esp_err_t codec_install(void) {
-    // I2S data interface for the codec.
+    // I2S data interface for the codec — wraps BOTH tx and rx handles so
+    // mic.c can share the same data_if for the ES7210 input path.
     audio_codec_i2s_cfg_t i2s_if_cfg = {
         .port      = BOARD_I2S_PORT,
         .tx_handle = s_i2s_tx,
-        .rx_handle = NULL,
+        .rx_handle = s_i2s_rx,
     };
-    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_if_cfg);
-    if (!data_if) return ESP_FAIL;
+    s_audio_data_if = audio_codec_new_i2s_data(&i2s_if_cfg);
+    if (!s_audio_data_if) return ESP_FAIL;
+    const audio_codec_data_if_t *data_if = s_audio_data_if;
 
     // I2C control interface — sources the bus from bus.c so we share
     // I2C_NUM_0 with the touch IC.
@@ -336,9 +358,12 @@ static bool tts_perform(const char *text) {
     const char *voice_id = devcfg_voice_id();
     if (!voice_id || !voice_id[0]) voice_id = ELEVENLABS_VOICE_ID;
     char url[256];
+    // pcm_16000 matches our I2S clock domain (shared with the mic input
+     // path). 16 kHz speech audio is intelligible; the loss vs 22050 is
+     // imperceptible on the small BOX-3 speaker.
     snprintf(url, sizeof(url),
              "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
-             "?output_format=pcm_22050&optimize_streaming_latency=3",
+             "?output_format=pcm_16000&optimize_streaming_latency=3",
              voice_id);
 
     tts_ctx_t ctx = {0};
@@ -488,4 +513,8 @@ bool voice_diagnose(void) {
         return false;
     }
     return true;
+}
+
+const audio_codec_data_if_t *voice_audio_data_if(void) {
+    return s_audio_data_if;
 }

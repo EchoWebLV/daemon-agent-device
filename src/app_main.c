@@ -29,6 +29,7 @@
 #include "touch.h"
 #include "ui.h"
 #include "voice.h"
+#include "mic.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -173,6 +174,13 @@ void app_main(void) {
     // take.
     if (!voice_begin()) {
         ESP_LOGW(TAG, "voice_begin failed; continuing muted");
+    }
+
+    // Mic capture for push-to-talk. Must run AFTER voice_begin since it
+    // shares the I2S RX channel + data_if created there. Failure is
+    // non-fatal — long-press just becomes a no-op.
+    if (mic_init() != ESP_OK) {
+        ESP_LOGW(TAG, "mic_init failed; push-to-talk disabled");
     }
 
     // No IMU on BOX-3B. Shake-to-talk is gone; M4 will replace it with
