@@ -21,8 +21,8 @@ all change.
 | Audio out | I2S → PCM5101 DAC → speaker | I2S → ES8311 codec → PA → speaker |
 | Audio in | (none) | I2S ← ES7210 codec ← dual digital mics |
 | IMU | QMI8658 on dedicated I2C bus, used for shake-to-talk | none |
-| Buttons | none | 3 side buttons (PREV / NEXT / MUTE) |
-| IR | none | front-panel IR receiver |
+| Buttons | none | 1 BOOT/CONFIG button (GPIO0) + 1 MUTE slide switch (GPIO1) |
+| IR | none | none (BOX-3 has neither IR rx nor tx — verified absent from official BSP) |
 
 ## Decisions
 
@@ -47,10 +47,10 @@ re-litigate them.
    becomes orphaned UI in this branch and is re-wired by the future
    push-to-talk branch.
 6. **Smoke-test wiring for new hardware.**
-   - `BTN_PREV` → "back / pop screen" via existing screen stack.
-   - `BTN_NEXT`, `BTN_MUTE` → log presses to serial only.
-   - IR receiver → log decoded NEC codes to serial only.
-   - Mic → 1 Hz RMS-level task logs to serial.
+   - **BOOT button (GPIO0)** → "back / pop screen" via existing screen stack. Press during running app is safe; bootloader entry only happens if held during reset.
+   - **MUTE switch (GPIO1)** → state-change log to serial only. (It's a slide switch, not a momentary button — we log every transition.)
+   - **Mic** → 1 Hz RMS-level task logs to serial.
+   - **No IR work** — BOX-3 has no IR hardware. Out of scope.
 
 ## Architecture
 
@@ -71,10 +71,9 @@ re-litigate them.
 | `src/voice.c` | Substantial rewrite: I2S-direct-to-DAC → `esp_codec_dev` over ES8311. PA enable line driven before first sample. Public API (`voice_say`, `voice_stop`, fade-in) unchanged. |
 | `src/mic.c` / `mic.h` | **New.** ES7210 capture via `esp_codec_dev`. Exposes `mic_init`, `mic_read`, `mic_level`. |
 | `src/imu.c` / `imu.h` | **Deleted.** All references removed from `app_main.c` and `src/CMakeLists.txt`. |
-| `src/buttons.c` / `buttons.h` | **New.** Wraps `espressif/button`; binds `BTN_PREV` to screen-back. |
-| `src/ir.c` / `ir.h` | **New.** RMT NEC decoder; logs `addr=0x%04x cmd=0x%02x` to serial. |
+| `src/buttons.c` / `buttons.h` | **New.** Wraps `espressif/button` for BOOT (GPIO0); binds it to screen-back. Adds a tiny GPIO-input poll for the MUTE slide switch (GPIO1) that logs state transitions. |
 | `src/devcfg.c` | Backlight pin constant updated; LEDC PWM logic unchanged. |
-| `src/app_main.c` | New init order (see below). IMU stanza removed. `mic_init`, `buttons_init`, `ir_init` added. |
+| `src/app_main.c` | New init order (see below). IMU stanza removed. `mic_init` and `buttons_init` added. |
 | `src/{creature,wallet,settings,swap,wifi,info,config,menu}_screen.c` | All 8 re-laid-out for 320×240 landscape. Logic untouched, geometry rewritten. |
 | `README.md` | Hardware section + pin table rewritten for BOX-3B. Build instructions otherwise identical. |
 
@@ -113,8 +112,7 @@ nvs_init()
   → screens_register_all()
   → voice_init()                     # ES8311 codec, PA enable
   → mic_init()                       # ES7210 codec, RMS-level task
-  → buttons_init()                   # 3 buttons, BTN_PREV → back-pop
-  → ir_init()                        # RMT NEC decoder
+  → buttons_init()                   # BOOT → back-pop, MUTE switch → log
   → server_init()                    # web UI
   → main loop (LVGL tick + say-worker)
 ```
@@ -150,61 +148,57 @@ documents it next to the pin definition.
 Single header, no `.c`, grouped by subsystem. Every other source file
 includes it; no hard-coded GPIO numbers anywhere else.
 
-```c
-// board.h shape (exact GPIOs locked from BOX-3B schematic v1.0 at impl)
+GPIOs are locked from `espressif/esp-bsp` `bsp/esp-box-3/include/bsp/esp-box-3.h`
+(master, fetched 2026-04-27), the canonical Espressif source for this board.
+That BSP also serves the BOX-3B variant — only the touch IC differs.
 
-// Display: ILI9342C over SPI2
-#define BOARD_LCD_SPI_HOST          SPI2_HOST
-#define BOARD_LCD_PIN_MOSI          /* schematic */
-#define BOARD_LCD_PIN_SCLK          /* schematic */
-#define BOARD_LCD_PIN_CS            /* schematic */
-#define BOARD_LCD_PIN_DC            /* schematic */
-#define BOARD_LCD_PIN_RST           /* shared with touch RST */
-#define BOARD_LCD_PIN_BL            /* schematic, owned by devcfg LEDC */
+```c
+// Display: ILI9342C over SPI3
+#define BOARD_LCD_SPI_HOST          SPI3_HOST
+#define BOARD_LCD_PIN_MOSI          GPIO_NUM_6
+#define BOARD_LCD_PIN_SCLK          GPIO_NUM_7
+#define BOARD_LCD_PIN_CS            GPIO_NUM_5
+#define BOARD_LCD_PIN_DC            GPIO_NUM_4
+#define BOARD_LCD_PIN_RST           GPIO_NUM_48   // shared with touch RST
+#define BOARD_LCD_PIN_BL            GPIO_NUM_47   // owned by devcfg LEDC
 #define BOARD_LCD_PIXEL_CLOCK_HZ    (40 * 1000 * 1000)
 #define BOARD_LCD_H_RES             320
 #define BOARD_LCD_V_RES             240
 
 // Shared I2C bus (touch + ES8311 control)
 #define BOARD_I2C_PORT              I2C_NUM_0
-#define BOARD_I2C_PIN_SDA           /* schematic */
-#define BOARD_I2C_PIN_SCL           /* schematic */
+#define BOARD_I2C_PIN_SDA           GPIO_NUM_8
+#define BOARD_I2C_PIN_SCL           GPIO_NUM_18
 #define BOARD_I2C_HZ                400000
 
-// Touch: TT21100
-#define BOARD_TOUCH_PIN_INT         /* schematic */
-#define BOARD_TOUCH_PIN_RST         BOARD_LCD_PIN_RST  // shared
+// Touch: TT21100 (BOX-3B)
+#define BOARD_TOUCH_PIN_INT         GPIO_NUM_3
+#define BOARD_TOUCH_PIN_RST         BOARD_LCD_PIN_RST  // shared via level-shifter
 
-// Audio
+// Audio (I2S + shared I2C for codec control)
 #define BOARD_I2S_PORT              I2S_NUM_0
-#define BOARD_I2S_PIN_BCLK          /* schematic */
-#define BOARD_I2S_PIN_LRCK          /* schematic */
-#define BOARD_I2S_PIN_DOUT          /* schematic, ES8311 */
-#define BOARD_I2S_PIN_DIN           /* schematic, ES7210 */
-#define BOARD_AUDIO_PIN_PA_EN       /* schematic, speaker amp enable */
+#define BOARD_I2S_PIN_MCLK          GPIO_NUM_2
+#define BOARD_I2S_PIN_BCLK          GPIO_NUM_17
+#define BOARD_I2S_PIN_LRCK          GPIO_NUM_45
+#define BOARD_I2S_PIN_DOUT          GPIO_NUM_15   // ESP -> ES8311
+#define BOARD_I2S_PIN_DIN           GPIO_NUM_16   // ESP <- ES7210
+#define BOARD_AUDIO_PIN_PA_EN       GPIO_NUM_46   // speaker amp enable
 #define BOARD_ES8311_I2C_ADDR       0x18
 #define BOARD_ES7210_I2C_ADDR       0x40
 
-// Side buttons (active-low)
-#define BOARD_BTN_PIN_PREV          /* schematic */
-#define BOARD_BTN_PIN_NEXT          /* schematic */
-#define BOARD_BTN_PIN_MUTE          /* schematic */
-#define BOARD_BTN_ACTIVE_LEVEL      0
-
-// IR receiver
-#define BOARD_IR_PIN_RX             /* schematic */
-#define BOARD_IR_RMT_RESOLUTION_HZ  1000000
+// User inputs
+#define BOARD_BTN_PIN_BOOT          GPIO_NUM_0    // momentary, active-low
+#define BOARD_MUTE_PIN              GPIO_NUM_1    // slide switch state, NOT a button
 ```
 
-Exact GPIO numbers are filled in as the very first task of milestone 1,
-cross-referenced against:
+Two non-obvious facts the BSP confirmed and that the implementation must
+respect:
 
-- Espressif ESP32-S3-BOX-3 schematic v1.0
-- `espressif/esp_bsp_box_3` BSP source (as a sanity check; we don't depend
-  on the package, just consult it)
-
-That first commit is intentionally tiny and self-contained so it can be
-reviewed against the schematic in isolation.
+- **LCD on SPI3, not SPI2.** The current Waveshare code uses `SPI2_HOST`;
+  M1 must switch.
+- **Touch reset has no dedicated GPIO.** It's level-shifted from `LCD_RST`,
+  so `display_init()` must run before `touch_init()` or the panel reset
+  yanks the touch IC mid-boot.
 
 ## LVGL screen re-layout
 
@@ -240,7 +234,7 @@ demos, and is bisectable.
 | 1 | **Boot + display + touch** | BOX-3B boots. `display.c` clears to navy. LVGL up with a single test screen showing "tap me"; taps register at correct landscape coords. No screens registered yet. | 1–2 days |
 | 2 | **All 8 screens re-laid-out** | Whole app tappable end-to-end. Wi-Fi connects, web UI works, x402 chat completes (typed input only). `voice.c` exists but skips actual playback. "The whole app, silent." | 2–4 days |
 | 3 | **Audio out + audio in** | TTS speaks via ES8311. `mic_init()` runs; 1 Hz RMS task logs to serial. No app consumer for mic. | 2–3 days |
-| 4 | **Buttons + IR** | 3 buttons debounced. `BTN_PREV` pops screen. NEC remote codes log to serial. | 1 day |
+| 4 | **User inputs** | BOOT button debounced and pops screen stack. MUTE switch transitions log to serial. | 0.5 day |
 
 **Total: ~6–10 days of focused work.** Milestones 1 and 4 are mechanical;
 2 (screens) and 3 (codec) are the time sinks.
@@ -255,25 +249,23 @@ separate branches needed since we are replacing, not coexisting.
 | 1 | Visual: navy clear-screen, then "tap me" pill at center. Tap any corner; check coords logged match the corner. Verify shared-RST init order doesn't break touch by power-cycling 5× and confirming touch responds every boot. |
 | 2 | Tap through every screen. Wi-Fi onboarding from cold. Web UI loads at `http://<ip>/`. Type a chat message, confirm x402 round-trip lands a paid response. (No audio expected.) |
 | 3 | Trigger a TTS reply; speaker plays clean audio. Tap the device while it speaks; confirm `voice_stop()` cuts cleanly. Cup mic with hand; serial RMS log drops; release; log rises. |
-| 4 | Press each button: `BTN_PREV` from any screen pops to previous; the other two log. Point any TV remote at the front panel; watch decoded codes scroll on serial. |
+| 4 | Press BOOT from any screen — pops to previous. Slide MUTE between positions — each transition logs `mute=on` / `mute=off`. |
 
 ## Out of scope
 
 - **Push-to-talk wiring** — mic → STT → chat input. Mic API is exposed; no consumer in this migration.
 - **`esp-sr` wake-word** — needs a partition-table change (~3 MB model partition) when it lands. Confirmed direction; not in this branch.
-- **IR-driven UX** — e.g. binding TV-remote codes to nav. Receiver alive; no consumer.
-- **Mute-button binding** — `BTN_MUTE` logs but doesn't mute.
+- **MUTE switch binding to actual audio mute** — switch state is logged but doesn't gate the speaker yet.
 - **Dual-board support** — Waveshare env is gone.
 - **Touch-controller auto-detection** — committing to TT21100. A non-B BOX-3 (GT911) would need a manual driver swap, not runtime detection.
 - **Partition layout changes** — 16 MB layout untouched; `esp-sr` will require revisiting in a follow-up.
 
 ## Risks
 
-- **Audio pinout uncertainty.** Different `esp-bsp` revisions have shown
-  different I2S WS / backlight assignments for BOX-3. Mitigation: lock pins
-  from the official BOX-3 v1.0 schematic in the very first impl task, with a
-  single dedicated commit, and cross-check against the latest `esp_bsp_box_3`
-  source.
+- **SPI host change.** Existing code targets SPI2; BOX-3 LCD is on SPI3. A
+  missed reference to `SPI2_HOST` in any subsystem will silently route
+  pixels to the wrong pins. Mitigation: a single grep-pass for `SPI2_HOST`
+  in M1 and replace via `BOARD_LCD_SPI_HOST` from `board.h`.
 - **Shared I2C bus init ordering.** Touch and audio both want `I2C_NUM_0`.
   Mitigation: `bus.c` lazy-init pattern. If a third subsystem ever needs the
   bus, it goes through the same handle.
