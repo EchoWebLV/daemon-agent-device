@@ -1,13 +1,18 @@
 #pragma once
 // ---------------------------------------------------------------------------
-//  CST328 capacitive-touch bring-up for the Waveshare 2.8" panel.
+//  TT21100 capacitive-touch bring-up for the ESP32-S3-BOX-3B.
 //
-//  Brings up I2C, creates an esp_lcd_touch handle over the CST328, and
-//  binds it to LVGL as a pointer input device via esp_lvgl_port. After
-//  touch_init() returns ESP_OK, LVGL widgets receive click / press / drag
-//  events the usual way — no further plumbing needed.
+//  Sources the shared I2C master bus from bus_i2c(), creates an esp_lcd_touch
+//  handle over the TT21100, and binds it to LVGL as a pointer input device
+//  via esp_lvgl_port. After touch_init() returns ESP_OK, LVGL widgets
+//  receive click / press / drag events the usual way — no further plumbing
+//  needed.
 //
-//  Depends on ui_init() having already created the default lv_display.
+//  Depends on:
+//    - ui_init() having already created the default lv_display.
+//    - display_init() having run first (BOX-3B's touch reset is level-shifted
+//      from LCD_RST, so the touch IC needs the panel reset before we talk
+//      I2C to it). See touch.c for the full rationale.
 // ---------------------------------------------------------------------------
 #include "esp_err.h"
 
