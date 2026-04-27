@@ -70,3 +70,11 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # QR code lib: wallet screen renders the device pubkey as a QR so a phone
 # wallet can scan it without typing 44 base58 chars.
 CONFIG_LV_USE_QRCODE=y
+
+# Allocator: route LVGL through libc malloc instead of LVGL's built-in TLSF
+# pool. The built-in pool defaults to a small fixed size and was choking on
+# wifi-screen redraws (long mapping_search walks under task watchdog), and
+# the system heap has access to all of PSRAM via heap_caps so there's no
+# practical pressure on LVGL allocations from the bigger screens.
+# CONFIG_LV_USE_STDLIB_MALLOC_BUILTIN is not set
+CONFIG_LV_USE_STDLIB_MALLOC_CLIB=y
