@@ -18,6 +18,7 @@
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 
 #include "screens_common.h"
@@ -38,7 +39,14 @@ typedef struct {
     int              len;             // currently entered length
     char             buf[PIN_BUF_MAX];
     bool             open;
+    int64_t          last_fire_us;    // last button-event time (CST328 debounce)
 } pin_ctx_t;
+
+// CST328 reports release jitter as a burst of CLICKED events on the
+// same widget. swap_screen.c already eats these via a poll-based hold
+// detector; we use a simpler 120 ms global cooldown — any second event
+// within the window after a successful keypress is dropped.
+#define PIN_BTN_DEBOUNCE_US 120000
 
 static pin_ctx_t s_ctx = {0};
 
@@ -67,7 +75,20 @@ void pin_screen_set_status(const char *text) {
 // ---------------------------------------------------------------------------
 // Button event handlers
 // ---------------------------------------------------------------------------
+// Returns true if enough time has passed since the last button event,
+// false if we should drop this event as touch-jitter from the previous tap.
+static bool debounce_ok(void) {
+    int64_t now = esp_timer_get_time();
+    if (s_ctx.last_fire_us != 0 &&
+        now - s_ctx.last_fire_us < PIN_BTN_DEBOUNCE_US) {
+        return false;
+    }
+    s_ctx.last_fire_us = now;
+    return true;
+}
+
 static void on_digit(lv_event_t *e) {
+    if (!debounce_ok()) return;
     int d = (int)(intptr_t)lv_event_get_user_data(e);
     if (s_ctx.len >= s_ctx.max_len) return;
     s_ctx.buf[s_ctx.len++] = (char)('0' + d);
@@ -77,6 +98,7 @@ static void on_digit(lv_event_t *e) {
 
 static void on_backspace(lv_event_t *e) {
     (void)e;
+    if (!debounce_ok()) return;
     if (s_ctx.len <= 0) return;
     s_ctx.len--;
     s_ctx.buf[s_ctx.len] = '\0';
@@ -85,6 +107,7 @@ static void on_backspace(lv_event_t *e) {
 
 static void on_ok(lv_event_t *e) {
     (void)e;
+    if (!debounce_ok()) return;
     if (s_ctx.len < s_ctx.min_len) {
         pin_screen_set_status("PIN too short");
         return;
@@ -100,6 +123,7 @@ static void on_ok(lv_event_t *e) {
 
 static void on_cancel(lv_event_t *e) {
     (void)e;
+    if (!debounce_ok()) return;
     pin_screen_cb_t cb = s_ctx.cb;
     void           *user = s_ctx.user;
     if (cb) cb(PIN_SCR_CANCEL, NULL, user);
