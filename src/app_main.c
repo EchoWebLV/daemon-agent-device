@@ -23,7 +23,6 @@
 #include "creature_screen.h"
 #include "devcfg.h"
 #include "display.h"
-#include "imu.h"
 #include "price.h"
 #include "server.h"
 #include "testharness.h"
@@ -75,23 +74,6 @@ static void on_wallet_incoming(const char *symbol, double amount) {
                  symbol ? symbol : "tokens");
         ui_deliver_reply(line);
     }
-}
-
-// Fired by the IMU task when it detects a shake. Plays one of three
-// complaint lines through the normal ui_deliver_reply path (subtitle +
-// TALK mouth + voice_speak) and jitters the creature screen for feedback.
-static void on_shake(void) {
-    static const char *LINES[] = {
-        "Please stop shaking me!",
-        "Please stop this!",
-        "Come on, stop it!",
-    };
-    // Round-robin so two shakes in a row never pick the same line.
-    static uint8_t idx = 0;
-    const char *line = LINES[idx];
-    idx = (idx + 1) % (sizeof(LINES) / sizeof(LINES[0]));
-    creature_screen_shake();
-    ui_deliver_reply(line);
 }
 
 static void log_boot_banner(void) {
@@ -172,31 +154,19 @@ void app_main(void) {
         server_set_status("idle");
     }
 
-    // AI client: clears conversation history and registers the /say handler.
-    // Wire this even when Wi-Fi didn't come up so the callback is ready for
-    // a later reconnect; ai_ask() itself rejects when offline.
-    //
-    // say_with_ui() is the forwarder that plumbs replies into the creature
-    // subtitle + voice task — see the wrapper at the top of this file.
-    ai_begin();
-    server_set_say_handler(say_with_ui);
+    // M1: chat path disabled. ai_begin() is fine to call (no GPIO use)
+    // but the resulting ui_deliver_reply() chain hits voice_speak()
+    // through ui.c, which expects voice_begin() to have run. Restored
+    // in M2 once the screens are working.
 
-    // Voice: installs I2S, plays the boot-beep probe so a dead codec is
-    // obvious, and spawns the audio task. Failure here is not fatal — the
-    // rest of the app is useful without audio.
-    if (!voice_begin()) {
-        ESP_LOGW(TAG, "voice_begin failed; continuing muted");
-    }
+    // M1 (BOX-3B migration): voice path disabled. Original code grabbed
+    // I2S on GPIO47/48/38 which conflict with LCD_BL and LCD_RST on the
+    // BOX-3B. M3 rewrites voice.c around the ES8311 codec; until then
+    // voice_begin() is intentionally not called.
 
-    // QMI8658C on the same I2C bus as the touch panel. Only the accel is
-    // enabled; the polling task calls on_shake() whenever the user gives the
-    // board a good rattle. Not fatal — a board revision without the IMU
-    // simply leaves the face un-shakable.
-    if (imu_begin()) {
-        imu_set_shake_cb(on_shake);
-    } else {
-        ESP_LOGW(TAG, "imu_begin failed; shake-to-talk disabled");
-    }
+    // No IMU on BOX-3B — shake-to-talk is gone. Replaced in a future
+    // branch by push-to-talk on the BOOT button (M4) once the mic
+    // capture path lands in M3.
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.
@@ -234,14 +204,8 @@ void app_main(void) {
         }
     }
 
-    // Boot greeting. Only when Wi-Fi is up — ElevenLabs needs the network, and
-    // silence is better than a failed TTS call on an offline boot. Routed
-    // through ui_deliver_reply() so the creature face goes to TALK + subtitle
-    // mirrors what the speaker says, which also exercises the whole
-    // ai→ui→voice pipeline on every cold boot (handy canary).
-    if (wifi_err == ESP_OK) {
-        ui_deliver_reply("Hello, I am Daemon.");
-    }
+    // M1: boot greeting disabled (would call voice_speak()). Restored
+    // in M2.
 
     // Host-driven smoke-test harness. Spawns a task that blocks on stdin and
     // dispatches "TEST ..." lines. Always on — the task idles on fgets() when

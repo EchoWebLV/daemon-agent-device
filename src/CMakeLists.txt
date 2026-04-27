@@ -14,7 +14,6 @@ idf_component_register(
         "creature_screen.c"
         "devcfg.c"
         "display.c"
-        "imu.c"
         "info_screen.c"
         "menu_screen.c"
         "price.c"
