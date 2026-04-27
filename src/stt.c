@@ -28,7 +28,7 @@
 
 static const char *TAG = "stt";
 
-#define STT_SAMPLE_HZ 22050   // matches BSP I2S default + mic capture rate
+#define STT_SAMPLE_HZ 16000   // matches mic capture rate
 #define STT_BOUNDARY  "----DaemonBoundary17X9k2pQ"
 #define STT_URL       "https://api.openai.com/v1/audio/transcriptions"
 #define STT_MODEL     "whisper-1"
@@ -94,9 +94,10 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
     if (!wifi_sta_is_connected())    { ESP_LOGW(TAG, "no wifi");      return false; }
     if (!has_openai_key())           { ESP_LOGW(TAG, "no OpenAI key"); return false; }
 
-    // Diagnostic: compute RMS + peak of the captured audio so we can tell
-    // whether Whisper got real speech or silence. RMS < 200 on int16 is
-    // basically silence; > 1000 is normal speech volume; > 5000 is loud.
+    // RMS + peak give a quick sanity check of the captured signal. RMS < 200
+    // on int16 is silence; > 1000 is normal speech; > 5000 is loud. Also
+    // the canary for the BOX-3 hardware mute button — if both numbers are
+    // zero, the physical switch on top is engaged.
     {
         int64_t sum_sq = 0;
         int16_t peak = 0;
@@ -110,28 +111,6 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
         ESP_LOGI(TAG, "captured audio: %u frames (%.2f s)  rms=%d  peak=%d",
                  (unsigned)frames, (float)frames / (float)STT_SAMPLE_HZ,
                  rms, (int)peak);
-        // Dump 16 samples each from start / middle / end of the buffer so
-        // we can spot bit-alignment / slot-mode issues by eye. Real speech
-        // looks like a smooth waveform; bit misalignment shows alternating-
-        // sign giant-spike patterns.
-        if (frames >= 48) {
-            char buf[16 * 8 + 1];
-            size_t off = 0;
-            for (size_t i = 0; i < 16; i++)
-                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[i]);
-            ESP_LOGI(TAG, "samples[0..16]:    %s", buf);
-
-            off = 0;
-            size_t mid = frames / 2;
-            for (size_t i = 0; i < 16; i++)
-                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[mid + i]);
-            ESP_LOGI(TAG, "samples[mid..+16]: %s", buf);
-
-            off = 0;
-            for (size_t i = 0; i < 16; i++)
-                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[frames - 16 + i]);
-            ESP_LOGI(TAG, "samples[end-16..]: %s", buf);
-        }
     }
 
     // ---- Build multipart body in PSRAM ------------------------------------

@@ -48,11 +48,9 @@ static const char *TAG = "voice";
 // so both directions must run at the same effective sample rate.
 // Whisper-class STT also expects 16 kHz, so this is a no-loss choice for
 // voice input. ElevenLabs returns pcm_16000 cleanly.
-// 22050 matches the BSP's bsp_audio_init default — keeps everyone (boot
-// beep, ElevenLabs TTS, mic capture, STT WAV) on one rate so we don't
-// rely on esp_codec_dev_open silently reconfiguring the I2S clock.
-#define TTS_SAMPLE_HZ  22050
-#define BEEP_SAMPLE_HZ 22050
+// 16000 Hz matches mic capture rate (BSP audio example uses 16k mono).
+#define TTS_SAMPLE_HZ  16000
+#define BEEP_SAMPLE_HZ 16000
 #define VOICE_TEXT_MAX 512
 #define CODEC_WRITE_FRAMES 512
 
@@ -83,29 +81,14 @@ static int volume_percent(void) {
 }
 
 static esp_err_t codec_open_for_speak(void) {
-    // Open at STEREO even though ElevenLabs streams mono. The mic side
-    // (ES7210) needs stereo capture, and the BOX-3 I2S port has shared
-    // BCLK/LRCK so speaker and mic must use the same channel count or
-    // the bus enters an inconsistent state and the mic reads back zeros.
-    // We duplicate each mono sample into L+R before writing.
     esp_codec_dev_sample_info_t fs = {
         .sample_rate     = TTS_SAMPLE_HZ,
-        .channel         = 2,
+        .channel         = 1,
         .bits_per_sample = 16,
     };
     esp_err_t err = esp_codec_dev_open(s_codec, &fs);
     if (err != ESP_OK) return err;
     return esp_codec_dev_set_out_vol(s_codec, volume_percent());
-}
-
-// Duplicate `frames` mono int16 samples from `mono` into `stereo` (which
-// must hold 2*frames samples). Used because the codec is opened in stereo
-// mode but our TTS source is mono PCM.
-static void mono_to_stereo(const int16_t *mono, int16_t *stereo, size_t frames) {
-    for (size_t i = 0; i < frames; i++) {
-        stereo[2 * i]     = mono[i];
-        stereo[2 * i + 1] = mono[i];
-    }
 }
 
 // --- boot beep probe -------------------------------------------------------
@@ -119,9 +102,7 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
     const int attack  = total / 6;
     const int release = total / 3;
 
-    // Stereo buffer (codec opened at channel=2). Samples are duplicated
-    // L=R from the mono sine wave generator.
-    static int16_t buf[CODEC_WRITE_FRAMES * 2];
+    static int16_t buf[CODEC_WRITE_FRAMES];
     int idx = 0;
     for (int s = 0; s < total; s++) {
         float env = 1.0f;
@@ -130,23 +111,21 @@ static void beep_tone(uint16_t freq, uint16_t duration_ms, int16_t amp) {
         int16_t v = (int16_t)(sinf(phase) * (float)amp * env);
         phase += phase_inc;
         if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
-        buf[idx * 2]     = v;
-        buf[idx * 2 + 1] = v;
-        idx++;
+        buf[idx++] = v;
         if (idx >= CODEC_WRITE_FRAMES) {
-            esp_codec_dev_write(s_codec, buf, idx * 2 * sizeof(int16_t));
+            esp_codec_dev_write(s_codec, buf, idx * sizeof(int16_t));
             idx = 0;
         }
     }
     if (idx > 0) {
-        esp_codec_dev_write(s_codec, buf, idx * 2 * sizeof(int16_t));
+        esp_codec_dev_write(s_codec, buf, idx * sizeof(int16_t));
     }
 }
 
 // --- ElevenLabs streaming --------------------------------------------------
 
 typedef struct {
-    int16_t  scratch[CODEC_WRITE_FRAMES * 2];   // stereo: 2 x mono frames
+    int16_t  scratch[CODEC_WRITE_FRAMES];
     uint8_t  half_byte;
     bool     has_half;
     size_t   total_samples_written;
@@ -181,8 +160,7 @@ static esp_err_t tts_http_event(esp_http_client_event_t *evt) {
             if (ctx->has_half && len >= 1) {
                 int16_t stitched = (int16_t)((ctx->half_byte) |
                                              ((uint16_t)raw[0] << 8));
-                int16_t pair[2] = { stitched, stitched };
-                esp_codec_dev_write(s_codec, pair, sizeof(pair));
+                esp_codec_dev_write(s_codec, &stitched, sizeof(stitched));
                 ctx->total_samples_written += 1;
                 raw += 1;
                 len -= 1;
@@ -199,11 +177,9 @@ static esp_err_t tts_http_event(esp_http_client_event_t *evt) {
             while (frames > 0 && !s_stop_requested) {
                 size_t this_chunk = frames > CODEC_WRITE_FRAMES
                                   ? CODEC_WRITE_FRAMES : frames;
-                // Codec is open in stereo — duplicate each mono sample
-                // into both channels before writing.
-                mono_to_stereo(mono, ctx->scratch, this_chunk);
+                memcpy(ctx->scratch, mono, this_chunk * sizeof(int16_t));
                 esp_err_t werr = esp_codec_dev_write(s_codec, ctx->scratch,
-                                                     this_chunk * 2 * sizeof(int16_t));
+                                                     this_chunk * sizeof(int16_t));
                 if (werr != ESP_OK) {
                     ESP_LOGW(TAG, "codec write err: %s", esp_err_to_name(werr));
                     return ESP_FAIL;
@@ -255,7 +231,7 @@ static bool tts_perform(const char *text) {
     char url[256];
     snprintf(url, sizeof(url),
              "https://api.elevenlabs.io/v1/text-to-speech/%s/stream"
-             "?output_format=pcm_22050&optimize_streaming_latency=3",
+             "?output_format=pcm_16000&optimize_streaming_latency=3",
              voice_id);
 
     tts_ctx_t ctx = {0};
@@ -402,14 +378,12 @@ const audio_codec_data_if_t *voice_audio_data_if(void) {
 bool voice_play_pcm(const int16_t *pcm, size_t frames) {
     if (!s_codec || !pcm || frames == 0) return false;
     if (codec_open_for_speak() != ESP_OK) return false;
-    static int16_t scratch[CODEC_WRITE_FRAMES * 2];
     size_t off = 0;
     while (off < frames) {
         size_t this_chunk = frames - off > CODEC_WRITE_FRAMES
                             ? CODEC_WRITE_FRAMES : frames - off;
-        mono_to_stereo(pcm + off, scratch, this_chunk);
-        esp_err_t err = esp_codec_dev_write(s_codec, scratch,
-                                            this_chunk * 2 * sizeof(int16_t));
+        esp_err_t err = esp_codec_dev_write(s_codec, (void *)(pcm + off),
+                                            this_chunk * sizeof(int16_t));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "loopback write err: %s", esp_err_to_name(err));
             esp_codec_dev_close(s_codec);

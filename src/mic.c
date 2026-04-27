@@ -27,12 +27,17 @@
 
 static const char *TAG = "mic";
 
-// 22050 Hz matches the BSP's bsp_audio_init default. Earlier we ran at
-// 16 kHz expecting esp_codec_dev_open to reconfigure I2S, but every
-// captured chunk still came back hallucinated as "You" — strongly
-// suggesting the reconfig didn't actually land and we were sending
-// 22 kHz audio with a 16 kHz WAV header. Whisper accepts 22050 fine.
-#define MIC_SAMPLE_HZ        22050
+// 16000 Hz, captured stereo and decimated to mono.
+//
+// BOX-3 has a *dual* mic on ES7210; the codec puts MIC1 on the left I2S
+// slot and MIC2 on the right. If we ask esp_codec_dev for channel=1 it
+// reconfigures the I2S peripheral with I2S_SLOT_MODE_MONO (single slot
+// per WS period) — but ES7210 keeps clocking out two slots, so the bit
+// stream slips and we get glitchy noise. So we open at channel=2,
+// matching what the codec actually sends, and drop the right channel
+// (MIC2) in software.
+#define MIC_SAMPLE_HZ        16000
+#define MIC_CHANNELS_RAW     2
 #define MIC_MAX_RECORD_SECS  10
 #define MIC_MAX_FRAMES       (MIC_SAMPLE_HZ * MIC_MAX_RECORD_SECS)
 #define MIC_READ_FRAMES      512
@@ -48,15 +53,16 @@ static TaskHandle_t  s_task       = NULL;
 static void record_task(void *arg) {
     (void)arg;
 
-    // chatgpt_demo opens the codec at 16 kHz / 16-bit / 2-channel (stereo).
-    // ES7210 has 4 mics; the BSP default selects MIC1+MIC2 which appear on
-    // the I2S left and right slots. We average L+R into a single mono
-    // sample per frame so STT gets a 16 kHz mono PCM stream.
+    // BSP example pattern (canonical for plain capture):
+    //   esp_codec_dev_set_in_gain(...)   BEFORE open
+    //   esp_codec_dev_open(channel=2)    stereo (matches ES7210 wire format)
+    //   esp_codec_dev_read into an interleaved L/R buffer
     esp_codec_dev_sample_info_t fs = {
         .sample_rate     = MIC_SAMPLE_HZ,
-        .channel         = 2,
+        .channel         = MIC_CHANNELS_RAW,   // 2 — see header comment
         .bits_per_sample = 16,
     };
+    esp_codec_dev_set_in_gain(s_dev, 42.0);   // matches BSP example
     if (esp_codec_dev_open(s_dev, &fs) != ESP_OK) {
         ESP_LOGE(TAG, "codec open failed");
         s_recording = false;
@@ -64,12 +70,11 @@ static void record_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    esp_codec_dev_set_in_gain(s_dev, 12.0);
 
-    int16_t scratch[MIC_READ_FRAMES * 2];
+    // Stereo scratch — twice as many int16 elements per frame.
+    int16_t scratch[MIC_READ_FRAMES * MIC_CHANNELS_RAW];
     size_t  scratch_bytes = sizeof(scratch);
-    int16_t peak_l_overall = 0, peak_r_overall = 0;
-    int chunk_idx = 0;
+    int16_t peak_l = 0, peak_r = 0;
 
     while (!s_stop_req && s_frames_written < MIC_MAX_FRAMES) {
         esp_err_t err = esp_codec_dev_read(s_dev, scratch, scratch_bytes);
@@ -80,33 +85,23 @@ static void record_task(void *arg) {
         size_t avail = MIC_MAX_FRAMES - s_frames_written;
         size_t to_copy = MIC_READ_FRAMES < avail ? MIC_READ_FRAMES : avail;
         int16_t *dst = s_buf + s_frames_written;
-        int16_t chunk_peak_l = 0, chunk_peak_r = 0;
-        int64_t chunk_sum_sq = 0;
+        // Sum L+R into mono — both ES7210 mics on BOX-3 capture the same
+        // ambient audio, so summing doubles the SNR vs picking one slot
+        // (and dodges the "is MIC1 on L or R?" question entirely).
         for (size_t i = 0; i < to_copy; i++) {
-            int16_t l = scratch[i * 2];
-            int16_t r = scratch[i * 2 + 1];
-            int16_t la = l < 0 ? -l : l;
-            int16_t ra = r < 0 ? -r : r;
-            if (la > chunk_peak_l)   chunk_peak_l   = la;
-            if (ra > chunk_peak_r)   chunk_peak_r   = ra;
-            if (la > peak_l_overall) peak_l_overall = la;
-            if (ra > peak_r_overall) peak_r_overall = ra;
-            chunk_sum_sq += (int64_t)l * (int64_t)l;
-            dst[i] = l;
+            int16_t l  = scratch[i * 2];
+            int16_t r  = scratch[i * 2 + 1];
+            int16_t al = l < 0 ? (int16_t)-l : l;
+            int16_t ar = r < 0 ? (int16_t)-r : r;
+            if (al > peak_l) peak_l = al;
+            if (ar > peak_r) peak_r = ar;
+            // Sign-extending sum then halve — avoids int16 overflow.
+            int32_t mix = ((int32_t)l + (int32_t)r) / 2;
+            dst[i] = (int16_t)mix;
         }
         s_frames_written += to_copy;
-
-        // Per-chunk RMS log every 10 chunks (~250 ms at 22050 Hz / 512
-        // frames per chunk). Lets us see in real time whether any chunk
-        // captures real audio or it's silence the whole way through.
-        if (++chunk_idx % 10 == 0) {
-            int rms = (int)__builtin_sqrt((double)chunk_sum_sq / (double)to_copy);
-            ESP_LOGI(TAG, "chunk %d: L_peak=%d R_peak=%d L_rms=%d",
-                     chunk_idx, chunk_peak_l, chunk_peak_r, rms);
-        }
     }
-    ESP_LOGI(TAG, "channel peaks during capture: L=%d  R=%d",
-             (int)peak_l_overall, (int)peak_r_overall);
+    ESP_LOGI(TAG, "capture peak: L=%d  R=%d", (int)peak_l, (int)peak_r);
 
     esp_codec_dev_close(s_dev);
     s_recording = false;
