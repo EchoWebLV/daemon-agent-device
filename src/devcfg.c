@@ -2,6 +2,7 @@
 //  NVS-backed device settings + LCD backlight PWM. See devcfg.h.
 // ---------------------------------------------------------------------------
 #include "devcfg.h"
+#include "board.h"
 
 #include <string.h>
 
@@ -14,10 +15,9 @@
 static const char *TAG = "devcfg";
 
 // ---- Backlight config -------------------------------------------------------
-// Pin matches the Waveshare 2.8" schematic (GPIO5, also used by display.c —
-// display.c sets it high for the panel initialisation; we take it over with
-// LEDC here so brightness is smoothly controllable from settings).
-#define BL_PIN              5
+// Pin matches src/board.h (GPIO47 on the BOX-3B). Owned exclusively by
+// devcfg via LEDC PWM; no other subsystem touches the line.
+#define BL_PIN              BOARD_LCD_PIN_BL
 #define BL_LEDC_MODE        LEDC_LOW_SPEED_MODE
 #define BL_LEDC_TIMER       LEDC_TIMER_0
 #define BL_LEDC_CHANNEL     LEDC_CHANNEL_0
