@@ -425,6 +425,14 @@ static void speech_task(void *arg) {
         return;
     }
 
+    // Surface the transcript on screen so the user can sanity-check what
+    // Whisper heard before the AI reply overwrites it. Stays visible
+    // until ai_handle_say returns and ui_deliver_reply replaces it.
+    char displayed[600];
+    snprintf(displayed, sizeof(displayed), "you: %s", transcript);
+    ui_set_subtitle(displayed);
+    ESP_LOGI(TAG, "transcript surfaced: %s", transcript);
+
     // Mirror the typed-input path: ai_handle_say + ui_deliver_reply.
     char reply[1024] = {0};
     ai_handle_say(transcript, reply, sizeof(reply));
@@ -461,8 +469,10 @@ void creature_screen_on_press_end_(struct _lv_event_t *e) {
     ui_set_subtitle("Thinking...");
     s_speech_frames = frames;
     s_speech_in_flight = true;
+    // 16 KB stack: ai_handle_say does HTTPS via mbedTLS (handshake eats
+    // 5-8 KB) + the 1 KB reply buffer + STT scratch — 8 KB overflowed.
     BaseType_t ok = xTaskCreatePinnedToCore(
-        speech_task, "speech", 8192, pcm, 5, NULL, 0);
+        speech_task, "speech", 16384, pcm, 5, NULL, 0);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "speech_task spawn failed");
         mic_buffer_free(pcm);

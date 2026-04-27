@@ -97,9 +97,10 @@ static void record_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    // Some boards need a short input-gain bump for tabletop distance
-    // speech. 30 dB is the BSP's default; tunable later.
-    esp_codec_dev_set_in_gain(s_dev, 30.0);
+    // Mic input gain. 30 dB was the BSP default but came back inaudible
+    // for tabletop-distance speech (Whisper transcribed only "You" out of
+    // 1.3 s of audio). 40 dB picks up normal-volume speech from ~0.5 m.
+    esp_codec_dev_set_in_gain(s_dev, 40.0);
 
     int16_t scratch[MIC_READ_FRAMES];
     size_t  scratch_bytes = sizeof(scratch);
