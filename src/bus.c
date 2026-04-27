@@ -1,36 +1,34 @@
 // ---------------------------------------------------------------------------
-//  bus.c — see bus.h for the why.
+//  bus.c — see bus.h.
+//
+//  Delegates to Espressif's esp-box-3 BSP for the actual I2C master bus
+//  setup. After hours debugging hand-rolled audio init that wouldn't
+//  produce real mic data, we pulled in the BSP wholesale for audio. Its
+//  bsp_audio_codec_*_init() helpers internally call bsp_i2c_init(), so
+//  every I2C consumer in the project (touch, both codecs) MUST share that
+//  same bus handle to avoid double-init conflicts on I2C_NUM_0.
+//
+//  bsp_i2c_init() is idempotent: first call sets up the bus, subsequent
+//  calls are no-ops. bsp_i2c_get_handle() returns the same handle every
+//  time. Callers of bus_i2c() see identical behaviour to the previous
+//  hand-rolled implementation.
 // ---------------------------------------------------------------------------
 #include "bus.h"
-#include "board.h"
+
+#include "bsp/esp-box-3.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
 
 static const char *TAG = "bus";
 
-static i2c_master_bus_handle_t s_bus = NULL;
-
 i2c_master_bus_handle_t bus_i2c(void) {
-    if (s_bus) return s_bus;
-
-    const i2c_master_bus_config_t cfg = {
-        .i2c_port                     = BOARD_I2C_PORT,
-        .sda_io_num                   = BOARD_I2C_PIN_SDA,
-        .scl_io_num                   = BOARD_I2C_PIN_SCL,
-        .clk_source                   = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt            = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &s_bus));
-    // The new ESP-IDF 5.x i2c_master API allocates the bus speed-agnostic
-    // and lets each device pick its own SCL frequency at add-device time
-    // (see touch.c's `io_cfg.scl_speed_hz = BOARD_I2C_HZ`). So this log
-    // intentionally does NOT advertise a bus-wide kHz number — it would
-    // mislead any future codec/sensor driver into trusting the bus is
-    // already running at 400 kHz when in fact it isn't until they ask.
-    ESP_LOGI(TAG, "I2C%d allocated (SDA=%d SCL=%d); per-device speed set on add",
-             BOARD_I2C_PORT,
-             BOARD_I2C_PIN_SDA, BOARD_I2C_PIN_SCL);
-    return s_bus;
+    static bool s_logged_once = false;
+    ESP_ERROR_CHECK(bsp_i2c_init());
+    i2c_master_bus_handle_t h = bsp_i2c_get_handle();
+    if (!s_logged_once) {
+        s_logged_once = true;
+        ESP_LOGI(TAG, "shared I2C bus from BSP (handle=%p)", h);
+    }
+    return h;
 }

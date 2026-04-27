@@ -94,6 +94,46 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
     if (!wifi_sta_is_connected())    { ESP_LOGW(TAG, "no wifi");      return false; }
     if (!has_openai_key())           { ESP_LOGW(TAG, "no OpenAI key"); return false; }
 
+    // Diagnostic: compute RMS + peak of the captured audio so we can tell
+    // whether Whisper got real speech or silence. RMS < 200 on int16 is
+    // basically silence; > 1000 is normal speech volume; > 5000 is loud.
+    {
+        int64_t sum_sq = 0;
+        int16_t peak = 0;
+        for (size_t i = 0; i < frames; i++) {
+            int16_t s = pcm[i];
+            int16_t a = s < 0 ? (int16_t)-s : s;
+            if (a > peak) peak = a;
+            sum_sq += (int64_t)s * (int64_t)s;
+        }
+        int rms = (int)__builtin_sqrt((double)sum_sq / (double)frames);
+        ESP_LOGI(TAG, "captured audio: %u frames (%.2f s)  rms=%d  peak=%d",
+                 (unsigned)frames, (float)frames / (float)STT_SAMPLE_HZ,
+                 rms, (int)peak);
+        // Dump 16 samples each from start / middle / end of the buffer so
+        // we can spot bit-alignment / slot-mode issues by eye. Real speech
+        // looks like a smooth waveform; bit misalignment shows alternating-
+        // sign giant-spike patterns.
+        if (frames >= 48) {
+            char buf[16 * 8 + 1];
+            size_t off = 0;
+            for (size_t i = 0; i < 16; i++)
+                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[i]);
+            ESP_LOGI(TAG, "samples[0..16]:    %s", buf);
+
+            off = 0;
+            size_t mid = frames / 2;
+            for (size_t i = 0; i < 16; i++)
+                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[mid + i]);
+            ESP_LOGI(TAG, "samples[mid..+16]: %s", buf);
+
+            off = 0;
+            for (size_t i = 0; i < 16; i++)
+                off += snprintf(buf + off, sizeof(buf) - off, "%6d ", pcm[frames - 16 + i]);
+            ESP_LOGI(TAG, "samples[end-16..]: %s", buf);
+        }
+    }
+
     // ---- Build multipart body in PSRAM ------------------------------------
     const char *pre =
         "--" STT_BOUNDARY "\r\n"

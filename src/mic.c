@@ -1,24 +1,16 @@
 // ---------------------------------------------------------------------------
 //  mic.c — see mic.h.
 //
-//  Capture pipeline:
-//      I2S RX (created in voice.c) ── shared data_if ──> ES7210 codec
-//                                                              │
-//                                                              ▼
-//                                              esp_codec_dev (TYPE_IN)
-//                                                              │
-//                                                              ▼
-//                                          mic_record_task reads PCM
-//                                          and appends to a PSRAM buffer
+//  Uses the BOX-3 BSP's microphone codec init directly. The BSP returns
+//  an esp_codec_dev handle wired to ES7210 over the same I2S port the
+//  speaker uses; bsp_audio_codec_microphone_init shares the underlying
+//  I2S setup with bsp_audio_codec_speaker_init by design.
 //
-//  The recording task is spawned per-record-session, not as a long-lived
-//  worker, so the codec is only opened (and PA path activated) while the
-//  user is actually holding to talk.
+//  The capture buffer lives in PSRAM (16 kHz mono * 16-bit * 10 s = ~320 KB),
+//  which is too big for internal RAM but fine in the BOX-3's 16 MB Octal
+//  PSRAM pool.
 // ---------------------------------------------------------------------------
 #include "mic.h"
-#include "voice.h"
-#include "board.h"
-#include "bus.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -31,7 +23,7 @@
 #include "esp_heap_caps.h"
 
 #include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
+#include "bsp/esp-box-3.h"
 
 static const char *TAG = "mic";
 
@@ -42,52 +34,22 @@ static const char *TAG = "mic";
 
 static esp_codec_dev_handle_t s_dev = NULL;
 
-static int16_t  *s_buf            = NULL;     // PSRAM, MIC_MAX_FRAMES * 2 bytes
+static int16_t  *s_buf            = NULL;
 static size_t    s_frames_written = 0;
 static volatile bool s_recording  = false;
 static volatile bool s_stop_req   = false;
 static TaskHandle_t  s_task       = NULL;
 
-static esp_err_t install_codec(void) {
-    const audio_codec_data_if_t *data_if = voice_audio_data_if();
-    if (!data_if) {
-        ESP_LOGE(TAG, "voice_audio_data_if() is NULL — voice_begin must run first");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    audio_codec_i2c_cfg_t i2c_cfg = {
-        .port       = BOARD_I2C_PORT,
-        .addr       = BOARD_ES7210_I2C_ADDR,
-        .bus_handle = bus_i2c(),
-    };
-    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
-    if (!ctrl_if) return ESP_FAIL;
-
-    es7210_codec_cfg_t es7210_cfg = {
-        .ctrl_if  = ctrl_if,
-        // Mic 1 is wired to the left mic on BOX-3. mic 2 is right; selecting
-        // both gives stereo input which we'd then have to downmix. Stick to
-        // a single mic for the lowest-friction path.
-        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
-    };
-    const audio_codec_if_t *codec_if = es7210_codec_new(&es7210_cfg);
-    if (!codec_if) return ESP_FAIL;
-
-    esp_codec_dev_cfg_t dev_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-        .codec_if = codec_if,
-        .data_if  = data_if,
-    };
-    s_dev = esp_codec_dev_new(&dev_cfg);
-    return s_dev ? ESP_OK : ESP_FAIL;
-}
-
 static void record_task(void *arg) {
     (void)arg;
 
+    // chatgpt_demo opens the codec at 16 kHz / 16-bit / 2-channel (stereo).
+    // ES7210 has 4 mics; the BSP default selects MIC1+MIC2 which appear on
+    // the I2S left and right slots. We average L+R into a single mono
+    // sample per frame so STT gets a 16 kHz mono PCM stream.
     esp_codec_dev_sample_info_t fs = {
         .sample_rate     = MIC_SAMPLE_HZ,
-        .channel         = 1,
+        .channel         = 2,
         .bits_per_sample = 16,
     };
     if (esp_codec_dev_open(s_dev, &fs) != ESP_OK) {
@@ -97,13 +59,16 @@ static void record_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    // Mic input gain. 30 dB was the BSP default but came back inaudible
-    // for tabletop-distance speech (Whisper transcribed only "You" out of
-    // 1.3 s of audio). 40 dB picks up normal-volume speech from ~0.5 m.
-    esp_codec_dev_set_in_gain(s_dev, 40.0);
+    // ES7210's open() hardcodes 30 dB on all channels. We adjust afterward.
+    // Pre-open calls return INVALID_STATE silently because the underlying
+    // _es7210_set_channel_gain refuses to write to a closed codec.
+    // 12 dB is below the open-default 30 to avoid clipping on tabletop
+    // speech which we measured peaking at full-scale at 30 dB.
+    esp_codec_dev_set_in_gain(s_dev, 12.0);
 
-    int16_t scratch[MIC_READ_FRAMES];
+    int16_t scratch[MIC_READ_FRAMES * 2];
     size_t  scratch_bytes = sizeof(scratch);
+    int16_t peak_l_overall = 0, peak_r_overall = 0;
 
     while (!s_stop_req && s_frames_written < MIC_MAX_FRAMES) {
         esp_err_t err = esp_codec_dev_read(s_dev, scratch, scratch_bytes);
@@ -113,9 +78,23 @@ static void record_task(void *arg) {
         }
         size_t avail = MIC_MAX_FRAMES - s_frames_written;
         size_t to_copy = MIC_READ_FRAMES < avail ? MIC_READ_FRAMES : avail;
-        memcpy(s_buf + s_frames_written, scratch, to_copy * sizeof(int16_t));
+        int16_t *dst = s_buf + s_frames_written;
+        // Diagnostic: track L and R peaks across the whole capture so we
+        // can see if one channel is dead. Use LEFT only into the mono
+        // buffer — averaging halves volume if R is silent.
+        for (size_t i = 0; i < to_copy; i++) {
+            int16_t l = scratch[i * 2];
+            int16_t r = scratch[i * 2 + 1];
+            int16_t la = l < 0 ? -l : l;
+            int16_t ra = r < 0 ? -r : r;
+            if (la > peak_l_overall) peak_l_overall = la;
+            if (ra > peak_r_overall) peak_r_overall = ra;
+            dst[i] = l;
+        }
         s_frames_written += to_copy;
     }
+    ESP_LOGI(TAG, "channel peaks during capture: L=%d  R=%d",
+             (int)peak_l_overall, (int)peak_r_overall);
 
     esp_codec_dev_close(s_dev);
     s_recording = false;
@@ -125,7 +104,13 @@ static void record_task(void *arg) {
 
 esp_err_t mic_init(void) {
     if (s_dev) return ESP_OK;
-    return install_codec();
+    s_dev = bsp_audio_codec_microphone_init();
+    if (!s_dev) {
+        ESP_LOGE(TAG, "bsp_audio_codec_microphone_init failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "mic up via BSP/ES7210 (handle=%p)", s_dev);
+    return ESP_OK;
 }
 
 esp_err_t mic_record_start(void) {
@@ -145,7 +130,7 @@ esp_err_t mic_record_start(void) {
     s_recording      = true;
 
     BaseType_t ok = xTaskCreatePinnedToCore(
-        record_task, "mic_record", 4096, NULL, 6, &s_task, 0);
+        record_task, "mic_record", 8192, NULL, 6, &s_task, 0);
     if (ok != pdPASS) {
         s_recording = false;
         return ESP_FAIL;
@@ -156,12 +141,9 @@ esp_err_t mic_record_start(void) {
 
 esp_err_t mic_record_stop(int16_t **out_pcm, size_t *out_frames) {
     if (!s_recording && !s_task) {
-        // Already stopped. Drain whatever's in the buffer.
         if (s_frames_written == 0) return ESP_ERR_INVALID_STATE;
     } else {
         s_stop_req = true;
-        // Wait for the record task to drain. Bound the wait so a stuck
-        // codec read doesn't hang the caller (LVGL UI thread).
         for (int i = 0; i < 50 && s_recording; i++) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
