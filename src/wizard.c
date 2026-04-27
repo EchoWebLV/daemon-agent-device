@@ -26,6 +26,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -150,23 +151,38 @@ esp_err_t wizard_apply_form(const wizard_form_t *form) {
         s_owner_pk_loaded = false;   // re-read on next access
     }
 
-    // 3. PIN: seal the *current* wallet seed under the chosen PIN. Source
-    //    is still secrets.h's SOLANA_KEY for now — Phase 2c-extended will
-    //    add per-device key generation. Once sealed, pin_unlock(PIN)
-    //    restores the same 64-byte seed.
+    // 3. Device seed → sealed under the PIN.
+    //    Per-device key generation: each shipping unit needs its own
+    //    wallet, so by default we draw 32 fresh bytes from the hardware
+    //    RNG. SOLANA_KEY in secrets.h is honored as a *dev-only override*
+    //    — useful when you want a known wallet on your bench device.
+    //    Anything else (placeholder, missing, or undecodable) falls
+    //    through to fresh generation.
     if (form->pin[0]) {
-        const char *seed_b58 = SOLANA_KEY;
-        if (seed_b58 && seed_b58[0] && strncmp(seed_b58, "PASTE-", 6) != 0) {
-            uint8_t seed[PIN_MAX_SEED_LEN];
-            int sn = base58_decode(seed_b58, seed, sizeof seed);
-            if (sn == 32 || sn == 64) {
-                pin_status_t st = pin_setup(form->pin, seed, (size_t)sn);
-                memset(seed, 0, sizeof seed);
-                if (st != PIN_OK) {
-                    ESP_LOGW(TAG, "pin_setup err=%d", st);
-                    return ESP_FAIL;
-                }
+        uint8_t seed[PIN_MAX_SEED_LEN] = {0};
+        size_t  seed_len = 0;
+
+        const char *override = SOLANA_KEY;
+        if (override && override[0] && strncmp(override, "PASTE-", 6) != 0) {
+            int n = base58_decode(override, seed, sizeof seed);
+            if (n == 32 || n == 64) {
+                seed_len = (size_t)n;
+                ESP_LOGI(TAG, "seed: using SOLANA_KEY override from secrets.h");
             }
+        }
+        if (seed_len == 0) {
+            // esp_fill_random is cryptographically secure once Wi-Fi/BT
+            // is up (which it is by the time the wizard runs).
+            esp_fill_random(seed, 32);
+            seed_len = 32;
+            ESP_LOGI(TAG, "seed: generated fresh 32 B from hardware RNG");
+        }
+
+        pin_status_t st = pin_setup(form->pin, seed, seed_len);
+        memset(seed, 0, sizeof seed);
+        if (st != PIN_OK) {
+            ESP_LOGW(TAG, "pin_setup err=%d", st);
+            return ESP_FAIL;
         }
     }
 
