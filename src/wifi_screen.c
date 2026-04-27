@@ -102,11 +102,20 @@ static void add_close_button(lv_obj_t *bar) {
 
 static void async_scan_done(void *arg) {
     (void)arg;
-    if (!lvgl_port_lock(0)) return;
+    // Wait up to 1s for the LVGL port lock. The previous (timeout=0) path
+    // silently skipped the unlock-and-clear when the port was momentarily
+    // busy with a draw, leaving s_scan_in_flight true forever — every
+    // subsequent Scan tap was then ignored. Clear the flag unconditionally
+    // even on lock-timeout so the button stays usable.
+    bool got_lock = lvgl_port_lock(1000);
     s_scan_in_flight = false;
-    repopulate_list();
-    lv_label_set_text(s_status_label, "wifi");
-    lvgl_port_unlock();
+    if (got_lock) {
+        repopulate_list();
+        lv_label_set_text(s_status_label, "wifi");
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "async_scan_done: port lock timeout; UI not refreshed");
+    }
 }
 
 // Payload for connect result so we can surface the SSID in the message.
