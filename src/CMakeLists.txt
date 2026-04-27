@@ -9,6 +9,7 @@ idf_component_register(
         "ai.c"
         "app_main.c"
         "base58.c"
+        "bus.c"
         "config_screen.c"
         "creature_screen.c"
         "devcfg.c"
