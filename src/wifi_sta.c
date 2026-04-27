@@ -212,11 +212,22 @@ size_t wifi_sta_scan(wifi_sta_scan_ap_t *out, size_t cap) {
         return 0;
     }
 
+    // If wifi_sta_begin couldn't reach a stored AP at boot, IDF's auto-
+    // reconnect leaves the STA state machine in an endless connect retry
+    // loop in the background. esp_wifi_scan_start(block=true) waits for
+    // a scan-done event that never fires while connect attempts are in
+    // flight, which presents to the UI as "stuck on scanning..." forever.
+    // Calling esp_wifi_disconnect first cancels the retry loop and lets
+    // the scan run to completion. Ignored if we weren't connecting.
+    esp_wifi_disconnect();
+
+    ESP_LOGI(TAG, "scan: starting");
     esp_err_t err = esp_wifi_scan_start(NULL, /*block=*/true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan_start: %s", esp_err_to_name(err));
         return 0;
     }
+    ESP_LOGI(TAG, "scan: complete");
 
     uint16_t n_found = 0;
     esp_wifi_scan_get_ap_num(&n_found);
