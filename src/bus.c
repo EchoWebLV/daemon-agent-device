@@ -1,17 +1,10 @@
 // ---------------------------------------------------------------------------
 //  bus.c — see bus.h.
 //
-//  Delegates to Espressif's esp-box-3 BSP for the actual I2C master bus
-//  setup. After hours debugging hand-rolled audio init that wouldn't
-//  produce real mic data, we pulled in the BSP wholesale for audio. Its
-//  bsp_audio_codec_*_init() helpers internally call bsp_i2c_init(), so
-//  every I2C consumer in the project (touch, both codecs) MUST share that
-//  same bus handle to avoid double-init conflicts on I2C_NUM_0.
-//
-//  bsp_i2c_init() is idempotent: first call sets up the bus, subsequent
-//  calls are no-ops. bsp_i2c_get_handle() returns the same handle every
-//  time. Callers of bus_i2c() see identical behaviour to the previous
-//  hand-rolled implementation.
+//  Delegates to the esp-box-3 BSP for I2C master setup. The BSP's audio
+//  codec init helpers internally call bsp_i2c_init(), so every I2C consumer
+//  in the project (touch + both codecs) MUST share the BSP's bus handle to
+//  avoid double-init conflicts on I2C_NUM_0. bsp_i2c_init() is idempotent.
 // ---------------------------------------------------------------------------
 #include "bus.h"
 

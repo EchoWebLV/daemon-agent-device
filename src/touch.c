@@ -11,14 +11,12 @@
 //  as a pointer indev.
 //
 //  I2C bus comes from bus_i2c() (see bus.c) so we share I2C_NUM_0 with the
-//  audio codec when M3 lands.
+//  ES8311 + ES7210 audio codecs.
 //
 //  Reset line: GT911 has no dedicated reset GPIO on the BOX-3 — its reset
-//  is level-shifted from LCD_RST (GPIO48). board.h aliases
-//  BOARD_TOUCH_PIN_RST to BOARD_LCD_PIN_RST for documentation, but
-//  display_init() is the one that actually drives the line. As long as
-//  display_init() runs first (it does, see app_main.c), the touch IC sees
-//  exactly one reset pulse during boot.
+//  is level-shifted from LCD_RST (GPIO48). display_init() is the one that
+//  drives that line; as long as display_init() runs first (see app_main.c),
+//  the touch IC sees exactly one reset pulse during boot.
 // ---------------------------------------------------------------------------
 #include "touch.h"
 #include "display.h"

@@ -215,7 +215,7 @@ static void handle_screen_paint(void) {
 
 static void handle_tap(const char *args) {
     // TAP on this build is a protocol-level acknowledgement rather than a
-    // real synthetic touch: LVGL owns the CST328 input device and the
+    // real synthetic touch: LVGL owns the GT911 input device and the
     // screens that exist on ESP-IDF today (creature / wallet / settings /
     // wifi) are reached through gestures or explicit screen forces rather
     // than tile taps. The host runner sends TAP anyway so the protocol

@@ -1,12 +1,11 @@
 // ---------------------------------------------------------------------------
-//  board.h — single source of truth for ESP32-S3-BOX-3B GPIO assignments.
+//  board.h — single source of truth for ESP32-S3-BOX-3 GPIO assignments.
 //
 //  Every other source file references these constants instead of hard-coding
 //  GPIO numbers. Keeping pins here means a future board port is one file.
 //
 //  Pinout was lifted from Espressif's official BSP source on 2026-04-27:
 //    espressif/esp-bsp · bsp/esp-box-3/include/bsp/esp-box-3.h (master)
-//  The same BSP serves both BOX-3 and BOX-3B; only the touch IC differs.
 //
 //  Two non-obvious facts the implementation must respect:
 //
@@ -14,18 +13,20 @@
 //       so any leftover `SPI2_HOST` reference will silently route pixels
 //       to the wrong pins.
 //
-//    2. The TT21100 touch IC's reset line has no dedicated GPIO — it's
+//    2. The GT911 touch IC's reset line has no dedicated GPIO — it's
 //       level-shifted from LCD_RST (GPIO48). That means display_init()
 //       MUST run before touch_init(); a panel reset pulse after the
 //       touch IC is up will yank the touch controller out from under
 //       the LVGL pointer indev.
+//
+//  Audio (ES8311 speaker + ES7210 mic) and the I2C bus pins are owned by
+//  the BOX-3 BSP — see managed_components/espressif__esp-box-3/. We don't
+//  redeclare them here because the BSP would just override us anyway.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include "driver/gpio.h"
 #include "driver/spi_common.h"
-#include "driver/i2c_master.h"
-#include "driver/i2s_common.h"
 
 // === Display: ILI9342C over SPI3 ============================================
 #define BOARD_LCD_SPI_HOST          SPI3_HOST
@@ -39,31 +40,6 @@
 #define BOARD_LCD_H_RES             320
 #define BOARD_LCD_V_RES             240
 
-// === Shared I2C bus (touch + ES8311/ES7210 codec control) ====================
-#define BOARD_I2C_PORT              I2C_NUM_0
-#define BOARD_I2C_PIN_SDA           GPIO_NUM_8
-#define BOARD_I2C_PIN_SCL           GPIO_NUM_18
-#define BOARD_I2C_HZ                400000
-
-// === Touch: TT21100 (BOX-3B variant) ========================================
+// === Touch: GT911 ===========================================================
 #define BOARD_TOUCH_PIN_INT         GPIO_NUM_3
-#define BOARD_TOUCH_PIN_RST         BOARD_LCD_PIN_RST  // level-shifted, see header
-
-// === Audio: ES8311 (out) + ES7210 (in) — defined for M3, unused in M1 =======
-#define BOARD_I2S_PORT              I2S_NUM_0
-#define BOARD_I2S_PIN_MCLK          GPIO_NUM_2
-#define BOARD_I2S_PIN_BCLK          GPIO_NUM_17
-#define BOARD_I2S_PIN_LRCK          GPIO_NUM_45
-#define BOARD_I2S_PIN_DOUT          GPIO_NUM_15   // ESP -> ES8311
-#define BOARD_I2S_PIN_DIN           GPIO_NUM_16   // ESP <- ES7210
-#define BOARD_AUDIO_PIN_PA_EN       GPIO_NUM_46   // speaker amp enable
-// 8-bit I2C addresses (7-bit slave addr left-shifted with the R/W bit).
-// The esp_codec_dev wrapper expects this form and shifts back internally;
-// passing the 7-bit form (0x18 / 0x40) makes the wrapper talk to the
-// wrong slave and codec init fails with "ES8311: Open fail".
-#define BOARD_ES8311_I2C_ADDR       (0x30)   // 7-bit 0x18 << 1
-#define BOARD_ES7210_I2C_ADDR       (0x80)   // 7-bit 0x40 << 1
-
-// === User inputs — defined for M4, unused in M1 ==============================
-#define BOARD_BTN_PIN_BOOT          GPIO_NUM_0    // momentary, active-low
-#define BOARD_MUTE_PIN              GPIO_NUM_1    // slide switch state
+#define BOARD_I2C_HZ                400000        // GT911 I2C speed

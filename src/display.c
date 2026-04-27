@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-//  display.c — ILI9342C bring-up for the ESP32-S3-BOX-3B.
+//  display.c — ILI9342C bring-up for the ESP32-S3-BOX-3.
 //
 //  Uses esp_lcd over SPI3 (BOX-3 routes the LCD bus to SPI3, NOT SPI2 like
 //  the Waveshare predecessor). Driver comes from espressif/esp_lcd_ili9341,

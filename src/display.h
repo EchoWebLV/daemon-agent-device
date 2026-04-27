@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-//  ILI9342C 320x240 landscape over SPI3 — ESP32-S3-BOX-3B.
+//  ILI9342C 320x240 landscape over SPI3 — ESP32-S3-BOX-3.
 //
 //  Thin wrapper around the espressif/esp_lcd_ili9341 managed component
 //  (it covers both 9341 and 9342C). Initialises the SPI bus, panel IO and

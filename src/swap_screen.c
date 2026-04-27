@@ -47,9 +47,9 @@ static const char *TAG = "swap_screen";
 #define HOLD_MS              3000
 #define IDLE_TIMEOUT_MS      30000
 #define POLL_PERIOD_MS       20
-// CST328 reports brief RELEASED dropouts during a static hold (INT line
-// retriggers between frames). Require this many continuous ms of RELEASED
-// before treating it as a real lift-off.
+// The touch IC reports brief RELEASED dropouts during a static hold (INT
+// line retriggers between frames). Require this many continuous ms of
+// RELEASED before treating it as a real lift-off.
 #define RELEASE_DEBOUNCE_MS  120
 
 typedef struct {
@@ -156,7 +156,7 @@ static void poll_tick(lv_timer_t *t) {
         }
     } else {
         if (s_ctx.touching && s_ctx.hold_ms > 0) {
-            // Debounce: a single RELEASED tick is usually a CST328 dropout
+            // Debounce: a single RELEASED tick is usually a touch-IC dropout
             // mid-hold, not a real lift. Only cancel after the streak crosses
             // RELEASE_DEBOUNCE_MS of continuous releases.
             s_ctx.release_streak_ms += POLL_PERIOD_MS;

@@ -15,7 +15,7 @@
 static const char *TAG = "devcfg";
 
 // ---- Backlight config -------------------------------------------------------
-// Pin matches src/board.h (GPIO47 on the BOX-3B). Owned exclusively by
+// Pin matches src/board.h (GPIO47 on the BOX-3). Owned exclusively by
 // devcfg via LEDC PWM; no other subsystem touches the line.
 #define BL_PIN              BOARD_LCD_PIN_BL
 #define BL_LEDC_MODE        LEDC_LOW_SPEED_MODE

@@ -39,10 +39,6 @@ static const char *TAG = "daemon";
 // of answering /say. Keeping the forwarder here (rather than in ai.c or ui.c)
 // lets each module stay unaware of the others — ai.c writes a reply, ui.c
 // displays+speaks it, and this one-liner is the seam where the two meet.
-//
-// M1 (BOX-3B): currently orphaned. Its only call site,
-// `server_set_say_handler(say_with_ui)`, is commented out below until M2
-// re-enables the chat path. Left in place so M2 just uncomments the wiring.
 static void say_with_ui(const char *user, char *reply_out, size_t reply_cap) {
     ai_handle_say(user, reply_out, reply_cap);
     // Only drive the UI when we got a non-empty answer. On error ai.c writes
@@ -127,8 +123,8 @@ void app_main(void) {
     // confirmed, delete this line — it clears any future persona on boot.
     devcfg_set_personality("");
 
-    // Bring the ST7789 online early so dead-panel failures show up in the
-    // log before we start allocating for LVGL / WiFi / audio.
+    // Bring the ILI9342C online early so dead-panel failures show up in
+    // the log before we start allocating for LVGL / WiFi / audio.
     ESP_ERROR_CHECK(display_init());
 
     // LVGL on top. The navy clear drawn by display_init() above is immediately
@@ -136,7 +132,7 @@ void app_main(void) {
     // get a "display is alive" signal even if LVGL itself fails to start.
     ESP_ERROR_CHECK(ui_init());
 
-    // CST328 touch → LVGL pointer input. Must come after ui_init() because
+    // GT911 touch → LVGL pointer input. Must come after ui_init() because
     // it binds to lv_display_get_default().
     ESP_ERROR_CHECK(touch_init());
 
@@ -176,23 +172,19 @@ void app_main(void) {
         ESP_LOGW(TAG, "voice_begin failed; continuing muted");
     }
 
-    // Mic capture for push-to-talk. Must run AFTER voice_begin since it
-    // shares the I2S RX channel + data_if created there. Failure is
-    // non-fatal — long-press just becomes a no-op.
+    // Mic capture for push-to-talk. Must run AFTER voice_begin since both
+    // codecs share the BSP-managed I2S port. Failure is non-fatal — the
+    // long-press handler on the creature face just becomes a no-op.
     if (mic_init() != ESP_OK) {
         ESP_LOGW(TAG, "mic_init failed; push-to-talk disabled");
     }
-
-    // No IMU on BOX-3B. Shake-to-talk is gone; M4 will replace it with
-    // push-to-talk on the BOOT button once mic capture lands in M3.
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the
     // wallet just decodes the static key, and price_begin() is a no-op.
     // Refreshes only attempt network traffic when wifi_sta_is_connected().
     wallet_begin();
     // React when incoming SOL / USDC / SPL crosses the announcement
-    // threshold. Chains into ui_deliver_reply, which silently no-ops on
-    // voice_speak until the M3 codec lands.
+    // threshold. Chains into ui_deliver_reply (subtitle + TTS).
     wallet_set_incoming_cb(on_wallet_incoming);
     price_begin();
     if (wifi_err == ESP_OK) {
@@ -220,9 +212,8 @@ void app_main(void) {
         }
     }
 
-    // Boot greeting. ai/voice path is back online; voice_speak no-ops
-    // silently until M3 lands the codec, but the subtitle still shows
-    // and the chat pipeline gets exercised on every cold boot.
+    // Boot greeting — exercises the full chat pipeline (subtitle + TTS) on
+    // every cold boot so a regression on either side surfaces immediately.
     if (wifi_err == ESP_OK) {
         ui_deliver_reply("Hello, I am Daemon.");
     }

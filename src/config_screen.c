@@ -137,10 +137,10 @@ static void set_body_expanded(lv_obj_t *body, lv_obj_t *chev, bool expanded) {
     }
 }
 
-// Debounce repeat clicks — CST328 occasionally reports a press-release
-// flicker during a single hold, which made the accordion look like it
-// was opening and closing itself. 300 ms is well below human tap cadence
-// but above the jitter window.
+// Debounce repeat clicks — the touch IC occasionally reports a press-
+// release flicker during a single hold, which made the accordion look
+// like it was opening and closing itself. 300 ms is well below human tap
+// cadence but above the jitter window.
 #define CLICK_DEBOUNCE_MS 300
 static uint32_t s_last_click_ms = 0;
 

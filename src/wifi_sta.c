@@ -120,7 +120,7 @@ esp_err_t wifi_sta_connect(const char *ssid, const char *password,
     wifi_config_t wc = { 0 };
     strlcpy((char *)wc.sta.ssid,     ssid,                    sizeof(wc.sta.ssid));
     strlcpy((char *)wc.sta.password, password ? password : "", sizeof(wc.sta.password));
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   // accept any auth; Waveshare panel
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   // accept any auth
     wc.sta.pmf_cfg.capable    = true;             // boards we target all support PMF
 
     // On repeat calls (changing networks at runtime), drop the old assoc

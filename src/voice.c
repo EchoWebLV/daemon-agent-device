@@ -13,8 +13,8 @@
 //  bring-up is one BSP call. mic.c uses bsp_audio_codec_microphone_init
 //  in turn, with both codecs sharing the BSP-managed I2S port.
 //
-//  Public API (voice_begin / voice_speak / voice_stop / voice_is_speaking
-//  / voice_set_volume / voice_diagnose) is unchanged.
+//  Public API: voice_begin / voice_speak / voice_stop / voice_is_speaking
+//  / voice_set_volume.
 // ---------------------------------------------------------------------------
 #include "voice.h"
 #include "secrets.h"
@@ -361,37 +361,3 @@ void voice_set_volume(uint8_t v) {
     }
 }
 
-bool voice_diagnose(void) {
-    if (!has_eleven_key())        { ESP_LOGW(TAG, "diag: no key");  return false; }
-    if (!wifi_sta_is_connected()) { ESP_LOGW(TAG, "diag: no wifi"); return false; }
-    return true;
-}
-
-// Stub kept for backward compat — voice.h declared this for mic.c to share
-// the I2S data_if. With the BSP managing I2S, mic.c instead calls
-// bsp_audio_codec_microphone_init() directly, so this returns NULL and the
-// declaration could be removed in a follow-up.
-const audio_codec_data_if_t *voice_audio_data_if(void) {
-    return NULL;
-}
-
-bool voice_play_pcm(const int16_t *pcm, size_t frames) {
-    if (!s_codec || !pcm || frames == 0) return false;
-    if (codec_open_for_speak() != ESP_OK) return false;
-    size_t off = 0;
-    while (off < frames) {
-        size_t this_chunk = frames - off > CODEC_WRITE_FRAMES
-                            ? CODEC_WRITE_FRAMES : frames - off;
-        esp_err_t err = esp_codec_dev_write(s_codec, (void *)(pcm + off),
-                                            this_chunk * sizeof(int16_t));
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "loopback write err: %s", esp_err_to_name(err));
-            esp_codec_dev_close(s_codec);
-            return false;
-        }
-        off += this_chunk;
-    }
-    esp_codec_dev_close(s_codec);
-    ESP_LOGI(TAG, "loopback played %u frames", (unsigned)frames);
-    return true;
-}

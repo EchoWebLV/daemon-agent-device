@@ -122,8 +122,8 @@ static void install_swipe_handlers(void) {
 }
 
 // Dial the gesture threshold down from LVGL's default 50 px. 25 px is a
-// thumbnail-sized flick, still well above the CST328's sub-pixel rest
-// jitter. Velocity min stays at the default 3 px/sample so hand-jitter
+// thumbnail-sized flick, still well above sub-pixel rest jitter from the
+// touch IC. Velocity min stays at the default 3 px/sample so hand-jitter
 // doesn't register as phantom swipes. Call AFTER touch_init() so the
 // pointer indev exists.
 void ui_tune_gestures(void) {
