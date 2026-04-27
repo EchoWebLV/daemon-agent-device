@@ -433,17 +433,26 @@ static void speech_task(void *arg) {
     ui_set_subtitle(displayed);
     ESP_LOGI(TAG, "transcript surfaced: %s", transcript);
 
-    // Streaming path: ai_ask_streaming pipes sentences directly into
-    // voice_speak_chunk() as the LLM emits them, so audio starts ~600 ms
-    // after we get here instead of after the full 2-5 s reply finishes.
-    // The accumulated full reply lands in `reply` for the subtitle replace.
+    // Reverted to the buffered path so tools work uniformly across all
+    // providers. ai_ask_streaming only carries tool_calls for openai/*
+    // models; anthropic/* and shannon/* would either silently drop tools
+    // or hallucinate that they fired. The streaming infrastructure
+    // (build_chat_body_stream, stream_ctx_t with tool_calls accumulator,
+    // ai_ask_streaming itself) is left in ai.c — re-enable by switching
+    // the call below back, once the Anthropic stream route grows tool
+    // translation.
+    //
+    // char reply[1024] = {0};
+    // bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
+
     char reply[1024] = {0};
-    bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
+    bool ok = ai_ask(transcript, reply, sizeof(reply));
     if (ok && reply[0]) {
         ui_set_subtitle(reply);
+        voice_speak(reply);   // single-shot TTS — was implicit in streaming path
     } else if (reply[0]) {
-        // ai_ask_streaming wrote a human-readable error into reply on
-        // failure; show that instead of the user's transcript.
+        // ai_ask wrote a human-readable error into reply on failure;
+        // show that instead of the user's transcript.
         ui_set_subtitle(reply);
     }
     s_speech_in_flight = false;
