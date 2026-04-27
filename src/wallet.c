@@ -146,6 +146,58 @@ void wallet_rpc_url(char *out, size_t cap) {
     }
 }
 
+// Install a 32-byte (pubkey-only) or 64-byte (Phantom-style) seed into
+// the wallet's private state. Recomputes the pubkey, signing key (when
+// 64 bytes), and re-derives the device-USDC ATA so the chain bookkeeping
+// stays in sync. Used both by wallet_begin (seed from secrets.h) and by
+// the PIN unlock path.
+bool wallet_load_seed(const uint8_t *seed, size_t len) {
+    if (!seed) return false;
+    if (len != 32 && len != 64) {
+        ESP_LOGE(TAG, "wallet_load_seed: bad len %zu (want 32 or 64)", len);
+        return false;
+    }
+
+    memcpy(s_secret, seed, len);
+    s_secret_len = len;
+
+    const uint8_t *pub = (len == 64) ? (s_secret + 32) : s_secret;
+    memcpy(s_pubkey_bytes, pub, 32);
+
+    if (base58_encode(pub, 32, s_pubkey, sizeof(s_pubkey)) < 0) {
+        ESP_LOGE(TAG, "pubkey encode failed");
+        return false;
+    }
+
+    s_sign_ready = false;
+    if (s_secret_len == 64) {
+        uint8_t derived_pub[32];
+        ed25519_create_keypair(derived_pub, s_sign_priv, s_secret);
+        if (memcmp(derived_pub, s_pubkey_bytes, 32) == 0) {
+            s_sign_ready = true;
+        } else {
+            ESP_LOGW(TAG, "seed/pubkey mismatch — signing disabled");
+        }
+    }
+
+    // Re-derive the device's USDC ATA — depends on s_pubkey_bytes which
+    // we just rewrote. Vault PDAs are owner-derived and don't change.
+    if (s_owner_ok) {
+        uint8_t usdc_mint[32];
+        if (base58_decode(USDC_MINT, usdc_mint, 32) == 32 &&
+            agent_pda_derive_ata(s_pubkey_bytes, usdc_mint,
+                                 s_device_usdc_ata_bytes) >= 0)
+        {
+            base58_encode(s_device_usdc_ata_bytes, 32,
+                          s_device_usdc_ata_b58, sizeof s_device_usdc_ata_b58);
+        }
+    }
+    s_ok = true;
+    ESP_LOGI(TAG, "wallet seed loaded (%zu bytes, can_sign=%d, addr=%s)",
+             len, (int)wallet_can_sign(), s_pubkey);
+    return true;
+}
+
 bool wallet_begin(void) {
     const char *raw = SOLANA_KEY;
     if (!raw || !raw[0] || strncmp(raw, "PASTE-", 6) == 0) {

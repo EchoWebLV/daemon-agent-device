@@ -45,6 +45,7 @@
 #include "ai.h"
 #include "base58.h"
 #include "pin.h"
+#include "pin_screen.h"
 #include "refill.h"
 #include "solana_tx.h"
 #include "swap.h"
@@ -547,6 +548,60 @@ static void handle_pin_wipe(void) {
     else { char b[32]; snprintf(b, sizeof b, "pin err=%d", st); resp_err(b); }
 }
 
+// PIN_SCREEN — pop the keypad, log the entered PIN, dismiss. Lets us
+// verify the LVGL UI works without binding it to a real unlock yet.
+static void pin_screen_demo_cb(pin_screen_result_t r, const char *pin, void *user) {
+    (void)user;
+    if (r == PIN_SCR_CANCEL) {
+        ESP_LOGI(TAG, "pin_screen demo: cancelled");
+    } else {
+        ESP_LOGI(TAG, "pin_screen demo: entered %d-digit PIN", (int)strlen(pin));
+    }
+    pin_screen_close();
+}
+
+static void handle_pin_screen(void) {
+    pin_screen_open(4, 6, pin_screen_demo_cb, NULL);
+    resp_ok("screen opened");
+}
+
+// PIN_BOOT — full software boot path: open keypad → unlock with entered
+// PIN → install seed into wallet via wallet_load_seed. Demonstrates the
+// complete handoff from UI to crypto to wallet. Replaces secrets.h-driven
+// loading at boot once the LVGL screen lives in app_main.
+static void pin_boot_cb(pin_screen_result_t r, const char *pin, void *user) {
+    (void)user;
+    if (r == PIN_SCR_CANCEL) {
+        pin_screen_set_status("cancelled");
+        return;
+    }
+    uint8_t seed[PIN_MAX_SEED_LEN]; size_t seed_len = 0;
+    pin_status_t st = pin_unlock(pin, seed, sizeof seed, &seed_len);
+    if (st == PIN_ERR_BAD_PIN) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "wrong (%d left)", pin_attempts_remaining());
+        pin_screen_set_status(buf);
+        pin_screen_clear_input();
+        return;
+    }
+    if (st == PIN_ERR_WIPED)   { pin_screen_set_status("WIPED");   return; }
+    if (st == PIN_ERR_NOT_SET) { pin_screen_set_status("no pin");  return; }
+    if (st != PIN_OK)          { pin_screen_set_status("err");     return; }
+
+    bool ok = wallet_load_seed(seed, seed_len);
+    memset(seed, 0, sizeof seed);
+    if (!ok) {
+        pin_screen_set_status("wallet load failed");
+        return;
+    }
+    pin_screen_close();
+}
+
+static void handle_pin_boot(void) {
+    pin_screen_open(4, 6, pin_boot_cb, NULL);
+    resp_ok("boot screen opened");
+}
+
 // Force a refill from vault → device USDC ATA. Argv: micro-USDC amount.
 // Returns the resulting tx signature on success.
 static void handle_vault_refill(const char *args) {
@@ -730,11 +785,13 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- PIN STATUS / SETUP <pin> / UNLOCK <pin> / WIPE --- (Phase 2b)
+    // --- PIN STATUS / SETUP <pin> / UNLOCK <pin> / WIPE / SCREEN / BOOT
     if ((rest = match_token(after_test, "PIN"))) {
         const char *args;
         if (match_token(rest, "STATUS")) { handle_pin_status(); return; }
         if (match_token(rest, "WIPE"))   { handle_pin_wipe();   return; }
+        if (match_token(rest, "SCREEN")) { handle_pin_screen(); return; }
+        if (match_token(rest, "BOOT"))   { handle_pin_boot();   return; }
         if ((args = match_token(rest, "SETUP")))  { handle_pin_setup(args);  return; }
         if ((args = match_token(rest, "UNLOCK"))) { handle_pin_unlock(args); return; }
         resp_err("pin bad_subverb");

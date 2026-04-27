@@ -28,6 +28,17 @@ typedef struct {
 // address. Returns false if the key is missing or malformed.
 bool wallet_begin(void);
 
+// Install a fresh seed into the wallet at runtime. Used by the PIN
+// unlock path (pin.c) — after pin_unlock returns the decrypted seed
+// bytes, the caller passes them here and the wallet recomputes its
+// pubkey, signing key, and chain-derived PDAs. Same code path as
+// wallet_begin's seed-load step but driven by data rather than secrets.h.
+//
+// `seed` is 32 bytes (pubkey-only) or 64 bytes (Phantom-style seed||pub).
+// Caller is responsible for zeroing the input buffer after this call —
+// the wallet copies the bytes into its own state.
+bool wallet_load_seed(const uint8_t *seed, size_t len);
+
 // Base58 pubkey as a NUL-terminated string. "" if wallet_begin() failed.
 const char *wallet_pubkey(void);
 
