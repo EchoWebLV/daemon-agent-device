@@ -213,11 +213,17 @@ static void row_clicked(lv_event_t *e) {
 
 static void connect_clicked(lv_event_t *e) {
     (void)e;
+    ESP_LOGI(TAG, "connect_clicked: in_flight=%d ssid='%s'",
+             (int)s_connect_in_flight, s_pending_ssid);
     if (s_connect_in_flight) return;
     const char *pw = lv_textarea_get_text(s_pw_input);
     if (!pw) pw = "";
+    ESP_LOGI(TAG, "connect_clicked: pw_len=%u", (unsigned)strlen(pw));
     connect_args_t *a = calloc(1, sizeof(*a));
-    if (!a) return;
+    if (!a) {
+        ESP_LOGW(TAG, "connect_clicked: oom on connect_args_t");
+        return;
+    }
     strncpy(a->ssid, s_pending_ssid, sizeof(a->ssid) - 1);
     strncpy(a->password, pw, sizeof(a->password) - 1);
     s_connect_in_flight = true;
