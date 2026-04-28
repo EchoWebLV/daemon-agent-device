@@ -40,6 +40,8 @@ typedef struct {
 static const llm_endpoint_t LLM_ENDPOINTS[] = {
     { "openai/",    "https://daemon-x402s-seven.vercel.app/api/openai" },
     { "anthropic/", "https://daemon-x402s-seven.vercel.app/api/anthropic" },
+    { "grok/",      "https://daemon-x402s-seven.vercel.app/api/grok" },
+    { "xai/",       "https://daemon-x402s-seven.vercel.app/api/grok" },
     { "shannon/",   "https://daemon-x402s-seven.vercel.app/api/call" },
     { NULL,         "https://daemon-x402s-seven.vercel.app/api/anthropic" },
 };
