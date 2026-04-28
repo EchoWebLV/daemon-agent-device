@@ -37,7 +37,7 @@ static const catalog_item_t MODELS[] = {
     { "openai/gpt-4o-mini",           "GPT-4o Mini"        },
     { "openai/gpt-4o",                "GPT-4o"             },
     { "grok/grok-4.20-reasoning",     "Grok 4.20 Reasoning"},
-    { "grok/grok-4.1-fast",           "Grok 4.1 Fast"      },
+    { "grok/grok-4-fast-non-reasoning", "Grok 4 Fast"      },
     { "shannon/shannon-1.6-lite",     "Shannon 1.6 Lite"   },
 };
 
