@@ -830,7 +830,7 @@ bool ai_ask(const char *user, char *reply_out, size_t reply_cap) {
     bool ok = false;
     for (int round = 0; round < MAX_TOOL_ROUNDS; ++round) {
         int n = build_chat_body(body, CHAT_BODY_CAP, NULL, /*use_history=*/true,
-                                /*max_tokens=*/512, /*temperature=*/0.9,
+                                /*max_tokens=*/256, /*temperature=*/0.9,
                                 services, enabled, extra_msgs);
         if (n < 0) {
             strlcpy(reply_out, "My thoughts didn't fit.", reply_cap);
@@ -922,7 +922,7 @@ bool ai_ask_one_shot(const char *prompt, char *reply_out, size_t reply_cap) {
     // No tools on one-shots — the ambient wallet chatter doesn't need them
     // and it'd be surprising (+ paid) to trigger tool calls from idle ticks.
     int n = build_chat_body(body, CHAT_BODY_CAP, prompt, /*use_history=*/false,
-                            /*max_tokens=*/512, /*temperature=*/1.1,
+                            /*max_tokens=*/256, /*temperature=*/1.1,
                             /*services=*/NULL, /*enabled=*/NULL,
                             /*extra_msgs=*/NULL);
     bool ok = false;
@@ -1324,7 +1324,7 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
         stream_ctx_reset(ctx);
 
         int n = build_chat_body_stream(body, CHAT_BODY_CAP,
-                                       /*max_tokens=*/512,
+                                       /*max_tokens=*/256,
                                        /*temperature=*/0.9,
                                        services, enabled, extra_msgs);
         if (n < 0) {
