@@ -245,6 +245,45 @@ static void build_system_prompt(char *out, size_t cap,
         "For other errors, summarise the error_msg.\n");
 
     append_tool_listing(out, cap, services, enabled);
+
+    // Tool-call preamble protocol: the firmware speaks the tool's verdict
+    // string directly after the tool returns, skipping a second LLM round
+    // entirely. To keep the reply natural, the model writes a short
+    // preamble in the content field alongside the tool_calls — that
+    // preamble is what the user hears while the tool runs. Skipping the
+    // second LLM round saves ~2 s on every tool query.
+    size_t u = strlen(out);
+    if (u + 320 < cap) {
+        snprintf(out + u, cap - u,
+            "\nTOOL PREAMBLE PROTOCOL: when you emit tool_calls, ALSO write "
+            "a one-sentence preamble (under 12 words) in the content field. "
+            "The preamble is spoken aloud while the tool runs. Do NOT "
+            "include the answer — the firmware speaks the tool's verdict "
+            "field after. Example preambles: \"Checking fib for SOL on the "
+            "hour.\" / \"Pulling whale flow on that mint.\" / \"Reading "
+            "news on Solana.\"\n");
+    }
+}
+
+// If `tool_json` (a tool's response body, JSON) carries a top-level
+// "verdict" string field, copy it into `out` and return true. Used by the
+// tool-loop to short-circuit a follow-up LLM round when the tool already
+// supplies a speakable answer (all four daemon-x402 tools do). Returns
+// false on missing/empty verdict — the caller then falls through to the
+// normal LLM-#2 path.
+static bool extract_tool_verdict(const char *tool_json, char *out, size_t out_cap) {
+    if (!tool_json || !out || out_cap == 0) return false;
+    out[0] = '\0';
+    cJSON *j = cJSON_Parse(tool_json);
+    if (!j) return false;
+    cJSON *verdict = cJSON_GetObjectItem(j, "verdict");
+    bool ok = false;
+    if (cJSON_IsString(verdict) && verdict->valuestring && verdict->valuestring[0]) {
+        strlcpy(out, verdict->valuestring, out_cap);
+        ok = true;
+    }
+    cJSON_Delete(j);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -860,10 +899,25 @@ bool ai_ask(const char *user, char *reply_out, size_t reply_cap) {
                               cJSON_GetArraySize(tool_calls) > 0;
 
         if (has_tool_calls && round + 1 < MAX_TOOL_ROUNDS) {
-            // Keep the assistant's tool-call message in the next request's
-            // context — OpenAI requires the matching assistant.tool_calls
-            // to precede the tool-role replies.
-            cJSON_AddItemToArray(extra_msgs, cJSON_Duplicate(msg, true));
+            // Skip-LLM-2 fast path. If every tool returned a "verdict"
+            // string, we compose `preamble + verdicts` ourselves and exit
+            // the loop without spending a second LLM round on cosmetic
+            // prose. Falls back to the standard tool-loop if any tool
+            // doesn't supply a verdict (e.g. third-party x402 services
+            // that return raw data).
+            char preamble[256] = {0};
+            const cJSON *content_j = cJSON_GetObjectItem(msg, "content");
+            if (cJSON_IsString(content_j) && content_j->valuestring) {
+                strlcpy(preamble, content_j->valuestring, sizeof(preamble));
+            }
+
+            // Stage tool replies in a side array — only spliced into
+            // extra_msgs if we end up needing the LLM-#2 fallback.
+            cJSON *staged_tool_msgs = cJSON_CreateArray();
+            char  verdicts[768] = {0};
+            size_t verdicts_used = 0;
+            int    executed_count = 0;
+            bool   all_have_verdict = true;
 
             const cJSON *tc = NULL;
             cJSON_ArrayForEach(tc, tool_calls) {
@@ -871,22 +925,74 @@ bool ai_ask(const char *user, char *reply_out, size_t reply_cap) {
                 const cJSON *fn   = cJSON_GetObjectItem(tc, "function");
                 const cJSON *name = fn ? cJSON_GetObjectItem(fn, "name") : NULL;
                 const cJSON *args = fn ? cJSON_GetObjectItem(fn, "arguments") : NULL;
-                if (!cJSON_IsString(id_j) || !cJSON_IsString(name)) continue;
+                if (!cJSON_IsString(id_j) || !cJSON_IsString(name)) {
+                    all_have_verdict = false;
+                    continue;
+                }
 
                 char *tool_out = malloc(TOOL_RESPONSE_CAP);
-                if (!tool_out) continue;
+                if (!tool_out) {
+                    all_have_verdict = false;
+                    continue;
+                }
                 execute_tool(services, enabled, name->valuestring,
                              (cJSON_IsString(args) && args->valuestring)
                                  ? args->valuestring : NULL,
                              tool_out, TOOL_RESPONSE_CAP);
+                executed_count++;
 
+                // Stage the tool-role reply (used only if fallback fires).
                 cJSON *tool_msg = cJSON_CreateObject();
                 cJSON_AddStringToObject(tool_msg, "role",         "tool");
                 cJSON_AddStringToObject(tool_msg, "tool_call_id", id_j->valuestring);
                 cJSON_AddStringToObject(tool_msg, "content",      tool_out);
-                cJSON_AddItemToArray(extra_msgs, tool_msg);
+                cJSON_AddItemToArray(staged_tool_msgs, tool_msg);
+
+                // Try to pull a speakable verdict for the fast path.
+                char one_verdict[300] = {0};
+                if (extract_tool_verdict(tool_out, one_verdict, sizeof(one_verdict))) {
+                    if (verdicts_used > 0 && verdicts_used + 1 < sizeof(verdicts)) {
+                        verdicts[verdicts_used++] = ' ';
+                    }
+                    size_t avail = sizeof(verdicts) - verdicts_used;
+                    if (avail > 1) {
+                        strlcpy(verdicts + verdicts_used, one_verdict, avail);
+                        verdicts_used += strlen(verdicts + verdicts_used);
+                    }
+                } else {
+                    all_have_verdict = false;
+                }
                 free(tool_out);
             }
+
+            if (all_have_verdict && executed_count > 0 && verdicts[0]) {
+                // Fast path: skip LLM-#2 entirely. Glue preamble + verdicts.
+                // Sized to fit the worst case: full preamble (256) + space
+                // + full verdicts (768) + a safety margin. Compiler's
+                // -Wformat-truncation flags anything tighter.
+                char composed[1100];
+                if (preamble[0]) {
+                    snprintf(composed, sizeof(composed), "%s %s", preamble, verdicts);
+                } else {
+                    strlcpy(composed, verdicts, sizeof(composed));
+                }
+                ok = trim_to(composed, reply_out, reply_cap);
+                ESP_LOGI(TAG, "skip-LLM-2 path: %d tools, %u-byte verdict",
+                         executed_count, (unsigned)verdicts_used);
+                cJSON_Delete(staged_tool_msgs);
+                cJSON_Delete(msg);
+                break;
+            }
+
+            // Fallback: normal flow. Keep the assistant's tool-call
+            // message + the staged tool-role replies in extra_msgs and
+            // loop for LLM-#2 as before.
+            cJSON_AddItemToArray(extra_msgs, cJSON_Duplicate(msg, true));
+            cJSON *child = NULL;
+            while ((child = cJSON_DetachItemFromArray(staged_tool_msgs, 0)) != NULL) {
+                cJSON_AddItemToArray(extra_msgs, child);
+            }
+            cJSON_Delete(staged_tool_msgs);
             cJSON_Delete(msg);
             continue;
         }
@@ -1371,13 +1477,13 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
             break;
         }
 
-        // Tool round. Add the assistant message (with tool_calls) to
-        // extra_msgs — OpenAI requires assistant.tool_calls to precede
-        // the tool-role replies in the next request.
+        // Tool round. Stage the assistant tool-call message + each
+        // tool's reply on the side. Stay in fast-path territory if every
+        // tool returns a "verdict" string — we then speak the verdicts
+        // directly (preamble was already streamed as ctx->reply during
+        // the SSE flow) and exit without burning an LLM-#2 round.
         cJSON *asst = cJSON_CreateObject();
         cJSON_AddStringToObject(asst, "role", "assistant");
-        // Content can be a partial preamble ("let me check…"); include
-        // it so the next round has the same continuity the model expects.
         if (ctx->reply_len > 0) {
             cJSON_AddStringToObject(asst, "content", ctx->reply);
         } else {
@@ -1394,23 +1500,77 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
             cJSON_AddStringToObject(fn, "arguments", src->args[0] ? src->args : "{}");
             cJSON_AddItemToArray(tcs, tc);
         }
-        cJSON_AddItemToArray(extra_msgs, asst);
 
-        // Execute each tool and append its response.
+        cJSON  *staged_tool_msgs = cJSON_CreateArray();
+        char    verdicts[768] = {0};
+        size_t  verdicts_used = 0;
+        int     executed_count = 0;
+        bool    all_have_verdict = true;
+
         for (int i = 0; i < ctx->tool_call_count; ++i) {
             stream_tc_t *src = &ctx->tool_calls[i];
             char *tool_out = malloc(TOOL_RESPONSE_CAP);
-            if (!tool_out) continue;
+            if (!tool_out) {
+                all_have_verdict = false;
+                continue;
+            }
             execute_tool(services, enabled, src->name,
                          src->args[0] ? src->args : NULL,
                          tool_out, TOOL_RESPONSE_CAP);
+            executed_count++;
+
             cJSON *tool_msg = cJSON_CreateObject();
             cJSON_AddStringToObject(tool_msg, "role",         "tool");
             cJSON_AddStringToObject(tool_msg, "tool_call_id", src->id);
             cJSON_AddStringToObject(tool_msg, "content",      tool_out);
-            cJSON_AddItemToArray(extra_msgs, tool_msg);
+            cJSON_AddItemToArray(staged_tool_msgs, tool_msg);
+
+            char one_verdict[300] = {0};
+            if (extract_tool_verdict(tool_out, one_verdict, sizeof(one_verdict))) {
+                if (verdicts_used > 0 && verdicts_used + 1 < sizeof(verdicts)) {
+                    verdicts[verdicts_used++] = ' ';
+                }
+                size_t avail = sizeof(verdicts) - verdicts_used;
+                if (avail > 1) {
+                    strlcpy(verdicts + verdicts_used, one_verdict, avail);
+                    verdicts_used += strlen(verdicts + verdicts_used);
+                }
+            } else {
+                all_have_verdict = false;
+            }
             free(tool_out);
         }
+
+        if (all_have_verdict && executed_count > 0 && verdicts[0]) {
+            // Speak the verdicts now — preamble (ctx->reply) was already
+            // played sentence-by-sentence during the streaming round.
+            voice_speak_chunk(verdicts);
+
+            // Sized to fit ctx->reply (potentially full streamed preamble)
+            // + verdicts. Compiler's -Wformat-truncation flags anything
+            // tighter than the worst-case sum.
+            char composed[2048];
+            if (ctx->reply_len > 0) {
+                snprintf(composed, sizeof(composed), "%s %s", ctx->reply, verdicts);
+            } else {
+                strlcpy(composed, verdicts, sizeof(composed));
+            }
+            ok = trim_to(composed, reply_out, reply_cap);
+            ESP_LOGI(TAG, "skip-LLM-2 (stream): %d tools, %u-byte verdict",
+                     executed_count, (unsigned)verdicts_used);
+            cJSON_Delete(asst);
+            cJSON_Delete(staged_tool_msgs);
+            break;
+        }
+
+        // Fallback: standard flow. Splice the assistant tool-call message
+        // and each staged tool reply into extra_msgs and loop for LLM-#2.
+        cJSON_AddItemToArray(extra_msgs, asst);
+        cJSON *child = NULL;
+        while ((child = cJSON_DetachItemFromArray(staged_tool_msgs, 0)) != NULL) {
+            cJSON_AddItemToArray(extra_msgs, child);
+        }
+        cJSON_Delete(staged_tool_msgs);
         // Loop — next round's stream will incorporate the tool results.
     }
 
