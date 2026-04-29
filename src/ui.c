@@ -416,7 +416,16 @@ void ui_tick(void) {
             // Wipe the subtitle so the face returns to a clean idle state
             // once the audio has drained. Keeping the reply on-screen past
             // the spoken line makes the face feel "stuck".
-            creature_screen_set_subtitle("");
+            //
+            // Skip the wipe while speech_task is mid-query — otherwise the
+            // filler word ("Hmm.", "Let me see.") finishing audio would
+            // wipe the user's transcript that STT just put on screen.
+            // Once speech_task ends (post-reply), the next true→false
+            // transition is the actual reply audio draining, and the
+            // wipe fires correctly.
+            if (!creature_screen_is_speech_in_flight()) {
+                creature_screen_set_subtitle("");
+            }
         }
         last_speaking = speaking;
     }

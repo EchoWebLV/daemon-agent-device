@@ -74,6 +74,12 @@ void creature_screen_cycle(int delta);
 void creature_screen_ptt_start(void);
 void creature_screen_ptt_stop(void);
 
+// True while speech_task is processing a voice query (STT → LLM → TTS).
+// ui.c reads this in its tick handler so the post-speak subtitle wipe
+// doesn't fire mid-query (e.g. when the filler word "Hmm." finishes
+// playing after STT has already surfaced the user's transcript).
+bool creature_screen_is_speech_in_flight(void);
+
 #ifdef __cplusplus
 }
 #endif

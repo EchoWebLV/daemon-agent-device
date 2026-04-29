@@ -813,6 +813,10 @@ void creature_screen_ptt_stop(void) {
 
 lv_obj_t *creature_screen(void) { return s_scr; }
 
+bool creature_screen_is_speech_in_flight(void) {
+    return s_speech_in_flight;
+}
+
 void creature_screen_set_status(const char *s) {
     // Intentional no-op. USDC lives in the top-left slot now; IP moved
     // to the serial log. Kept so ui_set_status(ip) remains harmless.
