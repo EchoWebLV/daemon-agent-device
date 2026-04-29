@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -686,23 +687,33 @@ static void speech_task(void *arg) {
 
     // Streaming path: chat.ts:chatStream now emits OpenAI-shaped tool_calls
     // SSE for every provider (openai/anthropic/grok), so tools work
-    // uniformly across the matrix. The firmware-side stream_ctx_t
-    // accumulator in ai.c reassembles tool deltas and runs the same
-    // tool-loop the buffered path uses. The big win: each sentence boundary
-    // in the LLM reply triggers voice_speak_chunk immediately, so first
-    // audio plays ~1.5–2 s sooner than the buffered version (which waited
-    // for the whole reply, then synthesised the whole TTS, then started
-    // playback). Shannon (/api/call) doesn't speak streaming and is
-    // handled by ai_ask_streaming via a one-shot fallback.
+    // uniformly across the matrix. First audio plays ~1.5–2 s sooner than
+    // the buffered version because each sentence boundary triggers
+    // voice_speak_chunk as the model emits it.
+    //
+    // Exception: shannon/* doesn't have a `/stream` route on the bundle
+    // (Shannon's upstream API doesn't expose a streaming completion
+    // endpoint, and we never wrote a server-side fake-SSE wrapper for
+    // /api/call). Hitting /api/call/stream from the firmware returns 404.
+    // For shannon models we fall back to the buffered ai_ask + a single
+    // voice_speak — slower-feeling but functional.
+    const char *model = devcfg_llm_model();
+    bool is_shannon = model && strncasecmp(model, "shannon/", 8) == 0;
+
     char reply[1024] = {0};
-    bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
+    bool ok = is_shannon
+        ? ai_ask(transcript, reply, sizeof(reply))
+        : ai_ask_streaming(transcript, reply, sizeof(reply));
     if (ok && reply[0]) {
         ui_set_subtitle(reply);
-        // No voice_speak here — TTS already played sentence-by-sentence
-        // as the model streamed.
+        if (is_shannon) {
+            // Buffered path doesn't auto-speak — synthesise once here.
+            voice_speak(reply);
+        }
+        // Streaming path already played sentence-by-sentence; no voice_speak.
     } else if (reply[0]) {
-        // ai_ask_streaming wrote a human-readable error into reply on
-        // failure; show that instead of the user's transcript.
+        // The chat helper wrote a human-readable error; surface it instead
+        // of the user's transcript.
         ui_set_subtitle(reply);
     }
     s_speech_in_flight = false;
