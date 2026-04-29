@@ -13,6 +13,7 @@ idf_component_register(
         "buttons.c"
         "config_screen.c"
         "creature_screen.c"
+        "creatures_data.c"
         "devcfg.c"
         "display.c"
         "info_screen.c"
