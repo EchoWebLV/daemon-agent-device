@@ -24,6 +24,8 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "mbedtls/base64.h"
 
 #include "base58.h"
@@ -456,6 +458,104 @@ out:
 }
 
 // ---------------------------------------------------------------------------
+// Persistent handle cache (cross-call TLS reuse).
+//
+// Every x402 call used to esp_http_client_init() a fresh handle, perform
+// its 402-pay-retry dance, then esp_http_client_cleanup() and walk away.
+// That meant a cold TLS handshake (~600-900 ms on the BOX-3) every single
+// call to daemon-x402s-seven.vercel.app — even within the same voice
+// query, which fires 1-3 calls back-to-back.
+//
+// We now keep a single handle alive across calls, keyed by the URL's
+// host. Subsequent calls to the same host reuse the live socket via
+// esp_http_client_set_url(h, new_url) — TLS session stays warm, no
+// handshake. Different host triggers a graceful cleanup + re-init. On
+// any perform error we drop the handle so the next call reconnects
+// fresh (auto-recovery from a dropped socket).
+//
+// Concurrency: a single mutex serialises x402_call_internal on the
+// handle. The firmware fires one chat call at a time (speech_task is
+// single-threaded; price/wallet refresh tasks use their own paths via
+// esp_http_client direct, not this code). The mutex is a safety net
+// for any future code that calls x402_call from a second task.
+// ---------------------------------------------------------------------------
+static SemaphoreHandle_t        s_handle_mutex   = NULL;
+static esp_http_client_handle_t s_cached_handle  = NULL;
+static char                     s_cached_host[128] = {0};
+
+static void ensure_mutex_init(void) {
+    if (s_handle_mutex == NULL) {
+        s_handle_mutex = xSemaphoreCreateMutex();
+    }
+}
+
+// Parse the host out of "scheme://host[:port]/path?query#frag".
+// Returns "" on any malformed input — caller treats that as a forced
+// fresh init.
+static void extract_host(const char *url, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!url) return;
+    const char *p = strstr(url, "://");
+    if (!p) return;
+    p += 3;
+    const char *e = strpbrk(p, "/:?#");
+    size_t n = e ? (size_t)(e - p) : strlen(p);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+// Caller MUST hold s_handle_mutex.
+static void cleanup_cached_handle_locked(void) {
+    if (s_cached_handle) {
+        esp_http_client_cleanup(s_cached_handle);
+        s_cached_handle = NULL;
+        s_cached_host[0] = '\0';
+    }
+}
+
+// Caller MUST hold s_handle_mutex. Returns NULL on init failure.
+static esp_http_client_handle_t acquire_handle_locked(
+        const char *url, const esp_http_client_config_t *cfg) {
+    char host[sizeof(s_cached_host)];
+    extract_host(url, host, sizeof(host));
+
+    if (s_cached_handle && host[0] && strcmp(s_cached_host, host) == 0) {
+        // Same host — reuse the live socket. Just point at the new URL.
+        if (esp_http_client_set_url(s_cached_handle, url) == ESP_OK) {
+            return s_cached_handle;
+        }
+        // set_url failure means the handle is in a bad state — drop it.
+        ESP_LOGW(TAG, "set_url failed on cached handle, reinitialising");
+        cleanup_cached_handle_locked();
+    } else if (s_cached_handle) {
+        // Different host (or unparseable URL). Drop and re-init.
+        cleanup_cached_handle_locked();
+    }
+
+    s_cached_handle = esp_http_client_init(cfg);
+    if (s_cached_handle && host[0]) {
+        strlcpy(s_cached_host, host, sizeof(s_cached_host));
+    }
+    return s_cached_handle;
+}
+
+// Reset per-call state on a reused handle. Headers from the previous
+// call (especially PAYMENT-SIGNATURE) carry over unless explicitly
+// removed; same for the post body and the event-handler user data.
+// delete_header is a no-op if the header isn't present.
+static void reset_handle_for_call(esp_http_client_handle_t h,
+                                  esp_http_client_method_t method,
+                                  void *user_data) {
+    esp_http_client_set_method(h, method);
+    esp_http_client_set_user_data(h, user_data);
+    esp_http_client_delete_header(h, "PAYMENT-SIGNATURE");
+    esp_http_client_delete_header(h, "Authorization");
+    esp_http_client_delete_header(h, "Content-Type");
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point.
 // ---------------------------------------------------------------------------
 // Map an HTTP-method string to the esp_http_client enum. Unknown/NULL → POST
@@ -543,16 +643,17 @@ static void x402_call_internal(const char *method,
         .pr = pr, .xpr = xpr, .wa = wa,
     };
 
-    // One handle for both the 402 challenge AND the paid retry. ESP-IDF's
-    // esp_http_client keeps the TLS session open between performs by
-    // default (HTTP/1.1 keep-alive), so the second perform skips the
-    // handshake — saves ~800-1500 ms per chat turn vs the original
-    // init/cleanup-per-phase pattern.
+    // We acquire the cached handle (or init a fresh one) under the
+    // mutex, then keep it alive past the call so the next x402 call
+    // to the same host reuses the live socket. Cleanup only fires on
+    // perform errors (handle likely dead) or different-host first-use.
     //
-    // Buffer sizing: 8 KB rx fits the worst-case 4-5 KB payment-required
-    // header from the facilitator alongside content-type / auth /
-    // standard headers. 16 KB tx is sized for the paid retry: our
-    // base64(payment envelope) PAYMENT-SIGNATURE header can hit ~12 KB.
+    // Buffer sizing on cfg: 8 KB rx fits the worst-case 4-5 KB
+    // payment-required header from the facilitator alongside
+    // content-type / auth / standard headers. 16 KB tx is sized for
+    // the paid retry: our base64(payment envelope) PAYMENT-SIGNATURE
+    // header can hit ~12 KB. These are connection-level settings
+    // baked at init time; reuse keeps them.
     esp_http_client_config_t cfg = {
         .url               = url,
         .method            = http_method,
@@ -565,11 +666,25 @@ static void x402_call_internal(const char *method,
         .buffer_size_tx    = 16384,
         .keep_alive_enable = true,
     };
-    esp_http_client_handle_t h = esp_http_client_init(&cfg);
+
+    ensure_mutex_init();
+    if (!s_handle_mutex || xSemaphoreTake(s_handle_mutex, portMAX_DELAY) != pdTRUE) {
+        strlcpy(out->error, "mutex take", sizeof(out->error));
+        goto done;
+    }
+
+    esp_http_client_handle_t h = acquire_handle_locked(url, &cfg);
     if (!h) {
+        xSemaphoreGive(s_handle_mutex);
         strlcpy(out->error, "client init", sizeof(out->error));
         goto done;
     }
+    // Refresh per-call state on the (possibly reused) handle. URL was
+    // already updated inside acquire_handle_locked; method, user_data,
+    // and any headers that lingered from a previous call still need
+    // resetting so we don't leak a stale PAYMENT-SIGNATURE etc. Then
+    // set fresh content-type, auth, and post body for this call.
+    reset_handle_for_call(h, http_method, &state);
     if (has_body) esp_http_client_set_header(h, "Content-Type", "application/json");
     if (auth_bearer && auth_bearer[0]) {
         char hdr[160];
@@ -584,7 +699,10 @@ static void x402_call_internal(const char *method,
 
     if (err1 != ESP_OK) {
         snprintf(out->error, sizeof(out->error), "perform: %s", esp_err_to_name(err1));
-        esp_http_client_cleanup(h);
+        // Perform error — socket may be half-closed. Drop the handle so
+        // the next call reconnects fresh instead of inheriting a corpse.
+        cleanup_cached_handle_locked();
+        xSemaphoreGive(s_handle_mutex);
         goto done;
     }
 
@@ -596,7 +714,8 @@ static void x402_call_internal(const char *method,
             free(desc); free(b64);
             strlcpy(out->error, "oom", sizeof(out->error));
             out->status = 402;
-            esp_http_client_cleanup(h);
+            // OOM is local — handle is healthy, leave it cached.
+            xSemaphoreGive(s_handle_mutex);
             goto done;
         }
         bool have_desc = decode_payment_description(&state, desc, X402_DESC_CAP);
@@ -605,7 +724,7 @@ static void x402_call_internal(const char *method,
             strlcpy(out->error, "402 no description", sizeof(out->error));
             out->status = 402;
             free(desc); free(b64);
-            esp_http_client_cleanup(h);
+            xSemaphoreGive(s_handle_mutex);
             goto done;
         }
 
@@ -616,7 +735,7 @@ static void x402_call_internal(const char *method,
             strlcpy(out->error, "payment build failed", sizeof(out->error));
             out->status = 402;
             free(b64);
-            esp_http_client_cleanup(h);
+            xSemaphoreGive(s_handle_mutex);
             goto done;
         }
 
@@ -650,14 +769,19 @@ static void x402_call_internal(const char *method,
             // don't tag that as a network error.
             if (state.stream_aborted) strlcpy(out->error, "aborted", sizeof(out->error));
             else snprintf(out->error, sizeof(out->error), "retry: %s", esp_err_to_name(err2));
+            // Perform error during retry — drop the handle, same reasoning
+            // as phase 1's err1 path.
+            cleanup_cached_handle_locked();
         } else if (code2 == 200) {
             // Report the real USDC cost we committed to.
             out->cost_usd = (double)paid_atomic / 1e6;
             ESP_LOGI(TAG, "paid %.5f USDC", out->cost_usd);
         } else {
+            // Non-200 (e.g. 502 from upstream) is an app-level error,
+            // not a transport failure. Handle is fine, leave it alive.
             snprintf(out->error, sizeof(out->error), "retry status %d", code2);
         }
-        esp_http_client_cleanup(h);
+        xSemaphoreGive(s_handle_mutex);
         goto done;
     }
 
@@ -673,7 +797,8 @@ static void x402_call_internal(const char *method,
     if (streaming && code1 == 200 && phase1_buf && state.body_len > 0) {
         on_chunk(phase1_buf, state.body_len, cb_user);
     }
-    esp_http_client_cleanup(h);
+    // Handle stays cached for the next call.
+    xSemaphoreGive(s_handle_mutex);
 
 done:
     if (streaming && phase1_buf) free(phase1_buf);
