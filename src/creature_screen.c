@@ -27,6 +27,7 @@
 // ---------------------------------------------------------------------------
 #include "creature_screen.h"
 #include "screens_common.h"
+#include "devcfg.h"
 #include "mic.h"
 #include "stt.h"
 #include "ai.h"
@@ -112,6 +113,84 @@ static const int16_t k_smile[14][2] = {
 // --- mood + talking state --------------------------------------------------
 static creature_mood_t s_mood    = CREATURE_MOOD_IDLE;
 static bool            s_talking = false;
+
+// --- creature trait variants -----------------------------------------------
+// Three creatures, each a distinct combination of eye / mouth / brow traits.
+// Index 0 is the original Daemon — unchanged from before this feature
+// landed (round eyes, full smile, no brow). Sliding LEFT/RIGHT on the
+// creature screen cycles through them; the active index persists in NVS
+// via devcfg_creature_index.
+//
+// Adding a 4th creature:  bump CREATURE_COUNT in devcfg.c, append a row
+// here, and add coord rows to the eye / mouth / brow tables below.
+#define CREATURE_COUNT          3
+
+typedef enum { EYE_ROUND = 0, EYE_SLIT = 1, EYE_BIG = 2 } eye_variant_t;
+typedef enum { MOUTH_SMILE = 0, MOUTH_SMIRK = 1, MOUTH_OVAL = 2 } mouth_variant_t;
+typedef enum { BROW_NONE = 0, BROW_ANGRY = 1, BROW_RAISED = 2 } brow_variant_t;
+
+typedef struct {
+    eye_variant_t   eye;
+    mouth_variant_t mouth;
+    brow_variant_t  brow;
+} creature_traits_t;
+
+static const creature_traits_t CREATURES[CREATURE_COUNT] = {
+    /* 0 — Daemon (original): round eyes, full smile, no brow                */
+    { .eye = EYE_ROUND, .mouth = MOUTH_SMILE, .brow = BROW_NONE   },
+    /* 1 — slit eyes (laser-eye vibe), smirk, angry slanted brows            */
+    { .eye = EYE_SLIT,  .mouth = MOUTH_SMIRK, .brow = BROW_ANGRY  },
+    /* 2 — big eyes with pupils, flat oval mouth, raised arched brows        */
+    { .eye = EYE_BIG,   .mouth = MOUTH_OVAL,  .brow = BROW_RAISED },
+};
+
+// Active variant — initialised from NVS in init(), updated by cycle().
+static int s_creature_idx = 0;
+
+// Eye geometry for the active variant. Set by apply_eye_variant() and
+// read by blink_paint() so blinks shrink to the right shape regardless of
+// which creature is wearing them.
+static int16_t s_eye_open_w  = EYE_W;
+static int16_t s_eye_open_h  = EYE_H;
+static int16_t s_eye_open_y  = EYE_Y + FACE_Y_OFFSET;
+static int16_t s_eye_l_x     = EYE_L_X;
+static int16_t s_eye_r_x     = EYE_R_X;
+
+// Variant-only widgets, all created in init() and shown/hidden as the
+// active creature changes. Brow blocks are kept around the whole time
+// and just repositioned per brow variant — saves churning widgets.
+static lv_obj_t *s_pupil_l        = NULL;
+static lv_obj_t *s_pupil_r        = NULL;
+#define OVAL_BLOCK_COUNT  10
+static lv_obj_t *s_oval[OVAL_BLOCK_COUNT] = {0};
+#define BROW_BLOCKS_PER_SIDE  3
+static lv_obj_t *s_brow_l[BROW_BLOCKS_PER_SIDE] = {0};
+static lv_obj_t *s_brow_r[BROW_BLOCKS_PER_SIDE] = {0};
+
+// Geometry tables for variant-only blocks. All coordinates use
+// FACE_Y_OFFSET like the rest of the face so the whole creature shifts
+// together if we ever re-centre.
+static const int16_t k_oval[OVAL_BLOCK_COUNT][2] = {
+    // top row of the oval
+    {130, 155}, {140, 155}, {150, 155}, {160, 155},
+    // sides — narrower than the top/bottom for the rounded silhouette
+    {120, 165}, {170, 165},
+    // bottom row of the oval
+    {130, 175}, {140, 175}, {150, 175}, {160, 175},
+};
+
+// 3 blocks per brow side. Y values per variant; X stays the same so the
+// brows sit directly above each eye column (left eye spans X 115..145,
+// right eye spans X 175..205, both 30 wide in ROUND).
+static const int16_t k_brow_x_l[BROW_BLOCKS_PER_SIDE] = {115, 125, 135};
+static const int16_t k_brow_x_r[BROW_BLOCKS_PER_SIDE] = {175, 185, 195};
+
+// ANGRY: outer-end UP, inner-end DOWN — slants point toward the nose.
+static const int16_t k_brow_y_angry_l[BROW_BLOCKS_PER_SIDE]  = {45, 50, 55};
+static const int16_t k_brow_y_angry_r[BROW_BLOCKS_PER_SIDE]  = {55, 50, 45};
+// RAISED: arch shape — sides low, middle high.
+static const int16_t k_brow_y_raised_l[BROW_BLOCKS_PER_SIDE] = {55, 45, 55};
+static const int16_t k_brow_y_raised_r[BROW_BLOCKS_PER_SIDE] = {55, 45, 55};
 
 // --- talking mouth: sprite frames ------------------------------------------
 // Three visually distinct sprites — each row-major within a 6×3 bounding box
@@ -245,22 +324,171 @@ static void set_smile_visible(bool visible) {
 
 // --- blink painters --------------------------------------------------------
 
-// Resize + reposition each eye so a "closed" eye renders as a 10-px slit
+// Resize + reposition each eye so a "closed" eye renders as a thin slit
 // at the bottom edge of where the open eye was. Snapping between the two
-// extremes (no tweening) keeps the motion feeling pixel-art.
+// extremes (no tweening) keeps the motion feeling pixel-art. Geometry
+// tracked in s_eye_open_* so blinks adapt to whichever variant is active.
 static void blink_paint(uint8_t eyes) {
-    int16_t open_y   = EYE_Y + FACE_Y_OFFSET;
-    int16_t closed_y = EYE_Y + FACE_Y_OFFSET + EYE_H - PX;
+    int16_t open_y   = s_eye_open_y;
+    int16_t closed_y = s_eye_open_y + s_eye_open_h - PX;
     bool lc = (eyes & EYE_CLOSED_L) != 0;
     bool rc = (eyes & EYE_CLOSED_R) != 0;
     if (s_eye_l) {
-        lv_obj_set_size(s_eye_l, EYE_W, lc ? PX : EYE_H);
-        lv_obj_set_pos (s_eye_l, EYE_L_X, lc ? closed_y : open_y);
+        lv_obj_set_size(s_eye_l, s_eye_open_w, lc ? PX : s_eye_open_h);
+        lv_obj_set_pos (s_eye_l, s_eye_l_x,    lc ? closed_y : open_y);
     }
     if (s_eye_r) {
-        lv_obj_set_size(s_eye_r, EYE_W, rc ? PX : EYE_H);
-        lv_obj_set_pos (s_eye_r, EYE_R_X, rc ? closed_y : open_y);
+        lv_obj_set_size(s_eye_r, s_eye_open_w, rc ? PX : s_eye_open_h);
+        lv_obj_set_pos (s_eye_r, s_eye_r_x,    rc ? closed_y : open_y);
     }
+    // Pupils ride on top of the eyes — hide them when the eye is closed
+    // so the slit doesn't show a stray dot.
+    if (s_pupil_l) {
+        if (lc) lv_obj_add_flag   (s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_remove_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_pupil_r) {
+        if (rc) lv_obj_add_flag   (s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_remove_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// --- variant appliers ------------------------------------------------------
+//
+// Each takes the variant index and reshapes the relevant face widgets in
+// place. Caller holds lvgl_port_lock. None allocate or free widgets — all
+// variant geometry is achieved by resize + reposition + visibility flags
+// on widgets created up front in init().
+
+static bool s_pupils_present = false;  // tracks whether pupils should show
+
+static void apply_eye_variant(eye_variant_t v) {
+    switch (v) {
+    case EYE_ROUND:
+    default:
+        s_eye_open_w = EYE_W;
+        s_eye_open_h = EYE_H;
+        s_eye_open_y = EYE_Y + FACE_Y_OFFSET;
+        s_eye_l_x    = EYE_L_X;
+        s_eye_r_x    = EYE_R_X;
+        s_pupils_present = false;
+        break;
+    case EYE_SLIT:
+        // Wide horizontal slit — 40 wide × 10 tall, centred vertically in
+        // the original eye box (Y 70..100 → centred Y 80, height 10).
+        s_eye_open_w = 40;
+        s_eye_open_h = 10;
+        s_eye_open_y = 80 + FACE_Y_OFFSET;
+        s_eye_l_x    = 110;
+        s_eye_r_x    = 170;
+        s_pupils_present = false;
+        break;
+    case EYE_BIG:
+        // 40×40 outer with a 12×12 pupil rendered in the BG colour so it
+        // reads as a hole. Outer slightly overshoots the original eye box
+        // to look distinctly "bigger" without crowding the brow row.
+        s_eye_open_w = 40;
+        s_eye_open_h = 40;
+        s_eye_open_y = 65 + FACE_Y_OFFSET;
+        s_eye_l_x    = 110;
+        s_eye_r_x    = 170;
+        s_pupils_present = true;
+        break;
+    }
+    // Reset to the open state regardless of where the blink machine left us.
+    blink_paint(0);
+    if (s_pupil_l) {
+        if (s_pupils_present) {
+            // Pupil 12×12 centred in the 40×40 outer.
+            lv_obj_set_size(s_pupil_l, 12, 12);
+            lv_obj_set_pos (s_pupil_l, s_eye_l_x + (s_eye_open_w - 12) / 2,
+                                       s_eye_open_y + (s_eye_open_h - 12) / 2);
+            lv_obj_remove_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_pupil_r) {
+        if (s_pupils_present) {
+            lv_obj_set_size(s_pupil_r, 12, 12);
+            lv_obj_set_pos (s_pupil_r, s_eye_r_x + (s_eye_open_w - 12) / 2,
+                                       s_eye_open_y + (s_eye_open_h - 12) / 2);
+            lv_obj_remove_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void apply_mouth_variant(mouth_variant_t v) {
+    // While talking, the static mouth is hidden anyway and the talking
+    // sprite owns the display. We still apply visibility flags so the
+    // right blocks come back when set_talking(false) flips s_smile back on.
+    bool show_smile_left_tip   = (v == MOUTH_SMILE) || (v == MOUTH_SMIRK);
+    bool show_smile_right_tip  = (v == MOUTH_SMILE);
+    bool show_smile_left_sh    = (v == MOUTH_SMILE) || (v == MOUTH_SMIRK);
+    bool show_smile_right_sh   = (v == MOUTH_SMILE);
+    bool show_smile_arc        = (v == MOUTH_SMILE) || (v == MOUTH_SMIRK);
+    bool show_oval             = (v == MOUTH_OVAL);
+
+    // s_smile layout (matches k_smile order):
+    //   [0] left tip,  [1] right tip
+    //   [2] left shoulder, [3] right shoulder
+    //   [4..13] base arc (10 blocks across the bottom)
+    static const struct { int idx; bool *flag; } smile_map[14] = {0};  // unused, kept as docs
+    (void)smile_map;
+    if (s_smile[0])  { if (show_smile_left_tip)  lv_obj_remove_flag(s_smile[0],  LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_smile[0],  LV_OBJ_FLAG_HIDDEN); }
+    if (s_smile[1])  { if (show_smile_right_tip) lv_obj_remove_flag(s_smile[1],  LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_smile[1],  LV_OBJ_FLAG_HIDDEN); }
+    if (s_smile[2])  { if (show_smile_left_sh)   lv_obj_remove_flag(s_smile[2],  LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_smile[2],  LV_OBJ_FLAG_HIDDEN); }
+    if (s_smile[3])  { if (show_smile_right_sh)  lv_obj_remove_flag(s_smile[3],  LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_smile[3],  LV_OBJ_FLAG_HIDDEN); }
+    for (int i = 4; i < 14; i++) {
+        if (!s_smile[i]) continue;
+        if (show_smile_arc) lv_obj_remove_flag(s_smile[i], LV_OBJ_FLAG_HIDDEN);
+        else                lv_obj_add_flag   (s_smile[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < OVAL_BLOCK_COUNT; i++) {
+        if (!s_oval[i]) continue;
+        if (show_oval) lv_obj_remove_flag(s_oval[i], LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag   (s_oval[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void apply_brow_variant(brow_variant_t v) {
+    bool visible = (v != BROW_NONE);
+    const int16_t *yl = NULL;
+    const int16_t *yr = NULL;
+    switch (v) {
+    case BROW_ANGRY:  yl = k_brow_y_angry_l;  yr = k_brow_y_angry_r;  break;
+    case BROW_RAISED: yl = k_brow_y_raised_l; yr = k_brow_y_raised_r; break;
+    case BROW_NONE:
+    default: break;
+    }
+    for (int i = 0; i < BROW_BLOCKS_PER_SIDE; i++) {
+        if (s_brow_l[i]) {
+            if (visible) {
+                lv_obj_set_pos(s_brow_l[i], k_brow_x_l[i], yl[i] + FACE_Y_OFFSET);
+                lv_obj_remove_flag(s_brow_l[i], LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(s_brow_l[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (s_brow_r[i]) {
+            if (visible) {
+                lv_obj_set_pos(s_brow_r[i], k_brow_x_r[i], yr[i] + FACE_Y_OFFSET);
+                lv_obj_remove_flag(s_brow_r[i], LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(s_brow_r[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+}
+
+static void apply_creature_traits(int idx) {
+    if (idx < 0 || idx >= CREATURE_COUNT) idx = 0;
+    s_creature_idx = idx;
+    apply_eye_variant  (CREATURES[idx].eye);
+    apply_mouth_variant(CREATURES[idx].mouth);
+    apply_brow_variant (CREATURES[idx].brow);
 }
 
 static uint32_t blink_wait_ms(void) {
@@ -361,6 +589,42 @@ bool creature_screen_init(void) {
 
     s_mouth_timer = lv_timer_create(mouth_timer_cb, MOUTH_FRAME_MS, NULL);
     lv_timer_pause(s_mouth_timer);
+
+    // --- variant-only widgets: pupils, oval mouth, brows ------------------
+    // All hidden by default — apply_creature_traits() at the end of init
+    // will reveal whichever set the active creature wears.
+
+    // Pupils: BG-coloured 12×12 squares that ride inside the EYE_BIG outer
+    // block to look like "hole in the eye". Created as siblings of the
+    // eyes (rather than children) so resize/repositioning by the variant
+    // appliers stays straightforward.
+    s_pupil_l = make_block(s_scr, 0, 0, 12, 12, SCR_COLOR_BG);
+    s_pupil_r = make_block(s_scr, 0, 0, 12, 12, SCR_COLOR_BG);
+    lv_obj_add_flag(s_pupil_l, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_pupil_r, LV_OBJ_FLAG_HIDDEN);
+
+    // Oval mouth blocks — only visible for MOUTH_OVAL.
+    for (int i = 0; i < OVAL_BLOCK_COUNT; i++) {
+        s_oval[i] = make_block(s_scr, k_oval[i][0],
+                                      k_oval[i][1] + FACE_Y_OFFSET,
+                                      PX, PX, face);
+        lv_obj_add_flag(s_oval[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Brow blocks — 3 per side, positioned by apply_brow_variant().
+    // Created at (0, 0) here; their real positions land when the active
+    // variant is applied below.
+    for (int i = 0; i < BROW_BLOCKS_PER_SIDE; i++) {
+        s_brow_l[i] = make_block(s_scr, 0, 0, PX, PX, face);
+        s_brow_r[i] = make_block(s_scr, 0, 0, PX, PX, face);
+        lv_obj_add_flag(s_brow_l[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_brow_r[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Apply whichever creature was selected last boot. devcfg loaded the
+    // index from NVS; default 0 = original Daemon, so first-boot behaviour
+    // is unchanged.
+    apply_creature_traits((int)devcfg_creature_index());
 
     // --- blink timer: idle-wait until first blink, then state machine ----
     s_blink_timer = lv_timer_create(blink_timer_cb, blink_wait_ms(), NULL);
@@ -629,7 +893,31 @@ void creature_screen_set_mood(creature_mood_t m) {
                 lv_obj_set_style_bg_color(s_mouth_grid[r][c], col, LV_PART_MAIN);
         }
     }
+    for (int i = 0; i < OVAL_BLOCK_COUNT; i++) {
+        if (s_oval[i]) lv_obj_set_style_bg_color(s_oval[i], col, LV_PART_MAIN);
+    }
+    for (int i = 0; i < BROW_BLOCKS_PER_SIDE; i++) {
+        if (s_brow_l[i]) lv_obj_set_style_bg_color(s_brow_l[i], col, LV_PART_MAIN);
+        if (s_brow_r[i]) lv_obj_set_style_bg_color(s_brow_r[i], col, LV_PART_MAIN);
+    }
+    // Pupils intentionally NOT recoloured — they stay BG-coloured so the
+    // EYE_BIG variant keeps its "hole" silhouette regardless of mood.
     lvgl_port_unlock();
+}
+
+void creature_screen_cycle(int delta) {
+    if (!s_scr) return;
+    int next = ((int)devcfg_creature_index() + delta) % CREATURE_COUNT;
+    if (next < 0) next += CREATURE_COUNT;
+    devcfg_set_creature_index((uint8_t)next);
+    if (!lvgl_port_lock(0)) return;
+    apply_creature_traits(next);
+    // Re-apply mood so the freshly-shown variant widgets pick up the
+    // current colour instead of the seed `face` colour from init().
+    creature_mood_t m = s_mood;
+    s_mood = (creature_mood_t)-1;
+    lvgl_port_unlock();
+    creature_screen_set_mood(m);
 }
 
 void creature_screen_set_talking(bool on) {

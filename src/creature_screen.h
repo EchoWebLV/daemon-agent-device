@@ -59,6 +59,13 @@ void creature_screen_tick(void);
 // flight. Safe from any task — takes the lvgl_port lock internally.
 void creature_screen_shake(void);
 
+// Cycle the active creature variant by `delta` (typically +1 or -1). The
+// new index is stored in NVS via devcfg, the face is reshaped to the
+// variant's eye / mouth / brow trait combo, and the current mood colour
+// is re-applied so freshly-shown widgets don't flash white. Wraps around
+// modulo CREATURE_COUNT.
+void creature_screen_cycle(int delta);
+
 #ifdef __cplusplus
 }
 #endif

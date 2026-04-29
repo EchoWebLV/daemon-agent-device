@@ -37,6 +37,11 @@ static const char *TAG = "devcfg";
 #define KEY_PERSONALITY     "persona"
 #define KEY_SVC_CUSTOM      "svc_custom"
 #define KEY_SVC_ENABLED     "svc_enabled"
+#define KEY_CREATURE        "creature"
+
+// Number of creature variants the home screen knows how to render. Bump
+// this in lockstep with the trait tables in creature_screen.c.
+#define CREATURE_COUNT      3
 
 // ---- Built-in default services ---------------------------------------------
 // Four x402 endpoints hosted on the Daemon's own seller (daemon-x402s-seven
@@ -147,6 +152,7 @@ static char    s_voice_id[VOICE_ID_MAX];
 static char    s_personality[PERSONALITY_MAX];
 static char    s_svc_custom[SVC_CUSTOM_MAX];
 static char    s_svc_enabled[SVC_ENABLED_MAX];
+static uint8_t s_creature_idx = 0;
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -244,6 +250,8 @@ esp_err_t devcfg_init(void) {
     load_str (h, KEY_PERSONALITY,   s_personality, sizeof(s_personality));
     load_str (h, KEY_SVC_CUSTOM,    s_svc_custom,  sizeof(s_svc_custom));
     load_str (h, KEY_SVC_ENABLED,   s_svc_enabled, sizeof(s_svc_enabled));
+    load_u8  (h, KEY_CREATURE,      &s_creature_idx, 0);
+    if (s_creature_idx >= CREATURE_COUNT) s_creature_idx = 0;
 
     if (h != 0) nvs_close(h);
 
@@ -394,4 +402,16 @@ void devcfg_set_services_enabled(const char *json) {
     }
     strlcpy(s_svc_enabled, json, sizeof(s_svc_enabled));
     save_str(KEY_SVC_ENABLED, s_svc_enabled);
+}
+
+uint8_t devcfg_creature_index(void) {
+    return s_creature_idx;
+}
+
+void devcfg_set_creature_index(uint8_t idx) {
+    if (idx >= CREATURE_COUNT) idx = 0;
+    if (idx == s_creature_idx) return;
+    s_creature_idx = idx;
+    save_u8(KEY_CREATURE, idx);
+    ESP_LOGI(TAG, "creature index → %u", (unsigned)idx);
 }

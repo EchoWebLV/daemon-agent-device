@@ -78,6 +78,14 @@ void        devcfg_set_custom_services(const char *json);
 const char *devcfg_services_enabled(void);
 void        devcfg_set_services_enabled(const char *json);
 
+// Active creature variant index, 0..2. The home-screen face renders one of
+// three trait combinations (eye / mouth / brow); swiping LEFT or RIGHT on
+// the creature screen cycles through them and persists the choice here.
+// 0 = the original Daemon (round eyes, smile, no brow); subsequent indices
+// add trait variants. Out-of-range writes are clamped to 0.
+uint8_t devcfg_creature_index(void);
+void    devcfg_set_creature_index(uint8_t idx);
+
 #ifdef __cplusplus
 }
 #endif

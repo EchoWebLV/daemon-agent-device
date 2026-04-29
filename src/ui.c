@@ -71,8 +71,10 @@ static void on_gesture_creature(lv_event_t *e) {
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
     lv_indev_wait_release(lv_indev_active());
     switch (d) {
-        case LV_DIR_TOP:    ui_show_menu();     break;  // swipe up
-        case LV_DIR_BOTTOM: ui_show_settings(); break;  // swipe down
+        case LV_DIR_TOP:    ui_show_menu();             break;  // swipe up
+        case LV_DIR_BOTTOM: ui_show_settings();         break;  // swipe down
+        case LV_DIR_LEFT:   creature_screen_cycle(+1);  break;  // next variant
+        case LV_DIR_RIGHT:  creature_screen_cycle(-1);  break;  // previous variant
         default: break;
     }
 }
