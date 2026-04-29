@@ -40,9 +40,9 @@ static const char *TAG = "devcfg";
 #define KEY_CREATURE        "creature"
 #define KEY_THEME           "theme"
 
-// Number of creature variants the home screen knows how to render. Bump
-// this in lockstep with the trait tables in creature_screen.c.
-#define CREATURE_COUNT      3
+// Number of creatures the home screen knows how to render. Must match
+// CREATURE_DATA_COUNT in creatures_data.h.
+#define CREATURE_COUNT      6
 
 // ---- Built-in default services ---------------------------------------------
 // Four x402 endpoints hosted on the Daemon's own seller (daemon-x402s-seven
