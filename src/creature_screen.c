@@ -666,6 +666,29 @@ static void speech_task(void *arg) {
     frames = s_speech_frames;
     s_speech_frames = 0;
 
+    // Filler word, ~50% of the time, fired in parallel with STT.
+    // voice_speak() enqueues onto the audio task's queue and returns
+    // immediately; the ElevenLabs HTTP fetch runs on the audio task while
+    // we upload PCM to /v1/audio/transcriptions on this task. By the time
+    // the user hears the filler (~700 ms after the dispatch when TLS is
+    // cold, ~150 ms when warm), STT is already in flight, so the filler
+    // genuinely covers what would otherwise be dead air. The actual reply
+    // queues behind the filler and plays when ready.
+    static const char *const FILLERS[] = {
+        "Hmm.",
+        "Let me see.",
+        "Hmm, let me check.",
+        "Alright.",
+        "Okay, one sec.",
+        "Give me a moment.",
+        "Hmm, thinking.",
+        "Let me think about that.",
+    };
+    if ((esp_random() & 1u) == 0u) {
+        uint32_t idx = esp_random() % (sizeof(FILLERS) / sizeof(FILLERS[0]));
+        voice_speak(FILLERS[idx]);
+    }
+
     char transcript[512] = {0};
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
     mic_buffer_free(pcm);
