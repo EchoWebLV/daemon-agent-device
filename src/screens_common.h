@@ -20,19 +20,38 @@ extern "C" {
 #define SCR_H            240
 #define STATUS_BAR_H      26
 
-// Palette — pixel-art CRT green on pure black. The creature face is
-// rendered as chunky square blocks for that analogue/Game Boy feel, so
-// the rest of the UI follows suit: no anti-aliased gradients, just
-// bright green text/chrome on black.
-#define SCR_COLOR_BG         lv_color_hex(0x000000)   // pure black
-#define SCR_COLOR_PANEL      lv_color_hex(0x041A08)   // very dark green (cards)
-#define SCR_COLOR_ACCENT     lv_color_hex(0x2BFF4A)   // CRT green
-#define SCR_COLOR_ACCENT_HI  lv_color_hex(0x66FF80)   // brighter green (highlights)
-#define SCR_COLOR_TEXT       lv_color_hex(0x2BFF4A)   // same green for text
-#define SCR_COLOR_DIM        lv_color_hex(0x0D5A1A)   // dim green (placeholders)
-#define SCR_COLOR_DIVIDER    lv_color_hex(0x0A3311)   // dark green divider
-#define SCR_COLOR_GOOD       lv_color_hex(0x66FF80)   // bright green
-#define SCR_COLOR_WARN       lv_color_hex(0xFFB84D)   // warning amber (unchanged)
+// Palette — pixel-art CRT green on pure black by default; flipped to
+// black-on-white when the user toggles the light theme. Each colour is
+// a runtime variable (not a #define literal) so theme switching works
+// without touching every call site. The macros below preserve the old
+// "named constant" syntax — call sites read `SCR_COLOR_BG` and never
+// see the indirection. ui.c owns the storage and the theme applier.
+extern lv_color_t scr_palette_bg;
+extern lv_color_t scr_palette_panel;
+extern lv_color_t scr_palette_accent;
+extern lv_color_t scr_palette_accent_hi;
+extern lv_color_t scr_palette_text;
+extern lv_color_t scr_palette_dim;
+extern lv_color_t scr_palette_divider;
+extern lv_color_t scr_palette_good;
+extern lv_color_t scr_palette_warn;
+
+#define SCR_COLOR_BG         (scr_palette_bg)         // bg fill
+#define SCR_COLOR_PANEL      (scr_palette_panel)      // card / inset surface
+#define SCR_COLOR_ACCENT     (scr_palette_accent)     // primary fg (text, lines)
+#define SCR_COLOR_ACCENT_HI  (scr_palette_accent_hi)  // brighter fg (highlights)
+#define SCR_COLOR_TEXT       (scr_palette_text)       // body text
+#define SCR_COLOR_DIM        (scr_palette_dim)        // placeholders / muted
+#define SCR_COLOR_DIVIDER    (scr_palette_divider)    // hairline rules
+#define SCR_COLOR_GOOD       (scr_palette_good)       // success / accent_hi alias
+#define SCR_COLOR_WARN       (scr_palette_warn)       // warning amber (theme-independent)
+
+// Apply the theme to the runtime palette. Call once at boot (in ui_init,
+// before any screen is built) and after toggling devcfg_set_theme().
+// Switching at runtime requires a restart for existing widgets to
+// repaint — the palette only governs colours read at widget-construction
+// time. theme: 0 = dark (default), 1 = light.
+void scr_palette_apply(int theme);
 
 // Dark fill applied to any screen root. Call right after lv_obj_create().
 static inline void scr_apply_bg(lv_obj_t *scr) {

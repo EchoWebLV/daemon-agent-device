@@ -19,6 +19,8 @@
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 
 static const char *TAG = "settings_screen";
 
@@ -43,6 +45,12 @@ static lv_obj_t *s_vol_value  = NULL;
 // Brightness slider.
 static lv_obj_t *s_bri_slider = NULL;
 static lv_obj_t *s_bri_value  = NULL;
+
+// Theme switch — toggles dark↔light. Requires a restart for live widgets
+// to repaint, so the handler persists the new value and schedules an
+// esp_restart() ~250 ms later (long enough for the user to see the switch
+// land in the new position before the screen blacks out).
+static lv_obj_t *s_theme_switch = NULL;
 
 static settings_wifi_click_cb_t s_wifi_click_cb = NULL;
 
@@ -111,6 +119,35 @@ static void vol_slider_changed(lv_event_t *e) {
     if (s_vol_value) lv_label_set_text_fmt(s_vol_value, "%" PRId32, v);
 }
 
+// Theme toggle handler. The runtime palette is set once at boot from
+// devcfg_theme(), so flipping it mid-session has no visible effect on
+// already-built widgets. Persist the new value and reboot — the next
+// boot constructs every screen against the new palette. The 250 ms
+// delay gives the switch its on/off animation and the user a moment to
+// register the click before the panel blacks out for the restart.
+static void theme_restart_cb(void *arg) {
+    (void)arg;
+    esp_restart();
+}
+
+static void theme_switch_changed(lv_event_t *e) {
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    devcfg_set_theme(checked ? DEVCFG_THEME_LIGHT : DEVCFG_THEME_DARK);
+    // Fire-and-forget timer; survives only until restart.
+    esp_timer_handle_t t = NULL;
+    const esp_timer_create_args_t args = {
+        .callback = theme_restart_cb,
+        .name     = "theme_restart",
+    };
+    if (esp_timer_create(&args, &t) == ESP_OK) {
+        esp_timer_start_once(t, 250 * 1000);  // microseconds
+    } else {
+        // Fallback: restart immediately if the timer subsystem refused us.
+        esp_restart();
+    }
+}
+
 static void bri_slider_changed(lv_event_t *e) {
     lv_obj_t *sl = lv_event_get_target(e);
     int32_t v = lv_slider_get_value(sl);
@@ -129,6 +166,12 @@ bool settings_screen_init(void) {
 
     s_scr = lv_obj_create(NULL);
     scr_apply_bg(s_scr);
+    // Vertical scroll: scr_apply_bg removes the scrollable flag; re-add it
+    // restricted to the vertical axis so the rows can grow past 240 px and
+    // the user can flick down to reach later items.
+    lv_obj_add_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_scr, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_scr, LV_SCROLLBAR_MODE_AUTO);
 
     // --- status bar: title on the left, X on the right ---
     lv_obj_t *bar = lv_obj_create(s_scr);
@@ -232,6 +275,30 @@ bool settings_screen_init(void) {
     lv_obj_set_style_bg_color(s_bri_slider, SCR_COLOR_ACCENT, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_bri_slider, SCR_COLOR_ACCENT_HI, LV_PART_KNOB);
     lv_obj_add_event_cb(s_bri_slider, bri_slider_changed, LV_EVENT_VALUE_CHANGED, NULL);
+
+    y += 64;
+
+    // THEME row — flip dark ↔ light. Toggling fires a delayed esp_restart
+    // so every screen rebuilds against the freshly-applied palette.
+    lv_obj_t *theme_row = make_row(s_scr, y);
+    lv_obj_t *theme_title = lv_label_create(theme_row);
+    lv_label_set_text(theme_title, "Light theme");
+    lv_obj_set_style_text_color(theme_title, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_align(theme_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *theme_sub = lv_label_create(theme_row);
+    lv_label_set_text(theme_sub, "device restarts when toggled");
+    lv_obj_set_style_text_color(theme_sub, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_align(theme_sub, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    s_theme_switch = lv_switch_create(theme_row);
+    lv_obj_align(s_theme_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_theme_switch, SCR_COLOR_DIVIDER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_theme_switch, SCR_COLOR_ACCENT, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (devcfg_theme() == DEVCFG_THEME_LIGHT) {
+        lv_obj_add_state(s_theme_switch, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(s_theme_switch, theme_switch_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     lvgl_port_unlock();
 

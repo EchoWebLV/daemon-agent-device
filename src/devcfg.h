@@ -86,6 +86,18 @@ void        devcfg_set_services_enabled(const char *json);
 uint8_t devcfg_creature_index(void);
 void    devcfg_set_creature_index(uint8_t idx);
 
+// UI theme. 0 = dark (CRT green on black, default). 1 = light (black on
+// white). The runtime palette in screens_common.h is set once at boot
+// from this value; toggling it persists the new value and the caller is
+// expected to restart so every widget repaints in the new palette.
+typedef enum {
+    DEVCFG_THEME_DARK  = 0,
+    DEVCFG_THEME_LIGHT = 1,
+} devcfg_theme_t;
+
+devcfg_theme_t devcfg_theme(void);
+void           devcfg_set_theme(devcfg_theme_t theme);
+
 #ifdef __cplusplus
 }
 #endif

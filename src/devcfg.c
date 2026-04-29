@@ -38,6 +38,7 @@ static const char *TAG = "devcfg";
 #define KEY_SVC_CUSTOM      "svc_custom"
 #define KEY_SVC_ENABLED     "svc_enabled"
 #define KEY_CREATURE        "creature"
+#define KEY_THEME           "theme"
 
 // Number of creature variants the home screen knows how to render. Bump
 // this in lockstep with the trait tables in creature_screen.c.
@@ -153,6 +154,7 @@ static char    s_personality[PERSONALITY_MAX];
 static char    s_svc_custom[SVC_CUSTOM_MAX];
 static char    s_svc_enabled[SVC_ENABLED_MAX];
 static uint8_t s_creature_idx = 0;
+static uint8_t s_theme        = 0;   // 0 = dark, 1 = light
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -252,6 +254,8 @@ esp_err_t devcfg_init(void) {
     load_str (h, KEY_SVC_ENABLED,   s_svc_enabled, sizeof(s_svc_enabled));
     load_u8  (h, KEY_CREATURE,      &s_creature_idx, 0);
     if (s_creature_idx >= CREATURE_COUNT) s_creature_idx = 0;
+    load_u8  (h, KEY_THEME,         &s_theme, 0);
+    if (s_theme > 1) s_theme = 0;
 
     if (h != 0) nvs_close(h);
 
@@ -414,4 +418,16 @@ void devcfg_set_creature_index(uint8_t idx) {
     s_creature_idx = idx;
     save_u8(KEY_CREATURE, idx);
     ESP_LOGI(TAG, "creature index → %u", (unsigned)idx);
+}
+
+devcfg_theme_t devcfg_theme(void) {
+    return (devcfg_theme_t)s_theme;
+}
+
+void devcfg_set_theme(devcfg_theme_t theme) {
+    uint8_t v = (theme == DEVCFG_THEME_LIGHT) ? 1 : 0;
+    if (v == s_theme) return;
+    s_theme = v;
+    save_u8(KEY_THEME, v);
+    ESP_LOGI(TAG, "theme → %s", v ? "light" : "dark");
 }

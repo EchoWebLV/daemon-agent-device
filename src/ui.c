@@ -14,9 +14,11 @@
 #include "ui.h"
 #include "config_screen.h"
 #include "creature_screen.h"
+#include "devcfg.h"
 #include "display.h"
 #include "info_screen.h"
 #include "menu_screen.h"
+#include "screens_common.h"
 #include "settings_screen.h"
 #include "voice.h"
 #include "wallet_screen.h"
@@ -32,6 +34,49 @@
 #include "lvgl.h"
 
 static const char *TAG = "ui";
+
+// --- runtime palette --------------------------------------------------------
+// Storage for the colour macros declared in screens_common.h. Values are
+// set by scr_palette_apply() before any screen builds; they reflect the
+// current theme for the lifetime of the boot. Switching theme at runtime
+// flips these and requires a restart for live widgets to repaint.
+lv_color_t scr_palette_bg;
+lv_color_t scr_palette_panel;
+lv_color_t scr_palette_accent;
+lv_color_t scr_palette_accent_hi;
+lv_color_t scr_palette_text;
+lv_color_t scr_palette_dim;
+lv_color_t scr_palette_divider;
+lv_color_t scr_palette_good;
+lv_color_t scr_palette_warn;
+
+void scr_palette_apply(int theme) {
+    if (theme == 1) {
+        // Light theme — black ink on white paper. Subtle grey instead of
+        // pure white panels so cards still read as inset rather than
+        // disappearing into the background.
+        scr_palette_bg        = lv_color_hex(0xFFFFFF);
+        scr_palette_panel     = lv_color_hex(0xF0F0F0);
+        scr_palette_accent    = lv_color_hex(0x000000);
+        scr_palette_accent_hi = lv_color_hex(0x202020);
+        scr_palette_text      = lv_color_hex(0x000000);
+        scr_palette_dim       = lv_color_hex(0x808080);
+        scr_palette_divider   = lv_color_hex(0xC8C8C8);
+        scr_palette_good      = lv_color_hex(0x107010);  // dark green for success
+        scr_palette_warn      = lv_color_hex(0xB06000);  // dark amber
+    } else {
+        // Dark theme (default) — CRT green on black, original Daemon look.
+        scr_palette_bg        = lv_color_hex(0x000000);
+        scr_palette_panel     = lv_color_hex(0x041A08);
+        scr_palette_accent    = lv_color_hex(0x2BFF4A);
+        scr_palette_accent_hi = lv_color_hex(0x66FF80);
+        scr_palette_text      = lv_color_hex(0x2BFF4A);
+        scr_palette_dim       = lv_color_hex(0x0D5A1A);
+        scr_palette_divider   = lv_color_hex(0x0A3311);
+        scr_palette_good      = lv_color_hex(0x66FF80);
+        scr_palette_warn      = lv_color_hex(0xFFB84D);
+    }
+}
 
 // 20 scan-line partial buffer, double-buffered, in DMA-capable internal RAM.
 // 2 * 240 * 20 * 2 B = 19.2 KB. The board has ~228 KB internal free at boot,
@@ -142,6 +187,11 @@ void ui_tune_gestures(void) {
 // --- public API ------------------------------------------------------------
 
 esp_err_t ui_init(void) {
+    // Apply the persisted theme to the runtime palette BEFORE any screen
+    // is built so every widget picks up the correct colours at construction.
+    // devcfg_init has already run by now (called from app_main earlier).
+    scr_palette_apply((int)devcfg_theme());
+
     // --- LVGL task: runs lv_timer_handler every ~5 ms on core 1, prio 2. ----
     const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_RETURN_ON_ERROR(lvgl_port_init(&port_cfg), TAG, "lvgl_port_init");
