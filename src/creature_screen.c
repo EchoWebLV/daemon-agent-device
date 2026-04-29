@@ -694,26 +694,25 @@ static void speech_task(void *arg) {
     ui_set_subtitle(displayed);
     ESP_LOGI(TAG, "transcript surfaced: %s", transcript);
 
-    // Reverted to the buffered path so tools work uniformly across all
-    // providers. ai_ask_streaming only carries tool_calls for openai/*
-    // models; anthropic/* and shannon/* would either silently drop tools
-    // or hallucinate that they fired. The streaming infrastructure
-    // (build_chat_body_stream, stream_ctx_t with tool_calls accumulator,
-    // ai_ask_streaming itself) is left in ai.c — re-enable by switching
-    // the call below back, once the Anthropic stream route grows tool
-    // translation.
-    //
-    // char reply[1024] = {0};
-    // bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
-
+    // Streaming path: chat.ts:chatStream now emits OpenAI-shaped tool_calls
+    // SSE for every provider (openai/anthropic/grok), so tools work
+    // uniformly across the matrix. The firmware-side stream_ctx_t
+    // accumulator in ai.c reassembles tool deltas and runs the same
+    // tool-loop the buffered path uses. The big win: each sentence boundary
+    // in the LLM reply triggers voice_speak_chunk immediately, so first
+    // audio plays ~1.5–2 s sooner than the buffered version (which waited
+    // for the whole reply, then synthesised the whole TTS, then started
+    // playback). Shannon (/api/call) doesn't speak streaming and is
+    // handled by ai_ask_streaming via a one-shot fallback.
     char reply[1024] = {0};
-    bool ok = ai_ask(transcript, reply, sizeof(reply));
+    bool ok = ai_ask_streaming(transcript, reply, sizeof(reply));
     if (ok && reply[0]) {
         ui_set_subtitle(reply);
-        voice_speak(reply);   // single-shot TTS — was implicit in streaming path
+        // No voice_speak here — TTS already played sentence-by-sentence
+        // as the model streamed.
     } else if (reply[0]) {
-        // ai_ask wrote a human-readable error into reply on failure;
-        // show that instead of the user's transcript.
+        // ai_ask_streaming wrote a human-readable error into reply on
+        // failure; show that instead of the user's transcript.
         ui_set_subtitle(reply);
     }
     s_speech_in_flight = false;

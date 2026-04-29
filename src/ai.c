@@ -88,7 +88,11 @@ static const char *PERSONA =
 // ---------------------------------------------------------------------------
 // Rolling history. Fixed-size arena; oldest turn is dropped when full.
 // ---------------------------------------------------------------------------
-#define MAX_TURNS          10
+// Halved from 10 to 5 to shrink the upload + the LLM input context. Past
+// 4-5 turns of voice context the model is already losing thread, and
+// every extra turn adds upload time + provider latency on the next call.
+// 5 turns × 512 chars = 2.5 KB cap on history payload.
+#define MAX_TURNS          5
 #define TURN_TEXT_CAP      512    // trimmed hard — long turns are summarised
 #define SYS_PROMPT_CAP     4096   // persona + wallet context + tool listing
 // Tool-calling blows up both sides of the wire — each tool in the request
