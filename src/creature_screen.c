@@ -654,6 +654,42 @@ bool creature_screen_init(void) {
 
 static volatile bool s_speech_in_flight = false;
 
+// Filler phrases for the post-release "Hmm." / "Let me see." beat. Edit
+// to taste — keep them short so the audio finishes well before the LLM
+// reply arrives (~6-9 s end-to-end), and natural enough to read as a
+// human hedge rather than a robot stalling.
+static const char *const FILLERS[] = {
+    "Hmm.",
+    "Let me see.",
+    "Hmm, let me check.",
+    "Alright.",
+    "Okay, one sec.",
+    "Give me a moment.",
+    "Hmm, thinking.",
+    "Let me think about that.",
+};
+
+// Sleeps 1 s then enqueues a random filler via voice_speak (which is
+// itself async — voice.c's audio task picks it up). Self-deletes when
+// done. Spawned by speech_task on a coin flip; speech_task continues
+// running STT in parallel on its own task.
+static void filler_delay_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // If the actual reply is somehow already playing (shouldn't happen
+    // given the 6+ s pipeline, but defensively safe), skip — we don't
+    // want to step on or queue behind real speech.
+    if (voice_is_speaking()) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t idx = esp_random() % (sizeof(FILLERS) / sizeof(FILLERS[0]));
+    voice_speak(FILLERS[idx]);
+    vTaskDelete(NULL);
+}
+
 static void speech_task(void *arg) {
     int16_t *pcm    = (int16_t *)arg;
     size_t   frames = 0;
@@ -666,27 +702,19 @@ static void speech_task(void *arg) {
     frames = s_speech_frames;
     s_speech_frames = 0;
 
-    // Filler word, ~50% of the time, fired in parallel with STT.
-    // voice_speak() enqueues onto the audio task's queue and returns
-    // immediately; the ElevenLabs HTTP fetch runs on the audio task while
-    // we upload PCM to /v1/audio/transcriptions on this task. By the time
-    // the user hears the filler (~700 ms after the dispatch when TLS is
-    // cold, ~150 ms when warm), STT is already in flight, so the filler
-    // genuinely covers what would otherwise be dead air. The actual reply
-    // queues behind the filler and plays when ready.
-    static const char *const FILLERS[] = {
-        "Hmm.",
-        "Let me see.",
-        "Hmm, let me check.",
-        "Alright.",
-        "Okay, one sec.",
-        "Give me a moment.",
-        "Hmm, thinking.",
-        "Let me think about that.",
-    };
+    // Filler word, ~50% of the time, fired ~1 s AFTER the button releases
+    // (i.e. ~1 s into speech_task). Immediate fillers felt over-eager —
+    // the 1 s pause reads as natural human hedging, lets the chirp tone
+    // finish, and still covers the dead-air window before the LLM reply
+    // arrives. Coin flip happens BEFORE the spawn so we don't burn a task
+    // on the silent half. The delay task sleeps then enqueues via
+    // voice_speak (async); STT continues unblocked on this task.
     if ((esp_random() & 1u) == 0u) {
-        uint32_t idx = esp_random() % (sizeof(FILLERS) / sizeof(FILLERS[0]));
-        voice_speak(FILLERS[idx]);
+        BaseType_t spawned = xTaskCreate(filler_delay_task, "filler_delay",
+                                         2048, NULL, 4, NULL);
+        if (spawned != pdPASS) {
+            ESP_LOGW(TAG, "filler delay task spawn failed");
+        }
     }
 
     char transcript[512] = {0};
