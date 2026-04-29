@@ -635,19 +635,9 @@ bool creature_screen_init(void) {
     lv_obj_set_style_text_color(s_subtitle, SCR_COLOR_TEXT, LV_PART_MAIN);
     lv_obj_align(s_subtitle, LV_ALIGN_BOTTOM_MID, 0, -8);
 
-    // --- Push-to-talk: long-press anywhere on the face to record ----------
-    // LV_EVENT_LONG_PRESSED fires once after the default ~400 ms hold; we
-    // start mic capture there and stop on RELEASED / PRESS_LOST. The
-    // recording path lives entirely in mic.c + stt.c — this handler is
-    // just the UI trigger.
-    extern void creature_screen_on_long_press_(struct _lv_event_t *e);
-    extern void creature_screen_on_press_end_(struct _lv_event_t *e);
-    lv_obj_add_event_cb(s_scr, creature_screen_on_long_press_,
-                        LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_add_event_cb(s_scr, creature_screen_on_press_end_,
-                        LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(s_scr, creature_screen_on_press_end_,
-                        LV_EVENT_PRESS_LOST, NULL);
+    // Push-to-talk lives on the BSP_BUTTON_MAIN hardware button (front-face,
+    // below the LCD) — see buttons.c. The face itself stays free for tap
+    // gestures we'll add later.
 
     // Apply the initial mood tint.
     creature_mood_t m = s_mood;
@@ -670,7 +660,7 @@ static void speech_task(void *arg) {
     // thread; we received the buffer + frame count via two static slots
     // because lv_async_call only takes one void* and FreeRTOS task args are
     // a single pointer. Frames are stored as the size_t suffix of the alloc
-    // header — simpler to just stash in a static. See on_press_end_.
+    // header — simpler to just stash in a static. See creature_screen_ptt_stop.
     extern volatile size_t s_speech_frames;
     frames = s_speech_frames;
     s_speech_frames = 0;
@@ -721,8 +711,7 @@ static void speech_task(void *arg) {
 
 volatile size_t s_speech_frames = 0;
 
-void creature_screen_on_long_press_(struct _lv_event_t *e) {
-    (void)e;
+void creature_screen_ptt_start(void) {
     if (s_speech_in_flight || mic_is_recording()) return;
     if (mic_record_start() == ESP_OK) {
         ui_set_subtitle("Listening...");
@@ -731,8 +720,7 @@ void creature_screen_on_long_press_(struct _lv_event_t *e) {
     }
 }
 
-void creature_screen_on_press_end_(struct _lv_event_t *e) {
-    (void)e;
+void creature_screen_ptt_stop(void) {
     if (!mic_is_recording()) return;
     int16_t *pcm    = NULL;
     size_t   frames = 0;

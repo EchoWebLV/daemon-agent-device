@@ -20,6 +20,7 @@
 #include "nvs_flash.h"
 
 #include "ai.h"
+#include "buttons.h"
 #include "creature_screen.h"
 #include "devcfg.h"
 #include "display.h"
@@ -174,9 +175,16 @@ void app_main(void) {
 
     // Mic capture for push-to-talk. Must run AFTER voice_begin since both
     // codecs share the BSP-managed I2S port. Failure is non-fatal — the
-    // long-press handler on the creature face just becomes a no-op.
+    // PTT button just becomes a no-op when nothing can record.
     if (mic_init() != ESP_OK) {
         ESP_LOGW(TAG, "mic_init failed; push-to-talk disabled");
+    }
+
+    // Front-face hardware button → PTT. Must run AFTER touch_init so the
+    // GT911 handle is live (the BSP button bit comes through the touch IC,
+    // not a dedicated GPIO — see buttons.c). Non-fatal on failure.
+    if (buttons_init() != ESP_OK) {
+        ESP_LOGW(TAG, "buttons_init failed; hardware PTT disabled");
     }
 
     // Wallet + price. Both are safe to initialise before Wi-Fi is up: the

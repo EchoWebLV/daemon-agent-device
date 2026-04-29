@@ -135,3 +135,7 @@ esp_err_t touch_init(void) {
              BOARD_I2C_HZ / 1000, BOARD_TOUCH_PIN_INT);
     return ESP_OK;
 }
+
+esp_lcd_touch_handle_t touch_handle(void) {
+    return s_touch;
+}

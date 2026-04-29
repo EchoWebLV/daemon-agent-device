@@ -10,6 +10,7 @@ idf_component_register(
         "app_main.c"
         "base58.c"
         "bus.c"
+        "buttons.c"
         "config_screen.c"
         "creature_screen.c"
         "devcfg.c"
@@ -79,4 +80,8 @@ idf_component_register(
         # BOX-3 BSP — audio init helpers (bsp_audio_codec_*_init etc.).
         # We bypass its display/touch helpers by simply not calling them.
         esp-box-3
+        # iot_button — front-face PTT button via the GT911's key bit.
+        # See buttons.c. Already pulled transitively through esp-box-3,
+        # but listed explicitly because we use its API directly.
+        button
 )

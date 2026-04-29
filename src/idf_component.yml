@@ -26,3 +26,8 @@ dependencies:
   # to inherit the chatgpt_demo's known-good codec/I2S configuration after
   # hand-rolled init couldn't get the mic input path producing real audio.
   espressif/esp-box-3:             "~3.2.0"
+  # iot_button — drives the front-face PTT button (BSP_BUTTON_MAIN), read
+  # via the GT911's key bit. See buttons.c. Already pulled transitively
+  # through esp-box-3 but pinned here so an upstream BSP refactor can't
+  # silently drop it.
+  espressif/button:                "^4.0.0"

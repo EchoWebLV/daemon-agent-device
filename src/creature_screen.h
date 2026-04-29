@@ -66,6 +66,14 @@ void creature_screen_shake(void);
 // modulo CREATURE_COUNT.
 void creature_screen_cycle(int delta);
 
+// Push-to-talk start/stop. Called from buttons.c when the front-face
+// hardware button (BSP_BUTTON_MAIN, read via the GT911 button bit) goes
+// down/up. Both are idempotent — start is a no-op if a capture or speech
+// task is already in flight; stop is a no-op if nothing is recording.
+// Safe to call from any task context.
+void creature_screen_ptt_start(void);
+void creature_screen_ptt_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,12 +15,18 @@
 //      I2C to it). See touch.c for the full rationale.
 // ---------------------------------------------------------------------------
 #include "esp_err.h"
+#include "esp_lcd_touch.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 esp_err_t touch_init(void);
+
+// Returns the underlying esp_lcd_touch handle once touch_init() has succeeded.
+// Used by buttons.c to read the GT911's home-button bit via
+// esp_lcd_touch_get_button_state(). NULL before touch_init() or if init failed.
+esp_lcd_touch_handle_t touch_handle(void);
 
 #ifdef __cplusplus
 }
