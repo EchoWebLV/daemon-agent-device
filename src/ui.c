@@ -95,10 +95,11 @@ static void nav_go_to_wifi(void) {
 }
 
 static void nav_wifi_connected(void) {
-    // Wi-Fi picker bounces back to settings so the user sees the newly-
-    // connected SSID in the Wi-Fi row.
-    ui_show_settings();
+    // Land on the creature after a successful connect — that's home, and
+    // it's where the user will want to start talking. Settings refresh is
+    // still kicked so the SSID row is current next time settings opens.
     settings_screen_refresh();
+    ui_show_creature();
 }
 
 // --- swipe navigation -------------------------------------------------------

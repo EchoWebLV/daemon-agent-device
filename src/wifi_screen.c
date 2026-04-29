@@ -48,8 +48,6 @@ static lv_obj_t *s_modal        = NULL;
 static lv_obj_t *s_modal_title  = NULL;
 static lv_obj_t *s_pw_input     = NULL;
 static lv_obj_t *s_keyboard     = NULL;
-static lv_obj_t *s_connect_btn  = NULL;
-static lv_obj_t *s_cancel_btn   = NULL;
 
 // --- state -----------------------------------------------------------------
 #define WIFI_MAX_APS 16
@@ -127,17 +125,26 @@ typedef struct {
 static void async_connect_done(void *arg) {
     connect_result_t *r = (connect_result_t *)arg;
     if (!r) return;
-    if (lvgl_port_lock(0)) {
-        s_connect_in_flight = false;
+    // Wait up to 1s for the LVGL lock — matches async_scan_done. The previous
+    // 0-timeout path silently lost the success branch when LVGL was momentarily
+    // busy with a draw, leaving s_connect_in_flight stuck and the modal up
+    // even after a successful connect (user complaint: "no redirect").
+    bool got_lock = lvgl_port_lock(1000);
+    s_connect_in_flight = false;
+    if (got_lock) {
         if (r->ok) {
             lv_label_set_text_fmt(s_status_label, "connected: %s", r->ssid);
             hide_modal();
             if (s_on_connected) s_on_connected();
         } else {
-            lv_label_set_text_fmt(s_status_label, "connect failed: %s", r->ssid);
-            // Keep the modal up so the user can retry / edit the password.
+            // Status bar carries the failure text; the modal sits below the
+            // bar now (see show_modal layout) so this is visible. Keep the
+            // modal up so the user can retry / edit the password.
+            lv_label_set_text_fmt(s_status_label, "wrong password? — %s", r->ssid);
         }
         lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "async_connect_done: port lock timeout; UI not refreshed");
     }
     free(r);
 }
@@ -347,64 +354,46 @@ bool wifi_screen_init(void) {
     lv_obj_align(s_hint, LV_ALIGN_BOTTOM_MID, 0, -6);
 
     // --- password modal --------------------------------------------------
-    // Full-screen opaque cover so the list below is visually + input-wise
-    // masked out.
+    // The modal sits BELOW the status bar so connect-state messages
+    // ("connecting to X" / "connect failed: X") stay visible above it —
+    // that's our error feedback channel. Earlier full-screen modal hid
+    // the bar, so failures were silent from the user's POV.
+    //
+    // No Connect/Cancel buttons: LVGL keyboards already emit LV_EVENT_READY
+    // on the green ✓ and LV_EVENT_CANCEL on the red ✗. keyboard_ready below
+    // routes those into connect_clicked / cancel_clicked, so the buttons
+    // were just duplicate UI eating vertical space.
     s_modal = lv_obj_create(s_scr);
-    lv_obj_set_size(s_modal, SCR_W, SCR_H);
-    lv_obj_align(s_modal, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_size(s_modal, SCR_W, SCR_H - STATUS_BAR_H);
+    lv_obj_align(s_modal, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_H);
     lv_obj_set_style_bg_color(s_modal, SCR_COLOR_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_modal, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_modal, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(s_modal, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_modal, 0, LV_PART_MAIN);
     lv_obj_remove_flag(s_modal, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
 
-    // Landscape modal layout (320×240). Vertical budget: 240 px total.
-    //   title       y=2..18    (16 px)
-    //   pw input    y=20..50   (30 px)
-    //   btn row     y=54..82   (28 px)
-    //   keyboard    y=86..240  (154 px)
-    // Earlier portrait layout had a 180 px keyboard at BOTTOM_MID overlap-
-    // -ping the buttons + input, which made the keyboard's mode-switch keys
-    // dispatch through to the buttons underneath ("numbers exited the
-    // keyboard"). Tighter layout below eliminates the overlap.
+    // Modal frame is now SCR_W × (SCR_H - STATUS_BAR_H) = 320 × 214.
+    //   title       y=2..16    (14 px)   "Connect to <SSID>"
+    //   pw input    y=18..46   (28 px)
+    //   keyboard    y=50..214  (164 px)  full-width, bottom-anchored
     s_modal_title = lv_label_create(s_modal);
     lv_label_set_text(s_modal_title, "Connect");
     lv_obj_set_style_text_color(s_modal_title, SCR_COLOR_TEXT, LV_PART_MAIN);
-    lv_obj_align(s_modal_title, LV_ALIGN_TOP_LEFT, 4, 2);
+    lv_obj_align(s_modal_title, LV_ALIGN_TOP_LEFT, 8, 2);
 
     s_pw_input = lv_textarea_create(s_modal);
-    lv_obj_set_size(s_pw_input, SCR_W - 32, 30);
-    lv_obj_align(s_pw_input, LV_ALIGN_TOP_LEFT, 4, 20);
+    lv_obj_set_size(s_pw_input, SCR_W - 16, 28);
+    lv_obj_align(s_pw_input, LV_ALIGN_TOP_LEFT, 8, 18);
     lv_textarea_set_password_mode(s_pw_input, true);
     lv_textarea_set_one_line(s_pw_input, true);
     lv_textarea_set_placeholder_text(s_pw_input, "password");
     lv_obj_set_style_bg_color(s_pw_input, SCR_COLOR_PANEL, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_pw_input, SCR_COLOR_TEXT, LV_PART_MAIN);
 
-    s_cancel_btn = lv_button_create(s_modal);
-    lv_obj_set_size(s_cancel_btn, 84, 28);
-    lv_obj_align(s_cancel_btn, LV_ALIGN_TOP_LEFT, 8, 54);
-    lv_obj_set_style_bg_color(s_cancel_btn, SCR_COLOR_DIVIDER, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_cancel_btn, cancel_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *cl = lv_label_create(s_cancel_btn);
-    lv_label_set_text(cl, "Cancel");
-    lv_obj_set_style_text_color(cl, SCR_COLOR_TEXT, LV_PART_MAIN);
-    lv_obj_center(cl);
-
-    s_connect_btn = lv_button_create(s_modal);
-    lv_obj_set_size(s_connect_btn, 84, 28);
-    lv_obj_align(s_connect_btn, LV_ALIGN_TOP_RIGHT, -8, 54);
-    lv_obj_set_style_bg_color(s_connect_btn, SCR_COLOR_ACCENT, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_connect_btn, connect_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *ol = lv_label_create(s_connect_btn);
-    lv_label_set_text(ol, "Connect");
-    lv_obj_set_style_text_color(ol, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_center(ol);
-
     s_keyboard = lv_keyboard_create(s_modal);
     lv_keyboard_set_textarea(s_keyboard, s_pw_input);
-    lv_obj_set_size(s_keyboard, SCR_W, 154);
+    lv_obj_set_size(s_keyboard, SCR_W, 164);
     lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_event_cb(s_keyboard, keyboard_ready, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(s_keyboard, keyboard_ready, LV_EVENT_CANCEL, NULL);
