@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 #include "devcfg.h"
 #include "board.h"
+#include "creatures_data.h"
 
 #include <string.h>
 
@@ -40,9 +41,8 @@ static const char *TAG = "devcfg";
 #define KEY_CREATURE        "creature"
 #define KEY_THEME           "theme"
 
-// Number of creatures the home screen knows how to render. Must match
-// CREATURE_DATA_COUNT in creatures_data.h.
-#define CREATURE_COUNT      6
+// CREATURE_DATA_COUNT comes from creatures_data.h — a runtime int sized from
+// the array literal, so adding rows in creatures_data.c just works.
 
 // ---- Built-in default services ---------------------------------------------
 // Four x402 endpoints hosted on the Daemon's own seller (daemon-x402s-seven
@@ -253,7 +253,7 @@ esp_err_t devcfg_init(void) {
     load_str (h, KEY_SVC_CUSTOM,    s_svc_custom,  sizeof(s_svc_custom));
     load_str (h, KEY_SVC_ENABLED,   s_svc_enabled, sizeof(s_svc_enabled));
     load_u8  (h, KEY_CREATURE,      &s_creature_idx, 0);
-    if (s_creature_idx >= CREATURE_COUNT) s_creature_idx = 0;
+    if (s_creature_idx >= CREATURE_DATA_COUNT) s_creature_idx = 0;
     load_u8  (h, KEY_THEME,         &s_theme, 0);
     if (s_theme > 1) s_theme = 0;
 
@@ -413,7 +413,7 @@ uint8_t devcfg_creature_index(void) {
 }
 
 void devcfg_set_creature_index(uint8_t idx) {
-    if (idx >= CREATURE_COUNT) idx = 0;
+    if (idx >= CREATURE_DATA_COUNT) idx = 0;
     if (idx == s_creature_idx) return;
     s_creature_idx = idx;
     save_u8(KEY_CREATURE, idx);

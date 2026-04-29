@@ -92,8 +92,10 @@
       <button id="prev-creature">◀</button>
       <span id="creature-idx">1 / 6</span>
       <button id="next-creature">▶</button>
+      <button id="btn-add" title="Add a blank creature after the current one">+ Add</button>
+      <button id="btn-delete" title="Delete the current creature">Delete</button>
       <span style="margin-left:16px">
-        <button id="btn-new">New</button>
+        <button id="btn-new">Clear</button>
         <button id="btn-load">Load</button>
         <button id="btn-save">Save</button>
         <button id="btn-export">Export C</button>
@@ -292,7 +294,7 @@ function refreshEditor() {
     });
   }
   document.getElementById("creature-name").value = c.name;
-  document.getElementById("creature-idx").textContent = `${activeIdx+1} / 6`;
+  document.getElementById("creature-idx").textContent = `${activeIdx+1} / ${roster.length}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +354,14 @@ document.querySelectorAll(".grid").forEach(grid => {
   grid.addEventListener("mousedown", e => {
     if (!e.target.classList.contains("cell")) return;
     painting = true;
-    paintValue = (tool === "pencil") ? 1 : 0;
+    // Pencil toggles: clicking a filled cell erases it, clicking an empty cell
+    // fills it. The chosen value sticks for the whole drag so a stroke stays
+    // consistent (no flicker when crossing filled/empty cells mid-drag).
+    if (tool === "pencil") {
+      paintValue = e.target.classList.contains("on") ? 0 : 1;
+    } else {
+      paintValue = 0;
+    }
     paintCell(e.target, paintValue);
   });
   grid.addEventListener("mouseover", e => {
@@ -558,6 +567,27 @@ document.getElementById("btn-new").addEventListener("click", () => {
   refreshPreview();
 });
 
+document.getElementById("btn-add").addEventListener("click", () => {
+  // Insert a blank creature directly after the current one and switch to it.
+  const fresh = blankCreature(`Slot ${roster.length + 1}`);
+  roster.splice(activeIdx + 1, 0, fresh);
+  saveLocal();
+  switchTo(activeIdx + 1);
+});
+
+document.getElementById("btn-delete").addEventListener("click", () => {
+  if (roster.length <= 1) {
+    alert("Can't delete the last creature.");
+    return;
+  }
+  const name = roster[activeIdx].name || `Slot ${activeIdx+1}`;
+  if (!confirm(`Delete "${name}"? This can't be undone.`)) return;
+  roster.splice(activeIdx, 1);
+  saveLocal();
+  // Stay on the same index if possible, otherwise step back.
+  switchTo(Math.min(activeIdx, roster.length - 1));
+});
+
 // ---------------------------------------------------------------------------
 //  Persistence
 // ---------------------------------------------------------------------------
@@ -575,8 +605,9 @@ function loadLocal() {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return false;
     const obj = JSON.parse(raw);
-    if (!obj || !Array.isArray(obj.creatures) || obj.creatures.length !== 6) return false;
-    for (let i = 0; i < 6; i++) roster[i] = obj.creatures[i];
+    if (!obj || !Array.isArray(obj.creatures) || obj.creatures.length < 1) return false;
+    roster.length = 0;
+    for (const c of obj.creatures) roster.push(c);
     return true;
   } catch (e) {
     console.warn("localStorage load failed", e);
@@ -610,11 +641,12 @@ document.getElementById("btn-load").addEventListener("click", () => {
     reader.addEventListener("load", () => {
       try {
         const obj = JSON.parse(reader.result);
-        if (!obj || !Array.isArray(obj.creatures) || obj.creatures.length !== 6) {
-          alert("Expected a roster JSON with 6 creatures.");
+        if (!obj || !Array.isArray(obj.creatures) || obj.creatures.length < 1) {
+          alert("Expected a roster JSON with at least one creature.");
           return;
         }
-        for (let i = 0; i < 6; i++) roster[i] = obj.creatures[i];
+        roster.length = 0;
+        for (const c of obj.creatures) roster.push(c);
         saveLocal();
         switchTo(0);
       } catch (e) {
@@ -704,10 +736,9 @@ document.getElementById("btn-export").addEventListener("click", () => {
 });
 
 document.getElementById("btn-reset").addEventListener("click", () => {
-  if (!confirm("Reset all 6 creatures to defaults? This wipes localStorage.")) return;
-  for (let i = 0; i < 6; i++) {
-    roster[i] = JSON.parse(JSON.stringify(DEFAULT_ROSTER[i]));
-  }
+  if (!confirm(`Reset to ${DEFAULT_ROSTER.length} default creatures? This wipes localStorage.`)) return;
+  roster.length = 0;
+  for (const c of DEFAULT_ROSTER) roster.push(JSON.parse(JSON.stringify(c)));
   saveLocal();
   switchTo(0);
 });

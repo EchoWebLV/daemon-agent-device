@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 #include "creatures_data.h"
 
-const creature_data_t CREATURES_DATA[CREATURE_DATA_COUNT] = {
+const creature_data_t CREATURES_DATA[] = {
     // 0 — Daemon (round eyes, full smile, no brows)
     {
         .name = "Daemon",
@@ -86,3 +86,6 @@ const creature_data_t CREATURES_DATA[CREATURE_DATA_COUNT] = {
         },
     },
 };
+
+const int CREATURE_DATA_COUNT =
+    sizeof(CREATURES_DATA) / sizeof(CREATURES_DATA[0]);

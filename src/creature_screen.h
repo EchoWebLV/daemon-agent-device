@@ -63,7 +63,7 @@ void creature_screen_shake(void);
 // new index is stored in NVS via devcfg, the face is reshaped to the
 // variant's eye / mouth / brow trait combo, and the current mood colour
 // is re-applied so freshly-shown widgets don't flash white. Wraps around
-// modulo CREATURE_COUNT.
+// modulo CREATURE_DATA_COUNT.
 void creature_screen_cycle(int delta);
 
 // Push-to-talk start/stop. Called from buttons.c when the front-face

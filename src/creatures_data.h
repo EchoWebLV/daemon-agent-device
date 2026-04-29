@@ -17,8 +17,6 @@
 #pragma once
 #include <stdint.h>
 
-#define CREATURE_DATA_COUNT  6
-
 typedef struct {
     const char *name;
     uint8_t brow_l[2][4];
@@ -28,4 +26,8 @@ typedef struct {
     uint8_t mouth [3][14];
 } creature_data_t;
 
-extern const creature_data_t CREATURES_DATA[CREATURE_DATA_COUNT];
+// The roster lives in creatures_data.c. CREATURE_DATA_COUNT is computed there
+// from the array's actual size, so adding/removing rows in the .c file is the
+// only edit needed — this header stays stable.
+extern const creature_data_t CREATURES_DATA[];
+extern const int CREATURE_DATA_COUNT;
