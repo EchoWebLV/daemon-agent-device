@@ -38,6 +38,85 @@ static const char *TAG = "devcfg";
 #define KEY_SVC_CUSTOM      "svc_custom"
 #define KEY_SVC_ENABLED     "svc_enabled"
 
+// ---- Built-in default services ---------------------------------------------
+// Four x402 endpoints hosted on the Daemon's own seller (daemon-x402s-seven
+// .vercel.app). Baked here so a fresh device boots with a working trading-
+// intel toolkit instead of an empty service library — the user can still
+// add / replace via the on-device wizard or HTTP /config POST. Field
+// shape matches what ai.c reads (`id`, `name`, `description`, `baseUrl`,
+// `endpoints[].{id, name, method, path, params[]}`).
+static const char DEFAULT_CUSTOM_SERVICES_JSON[] =
+    "["
+      "{"
+        "\"id\":\"daemon-fib\","
+        "\"name\":\"Fib Levels\","
+        "\"description\":\"Fibonacci retracement levels for any major coin on a Binance pair\","
+        "\"baseUrl\":\"https://daemon-x402s-seven.vercel.app\","
+        "\"endpoints\":[{"
+          "\"id\":\"analyze\","
+          "\"name\":\"Fib Retracement\","
+          "\"method\":\"GET\","
+          "\"path\":\"/api/fib\","
+          "\"params\":["
+            "{\"name\":\"symbol\",\"type\":\"string\",\"description\":\"Token ticker (SOL, BTC, ETH) or full Binance pair (SOLUSDT)\",\"required\":true},"
+            "{\"name\":\"timeframe\",\"type\":\"string\",\"description\":\"Candle timeframe (15m, 1h, 4h, 1d). Default 1d.\"},"
+            "{\"name\":\"lookback\",\"type\":\"number\",\"description\":\"Candles to scan for the swing. 10..500. Default 90.\"}"
+          "]"
+        "}]"
+      "},"
+      "{"
+        "\"id\":\"daemon-momentum\","
+        "\"name\":\"Momentum\","
+        "\"description\":\"RSI MACD and EMA stack with bullish or bearish bias verdict\","
+        "\"baseUrl\":\"https://daemon-x402s-seven.vercel.app\","
+        "\"endpoints\":[{"
+          "\"id\":\"analyze\","
+          "\"name\":\"Momentum Read\","
+          "\"method\":\"GET\","
+          "\"path\":\"/api/momentum\","
+          "\"params\":["
+            "{\"name\":\"symbol\",\"type\":\"string\",\"description\":\"Token ticker or full Binance pair\",\"required\":true},"
+            "{\"name\":\"timeframe\",\"type\":\"string\",\"description\":\"Candle timeframe. Default 1d.\"},"
+            "{\"name\":\"lookback\",\"type\":\"number\",\"description\":\"Indicator warmup candles. 50..1000. Default 220.\"}"
+          "]"
+        "}]"
+      "},"
+      "{"
+        "\"id\":\"daemon-news-pulse\","
+        "\"name\":\"News Pulse\","
+        "\"description\":\"Fresh headlines summarised into bullish bearish or neutral verdict with confidence\","
+        "\"baseUrl\":\"https://daemon-x402s-seven.vercel.app\","
+        "\"endpoints\":[{"
+          "\"id\":\"analyze\","
+          "\"name\":\"News Sentiment\","
+          "\"method\":\"GET\","
+          "\"path\":\"/api/news-pulse\","
+          "\"params\":["
+            "{\"name\":\"query\",\"type\":\"string\",\"description\":\"Ticker or topic. Max 200 chars.\",\"required\":true}"
+          "]"
+        "}]"
+      "},"
+      "{"
+        "\"id\":\"daemon-whale-flow\","
+        "\"name\":\"Whale Flow\","
+        "\"description\":\"Buy or sell pressure for a Solana SPL token across DEX pairs with accumulation distribution verdict\","
+        "\"baseUrl\":\"https://daemon-x402s-seven.vercel.app\","
+        "\"endpoints\":[{"
+          "\"id\":\"analyze\","
+          "\"name\":\"Buy Sell Pressure\","
+          "\"method\":\"GET\","
+          "\"path\":\"/api/whale-flow\","
+          "\"params\":["
+            "{\"name\":\"mint\",\"type\":\"string\",\"description\":\"Solana SPL token mint address (32-64 chars base58)\",\"required\":true},"
+            "{\"name\":\"timeframe\",\"type\":\"string\",\"description\":\"Window 5m 1h 6h or 24h. Default 1h.\"}"
+          "]"
+        "}]"
+      "}"
+    "]";
+
+static const char DEFAULT_SERVICES_ENABLED_JSON[] =
+    "[\"daemon-fib\",\"daemon-momentum\",\"daemon-news-pulse\",\"daemon-whale-flow\"]";
+
 // Upper bounds on strings we persist. WPA2 passwords cap at 63 chars + NUL;
 // SSIDs at 32 + NUL. We round up for headroom (hidden SSIDs / WPA3).
 #define SSID_MAX            64
@@ -168,6 +247,40 @@ esp_err_t devcfg_init(void) {
 
     if (h != 0) nvs_close(h);
 
+    // One-shot migration: the deprecated wizard saved its BUILTIN
+    // suggestions (SolSignal, Sentinel, CYBERA, DeFi Signal, …) directly
+    // into customServices NVS. Those IDs are not in the new toolkit, so
+    // they sit dormant in svc_custom and silently override the
+    // firmware-baked defaults. If we spot any of them, wipe svc_custom
+    // and svc_enabled so the new bake-in defaults activate on first ask.
+    // Other NVS keys (wallet, wifi, brightness, …) are untouched.
+    static const char *const DEPRECATED_SVC_FINGERPRINTS[] = {
+        "\"id\":\"solsignal\"",  "\"id\":\"sentinel\"",
+        "\"id\":\"cybera\"",     "\"id\":\"defi-signal\"",
+        "\"id\":\"deepblue\"",   "\"id\":\"moonmaker\"",
+        "\"id\":\"kerdos\"",     "\"id\":\"xquik\"",
+        "\"id\":\"agentfeed\"",  "\"id\":\"gpu-bridge\"",
+        "\"id\":\"x402engine\"",
+        NULL,
+    };
+    if (s_svc_custom[0]) {
+        for (const char *const *p = DEPRECATED_SVC_FINGERPRINTS; *p; ++p) {
+            if (strstr(s_svc_custom, *p)) {
+                ESP_LOGI(TAG, "wiping stale chrome-ext services from NVS (matched %s)", *p);
+                s_svc_custom[0]  = '\0';
+                s_svc_enabled[0] = '\0';
+                nvs_handle_t hw;
+                if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &hw) == ESP_OK) {
+                    nvs_erase_key(hw, KEY_SVC_CUSTOM);
+                    nvs_erase_key(hw, KEY_SVC_ENABLED);
+                    nvs_commit(hw);
+                    nvs_close(hw);
+                }
+                break;
+            }
+        }
+    }
+
     apply_brightness(s_brightness);
     s_ready = true;
 
@@ -246,10 +359,10 @@ void devcfg_set_personality(const char *persona) {
 
 const char *devcfg_custom_services(void) {
     // Callers (system prompt builder, /config GET responder) expect a valid
-    // JSON array on every read. An empty cache means "user hasn't saved
-    // anything yet" — return a literal "[]" so downstream JSON embedding
-    // stays well-formed.
-    return s_svc_custom[0] ? s_svc_custom : "[]";
+    // JSON array on every read. Empty cache = the user hasn't saved their
+    // own library yet → fall through to the firmware-baked defaults so the
+    // device ships with a working trading-intel toolkit on first boot.
+    return s_svc_custom[0] ? s_svc_custom : DEFAULT_CUSTOM_SERVICES_JSON;
 }
 
 void devcfg_set_custom_services(const char *json) {
@@ -267,7 +380,9 @@ void devcfg_set_custom_services(const char *json) {
 }
 
 const char *devcfg_services_enabled(void) {
-    return s_svc_enabled[0] ? s_svc_enabled : "[]";
+    // Same default-on-empty story as devcfg_custom_services() — fresh
+    // device boots with all four built-in services toggled on.
+    return s_svc_enabled[0] ? s_svc_enabled : DEFAULT_SERVICES_ENABLED_JSON;
 }
 
 void devcfg_set_services_enabled(const char *json) {
