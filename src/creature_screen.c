@@ -659,13 +659,15 @@ static volatile bool s_speech_in_flight = false;
 // reply arrives (~6-9 s end-to-end), and natural enough to read as a
 // human hedge rather than a robot stalling.
 static const char *const FILLERS[] = {
+    // Only one "Hmm" in the set so the cadence doesn't feel monotone
+    // across consecutive queries. The rest are clean openers.
     "Hmm.",
     "Let me see.",
-    "Hmm, let me check.",
+    "Let me check.",
     "Alright.",
     "Okay, one sec.",
     "Give me a moment.",
-    "Hmm, thinking.",
+    "Thinking.",
     "Let me think about that.",
 };
 
