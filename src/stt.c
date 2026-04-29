@@ -31,7 +31,14 @@ static const char *TAG = "stt";
 #define STT_SAMPLE_HZ 16000   // matches mic capture rate
 #define STT_BOUNDARY  "----DaemonBoundary17X9k2pQ"
 #define STT_URL       "https://api.openai.com/v1/audio/transcriptions"
-#define STT_MODEL     "whisper-1"
+// gpt-4o-mini-transcribe was shipped in Q1 2025 as a Whisper successor on
+// the same /v1/audio/transcriptions endpoint. ~30-40% lower latency than
+// whisper-1 for short device audio, lower WER too. Same multipart body
+// shape, same JSON response — only the `model` field changes. Swap to
+// "gpt-4o-transcribe" (no -mini) for marginally better accuracy at
+// slightly higher latency; "whisper-1" is the fallback if either of the
+// new models is gated on your account.
+#define STT_MODEL     "gpt-4o-mini-transcribe"
 
 static bool has_openai_key(void) {
     const char *k = OPENAI_API_KEY;
