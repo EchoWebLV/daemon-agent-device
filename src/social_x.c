@@ -347,6 +347,53 @@ void social_x_disconnect(void) {
     devcfg_clear_x();
     ESP_LOGI(TAG, "disconnected");
 }
+// Refresh the access token using the stored refresh token. Returns true on
+// success and updates devcfg. On failure, returns false; caller decides how
+// to surface it (typically: clear and force re-pair).
+static bool refresh_access_token(void) {
+    const char *refresh = devcfg_x_refresh_token();
+    if (!refresh || !refresh[0]) return false;
+
+    char client_enc[128], rt_enc[600];
+    url_encode(DAEMON_X_CLIENT_ID, client_enc, sizeof(client_enc));
+    url_encode(refresh,            rt_enc,     sizeof(rt_enc));
+
+    char *body = malloc(1024);
+    if (!body) return false;
+    snprintf(body, 1024,
+        "grant_type=refresh_token"
+        "&refresh_token=%s"
+        "&client_id=%s",
+        rt_enc, client_enc);
+
+    char *resp = NULL; int st = 0;
+    bool ok = http_post_with_auth("https://api.x.com/2/oauth2/token",
+                                  body, NULL, NULL, &resp, &st);
+    free(body);
+    if (!ok || st != 200 || !resp) {
+        free(resp);
+        return false;
+    }
+    cJSON *root = cJSON_Parse(resp);
+    free(resp);
+    if (!root) return false;
+    char *access      = json_dup_string(root, "access_token");
+    char *new_refresh = json_dup_string(root, "refresh_token");
+    cJSON *exp        = cJSON_GetObjectItem(root, "expires_in");
+    int    exp_s      = cJSON_IsNumber(exp) ? exp->valueint : 7200;
+    cJSON_Delete(root);
+
+    if (!access || !new_refresh) {
+        free(access); free(new_refresh);
+        return false;
+    }
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    devcfg_set_x_tokens(access, new_refresh, now_s + (uint32_t)exp_s);
+    free(access); free(new_refresh);
+    ESP_LOGI(TAG, "access token refreshed");
+    return true;
+}
+
 bool social_x_post(const char *text,
                    char *out_url, size_t out_url_cap,
                    char *out_err, size_t out_err_cap) {
