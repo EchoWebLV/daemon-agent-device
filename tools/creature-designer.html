@@ -99,6 +99,9 @@
         <button id="btn-load">Load</button>
         <button id="btn-save">Save</button>
         <button id="btn-export">Export C</button>
+        <button id="btn-gif">Export GIF</button>
+        <input id="gif-delay" type="number" value="500" min="20" max="5000" style="width:60px" title="Delay between frames (ms)">
+        <span style="color:#888;font-size:11px">ms</span>
         <button id="btn-reset">Reset</button>
       </span>
     </div>
@@ -736,6 +739,166 @@ document.getElementById("btn-export").addEventListener("click", () => {
   panel.appendChild(btnRow);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
+});
+
+// ---------------------------------------------------------------------------
+//  Export GIF — minimal GIF89a encoder for 2-color animated frames
+// ---------------------------------------------------------------------------
+function renderCreatureToPixels(creature, width, height) {
+  const pixels = new Uint8Array(width * height); // 0=bg, 1=fg
+  const mood = document.getElementById("mood").value;
+  for (const key of Object.keys(PREVIEW_SLOTS)) {
+    const slot = PREVIEW_SLOTS[key];
+    const data = creature[key];
+    if (!data) continue;
+    for (let r = 0; r < slot.rows; r++) {
+      for (let col = 0; col < slot.cols; col++) {
+        if (!data[r][col]) continue;
+        const px = slot.x + col * PX;
+        const py = slot.y + r * PX + FACE_Y_OFFSET;
+        for (let dy = 0; dy < PX; dy++) {
+          for (let dx = 0; dx < PX; dx++) {
+            const x = px + dx, y = py + dy;
+            if (x >= 0 && x < width && y >= 0 && y < height) {
+              pixels[y * width + x] = 1;
+            }
+          }
+        }
+      }
+    }
+  }
+  return pixels;
+}
+
+function lzwEncode(pixels, minCodeSize) {
+  const clearCode = 1 << minCodeSize;
+  const eoiCode = clearCode + 1;
+  let codeSize = minCodeSize + 1;
+  let nextCode = eoiCode + 1;
+  const maxCodeSize = 12;
+
+  const table = new Map();
+  function resetTable() {
+    table.clear();
+    for (let i = 0; i < clearCode; i++) table.set(String(i), i);
+    codeSize = minCodeSize + 1;
+    nextCode = eoiCode + 1;
+  }
+
+  const output = [];
+  let buffer = 0, bufBits = 0;
+  function emit(code) {
+    buffer |= code << bufBits;
+    bufBits += codeSize;
+    while (bufBits >= 8) {
+      output.push(buffer & 0xff);
+      buffer >>= 8;
+      bufBits -= 8;
+    }
+  }
+
+  resetTable();
+  emit(clearCode);
+
+  let prefix = String(pixels[0]);
+  for (let i = 1; i < pixels.length; i++) {
+    const k = prefix + "," + pixels[i];
+    if (table.has(k)) {
+      prefix = k;
+    } else {
+      emit(table.get(prefix));
+      if (nextCode < 4096) {
+        table.set(k, nextCode++);
+        if (nextCode > (1 << codeSize) && codeSize < maxCodeSize) codeSize++;
+      } else {
+        emit(clearCode);
+        resetTable();
+      }
+      prefix = String(pixels[i]);
+    }
+  }
+  emit(table.get(prefix));
+  emit(eoiCode);
+  if (bufBits > 0) output.push(buffer & 0xff);
+  return output;
+}
+
+function buildGif(width, height, frames, delayMs) {
+  const out = [];
+  const w = (v) => { out.push(v & 0xff, (v >> 8) & 0xff); };
+
+  // Header
+  out.push(0x47,0x49,0x46,0x38,0x39,0x61); // GIF89a
+
+  // Logical Screen Descriptor
+  w(width); w(height);
+  out.push(0x80 | 0x00); // GCT flag, 2 colors (size=0 means 2^(0+1)=2)
+  out.push(0x00); // bg color index
+  out.push(0x00); // pixel aspect ratio
+
+  // Global Color Table (2 entries)
+  const mood = document.getElementById("mood").value;
+  const colorHex = MOOD_COLORS[mood] || "#0f0";
+  const r = parseInt(colorHex.length > 4 ? colorHex.slice(1,3) : colorHex[1]+colorHex[1], 16);
+  const g = parseInt(colorHex.length > 4 ? colorHex.slice(3,5) : colorHex[2]+colorHex[2], 16);
+  const b = parseInt(colorHex.length > 4 ? colorHex.slice(5,7) : colorHex[3]+colorHex[3], 16);
+  out.push(0x00,0x00,0x00); // index 0: black
+  out.push(r, g, b);        // index 1: mood color
+
+  // NETSCAPE2.0 extension (infinite loop)
+  out.push(0x21, 0xFF, 0x0B);
+  const ns = "NETSCAPE2.0";
+  for (let i = 0; i < 11; i++) out.push(ns.charCodeAt(i));
+  out.push(0x03, 0x01);
+  w(0); // loop count 0 = infinite
+  out.push(0x00);
+
+  const delay = Math.round(delayMs / 10); // GIF delay is in 1/100s
+
+  for (const pixels of frames) {
+    // Graphic Control Extension
+    out.push(0x21, 0xF9, 0x04);
+    out.push(0x00); // no transparency, no disposal
+    w(delay);
+    out.push(0x00); // transparent color index (unused)
+    out.push(0x00); // terminator
+
+    // Image Descriptor
+    out.push(0x2C);
+    w(0); w(0); // left, top
+    w(width); w(height);
+    out.push(0x00); // no local color table
+
+    // Image Data
+    const minCodeSize = 2;
+    out.push(minCodeSize);
+    const lzw = lzwEncode(pixels, minCodeSize);
+    // Sub-blocks (max 255 bytes each)
+    let idx = 0;
+    while (idx < lzw.length) {
+      const chunk = Math.min(255, lzw.length - idx);
+      out.push(chunk);
+      for (let i = 0; i < chunk; i++) out.push(lzw[idx++]);
+    }
+    out.push(0x00); // block terminator
+  }
+
+  out.push(0x3B); // trailer
+  return new Uint8Array(out);
+}
+
+document.getElementById("btn-gif").addEventListener("click", () => {
+  const delayMs = Math.max(20, parseInt(document.getElementById("gif-delay").value) || 500);
+  const width = 320, height = 240;
+  const frames = roster.map(c => renderCreatureToPixels(c, width, height));
+  const gif = buildGif(width, height, frames, delayMs);
+  const blob = new Blob([gif], { type: "image/gif" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "creatures.gif";
+  a.click();
+  URL.revokeObjectURL(url);
 });
 
 document.getElementById("btn-reset").addEventListener("click", () => {
