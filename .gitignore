@@ -24,5 +24,8 @@ src/generated/
 __pycache__/
 .venv/
 
-# Claude Code local state (settings.local.json, worktrees, etc).
-.claude/
+# Claude Code: ignore local state but track project-shared slash commands
+# and skills. Listing children (.claude/*) instead of the directory itself
+# lets the !commands/ re-include rule actually traverse in.
+.claude/*
+!.claude/commands/
