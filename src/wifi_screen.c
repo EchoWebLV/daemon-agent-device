@@ -405,6 +405,22 @@ bool wifi_screen_init(void) {
 
 lv_obj_t *wifi_screen(void) { return s_scr; }
 
+void wifi_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_scan_btn     = NULL;
+    s_list         = NULL;
+    s_hint         = NULL;
+    s_modal        = NULL;
+    s_modal_title  = NULL;
+    s_pw_input     = NULL;
+    s_keyboard     = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void wifi_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;

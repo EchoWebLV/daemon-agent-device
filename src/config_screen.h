@@ -28,6 +28,7 @@ extern "C" {
 
 bool      config_screen_init(void);
 lv_obj_t *config_screen(void);
+void      config_screen_destroy(void);
 
 void config_screen_set_status(const char *s);
 void config_screen_set_price (const char *s);

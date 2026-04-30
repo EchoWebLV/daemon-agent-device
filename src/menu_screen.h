@@ -20,6 +20,7 @@ extern "C" {
 
 bool      menu_screen_init(void);
 lv_obj_t *menu_screen(void);
+void      menu_screen_destroy(void);
 
 void menu_screen_set_status(const char *s);
 void menu_screen_set_price(const char *s);

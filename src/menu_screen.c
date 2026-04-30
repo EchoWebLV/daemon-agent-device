@@ -108,6 +108,15 @@ bool menu_screen_init(void) {
 
 lv_obj_t *menu_screen(void) { return s_scr; }
 
+void menu_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void menu_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;

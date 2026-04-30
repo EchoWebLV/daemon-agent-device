@@ -114,6 +114,22 @@ bool info_screen_init(void) {
 
 lv_obj_t *info_screen(void) { return s_scr; }
 
+void info_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_label_fw     = NULL;
+    s_label_idf    = NULL;
+    s_label_chip   = NULL;
+    s_label_mac    = NULL;
+    s_label_ip     = NULL;
+    s_label_heap   = NULL;
+    s_label_uptime = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void info_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;

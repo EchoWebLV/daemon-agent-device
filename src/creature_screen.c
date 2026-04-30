@@ -898,3 +898,47 @@ void creature_screen_shake(void) {
     lvgl_port_unlock();
 }
 
+void creature_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+
+    // Stop + delete all cached timers before deleting the screen root.
+    if (s_blink_timer) { lv_timer_delete(s_blink_timer); s_blink_timer = NULL; }
+    if (s_mouth_timer) { lv_timer_delete(s_mouth_timer); s_mouth_timer = NULL; }
+    if (s_sub_timer)   { lv_timer_delete(s_sub_timer);   s_sub_timer   = NULL; }
+    if (s_shake_timer) { lv_timer_delete(s_shake_timer); s_shake_timer = NULL; }
+
+    // Delete the root — LVGL cascades to all children.
+    lv_obj_delete(s_scr);
+
+    // NULL out all cached widget array grids.
+    memset(s_brow_grid_l, 0, sizeof(s_brow_grid_l));
+    memset(s_brow_grid_r, 0, sizeof(s_brow_grid_r));
+    memset(s_eye_grid_l,  0, sizeof(s_eye_grid_l));
+    memset(s_eye_grid_r,  0, sizeof(s_eye_grid_r));
+    memset(s_mouth_idle,  0, sizeof(s_mouth_idle));
+    memset(s_mouth_grid,  0, sizeof(s_mouth_grid));
+
+    // NULL scalar widget pointers.
+    s_price_label = NULL;
+    s_usdc_label  = NULL;
+    s_eye_bar_l   = NULL;
+    s_eye_bar_r   = NULL;
+    s_subtitle    = NULL;
+
+    // Reset state-machine variables so first-paint after rebuild is clean.
+    s_mood           = CREATURE_MOOD_IDLE;
+    s_talking        = false;
+    s_blink_seq      = NULL;
+    s_blink_step     = 0;
+    s_mouth_cyc      = 0;
+    s_shake_frame    = 0;
+    s_sub_page_count = 0;
+    s_sub_page_idx   = 0;
+
+    // s_creature_idx intentionally kept — user's choice persists across rebuilds.
+
+    s_scr = NULL;
+    lvgl_port_unlock();
+}
+

@@ -28,6 +28,7 @@ extern "C" {
 
 bool wallet_screen_init(void);
 lv_obj_t *wallet_screen(void);
+void      wallet_screen_destroy(void);
 
 // Shared status-bar setters mirror the creature screen's API, so the same
 // main-loop pump can update both without a special-case.

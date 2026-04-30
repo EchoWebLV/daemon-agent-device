@@ -18,6 +18,7 @@ extern "C" {
 
 bool      info_screen_init(void);
 lv_obj_t *info_screen(void);
+void      info_screen_destroy(void);
 
 void info_screen_set_status(const char *s);
 void info_screen_set_price (const char *s);

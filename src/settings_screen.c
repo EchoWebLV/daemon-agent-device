@@ -311,6 +311,24 @@ bool settings_screen_init(void) {
 
 lv_obj_t *settings_screen(void) { return s_scr; }
 
+void settings_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_wifi_row     = NULL;
+    s_wifi_title   = NULL;
+    s_wifi_sub     = NULL;
+    s_bt_switch    = NULL;
+    s_vol_slider   = NULL;
+    s_vol_value    = NULL;
+    s_bri_slider   = NULL;
+    s_bri_value    = NULL;
+    s_theme_switch = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void settings_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;

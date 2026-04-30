@@ -31,6 +31,7 @@ typedef void (*settings_wifi_click_cb_t)(void);
 
 bool settings_screen_init(void);
 lv_obj_t *settings_screen(void);
+void      settings_screen_destroy(void);
 
 // Status-bar setters (same API shape as creature/wallet screens).
 void settings_screen_set_status(const char *s);

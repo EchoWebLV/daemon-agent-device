@@ -27,6 +27,7 @@ typedef void (*wifi_screen_connected_cb_t)(void);
 
 bool wifi_screen_init(void);
 lv_obj_t *wifi_screen(void);
+void      wifi_screen_destroy(void);
 
 // Status-bar setters (shared with the other screens).
 void wifi_screen_set_status(const char *s);

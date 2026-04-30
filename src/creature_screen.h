@@ -36,6 +36,11 @@ typedef enum {
 // are no-ops.
 bool creature_screen_init(void);
 
+// Tear down the cached widget tree so it can be rebuilt with a new palette.
+// No-op if not yet initialised. Must NOT be called from inside an LVGL
+// event handler — defer via lv_async_call if needed.
+void creature_screen_destroy(void);
+
 // Root object — pass to lv_screen_load() to show Daemon.
 lv_obj_t *creature_screen(void);
 

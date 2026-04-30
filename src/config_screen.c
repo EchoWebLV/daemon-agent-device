@@ -346,6 +346,23 @@ bool config_screen_init(void) {
 
 lv_obj_t *config_screen(void) { return s_scr; }
 
+void config_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_model_title  = NULL;
+    s_model_chev   = NULL;
+    s_model_body   = NULL;
+    s_voice_title  = NULL;
+    s_voice_chev   = NULL;
+    s_voice_body   = NULL;
+    for (int i = 0; i < MODEL_COUNT; i++) s_model_rows[i] = NULL;
+    for (int i = 0; i < VOICE_COUNT; i++) s_voice_rows[i] = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void config_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;

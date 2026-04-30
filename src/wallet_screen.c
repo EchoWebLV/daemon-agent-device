@@ -186,6 +186,19 @@ bool wallet_screen_init(void) {
 
 lv_obj_t *wallet_screen(void) { return s_scr; }
 
+void wallet_screen_destroy(void) {
+    if (!s_scr) return;
+    if (!lvgl_port_lock(0)) return;
+    lv_obj_delete(s_scr);
+    s_status_label = NULL;
+    s_addr_label   = NULL;
+    s_qrcode       = NULL;
+    s_qr_set       = false;
+    s_list         = NULL;
+    s_scr          = NULL;
+    lvgl_port_unlock();
+}
+
 void wallet_screen_set_status(const char *s) {
     if (!s_status_label) return;
     if (!lvgl_port_lock(0)) return;
