@@ -54,7 +54,7 @@ static const char *TAG = "creature_screen";
 
 // Shift every face block down by this much from the raw coordinates.
 // Tweak in one place to raise/lower the face without touching each feature.
-#define FACE_Y_OFFSET   (-5)
+#define FACE_Y_OFFSET   5
 #define SMILE_MID_Y    (165 + FACE_Y_OFFSET)    // where the talking mouth centers
 
 // --- widget handles --------------------------------------------------------
@@ -897,3 +897,4 @@ void creature_screen_shake(void) {
     }
     lvgl_port_unlock();
 }
+
