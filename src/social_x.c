@@ -327,7 +327,25 @@ bool social_x_finish(const char *code, char *out_err, size_t out_err_cap) {
     return true;
 }
 void social_x_disconnect(void) {
+    const char *tok = devcfg_x_access_token();
+    if (tok && tok[0]) {
+        char client_enc[128], tok_enc[600];
+        url_encode(DAEMON_X_CLIENT_ID, client_enc, sizeof(client_enc));
+        url_encode(tok,                tok_enc,    sizeof(tok_enc));
+        char *body = malloc(1024);
+        if (body) {
+            snprintf(body, 1024,
+                "token=%s&client_id=%s&token_type_hint=access_token",
+                tok_enc, client_enc);
+            char *resp = NULL; int st = 0;
+            (void)http_post_with_auth("https://api.x.com/2/oauth2/revoke",
+                                      body, NULL, NULL, &resp, &st);
+            free(body); free(resp);
+            ESP_LOGI(TAG, "revoke status=%d", st);
+        }
+    }
     devcfg_clear_x();
+    ESP_LOGI(TAG, "disconnected");
 }
 bool social_x_post(const char *text,
                    char *out_url, size_t out_url_cap,
