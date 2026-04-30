@@ -31,7 +31,11 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # (source path relative to project root, C symbol base)
 ASSETS: list[tuple[str, str]] = [
-    ("src/html/index.html", "index_html"),
+    ("src/html/index.html",     "index_html"),
+    # Daemon MCP server source — embedded so any device owner can curl it
+    # straight off the device (GET /mcp.mjs) and configure Claude Code
+    # without needing the repo.
+    ("tools/daemon-mcp.mjs",    "mcp_mjs"),
 ]
 
 

@@ -204,22 +204,24 @@
       <strong>daemon_state</strong> (price + balance + status).
     </p>
     <ol class="hint" style="line-height:1.55;padding-left:18px;margin:6px 0 8px">
-      <li>From your local clone of the <code>board-game</code> repo, run:</li>
+      <li>Paste this one-liner into your terminal — downloads the MCP script
+        from the device and registers it with Claude Code:</li>
     </ol>
-    <pre id="mcp-cmd" class="preview" style="user-select:all;cursor:text">cd /path/to/board-game &amp;&amp; claude mcp add daemon node "$PWD/tools/daemon-mcp.mjs"</pre>
+    <pre id="mcp-cmd" class="preview" style="user-select:all;cursor:text;white-space:pre-wrap;word-break:break-all"></pre>
     <div class="row" style="margin-top:8px">
       <button class="btn" id="mcp-copy">Copy command</button>
       <span id="mcp-copied" style="margin-left:10px;font-size:11px;color:var(--green);display:none">copied</span>
     </div>
     <p class="hint" style="font-size:11px;margin-top:10px;line-height:1.45">
-      Defaults to <code>daemon.local</code> (mDNS — works on macOS / most
-      Linux / Win 10+). If your network blocks mDNS, append
-      <code>-- --ip <span id="mcp-ip">…</span></code> to the command.
+      Auto-discovers Daemon via <code>daemon.local</code> (mDNS — works on
+      macOS / most Linux / Win 10+). If your network blocks mDNS, replace
+      <code>daemon.local</code> with <code><span id="mcp-ip">…</span></code> in the command.
     </p>
     <ol class="hint" start="2" style="line-height:1.55;padding-left:18px;margin:6px 0 0">
       <li>Restart Claude Code.</li>
-      <li>Run <code>/mcp</code> — should list <strong>daemon</strong> with three tools.</li>
-      <li>Try it: "<em>Ping the daemon and tell it I'm done</em>."</li>
+      <li>Verify with <code>claude mcp list</code> in your terminal —
+        should list <strong>daemon</strong>.</li>
+      <li>In a Claude Code session: "<em>Ping the daemon and tell it I'm done</em>."</li>
     </ol>
   </div>
 
@@ -670,17 +672,30 @@ async function refreshXState() {
   } catch (e) { /* offline; leave UI alone */ }
 }
 
-// MCP card: fill the IP placeholder + wire the Copy button. The card is
+// MCP card: build a copy-paste one-liner that downloads the MCP script
+// from the device itself and registers it with Claude Code. The card is
 // always visible (not state-driven) so this runs once at load.
 (function wireMcpCard() {
+  const host = location.hostname || 'daemon.local';
+  // Show the device's actual hostname/IP for the mDNS-fallback hint.
   const ipEl = document.getElementById('mcp-ip');
-  if (ipEl) ipEl.textContent = location.hostname || 'daemon.local';
+  if (ipEl) ipEl.textContent = host;
+  // Construct the one-liner. Steps: ensure ~/.daemon exists, curl the
+  // MCP script down to it, register with Claude Code. The --ip arg is
+  // baked in so the script targets whichever host the web UI is being
+  // accessed through (daemon.local or raw IP — either works).
+  const cmd =
+    `mkdir -p ~/.daemon && ` +
+    `curl -fsSL http://${host}/mcp.mjs -o ~/.daemon/mcp.mjs && ` +
+    `claude mcp add daemon -- node ~/.daemon/mcp.mjs --ip ${host}`;
+  const cmdEl = document.getElementById('mcp-cmd');
+  if (cmdEl) cmdEl.textContent = cmd;
+
   const copyBtn = document.getElementById('mcp-copy');
   const copied  = document.getElementById('mcp-copied');
   if (copyBtn) copyBtn.addEventListener('click', async () => {
-    const txt = document.getElementById('mcp-cmd').textContent.trim();
-    try { await navigator.clipboard.writeText(txt); }
-    catch { /* fallback: select the pre block */ }
+    try { await navigator.clipboard.writeText(cmd); }
+    catch { /* fallback — the <pre> already has user-select:all */ }
     if (copied) { copied.style.display = ''; setTimeout(() => { copied.style.display = 'none'; }, 1500); }
   });
 })();

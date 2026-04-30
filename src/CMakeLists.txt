@@ -41,6 +41,7 @@ idf_component_register(
         # extra_scripts). Exposes index_html_start[] + index_html_len, which
         # server.c serves for GET /.
         "generated/index_html.c"
+        "generated/mcp_mjs.c"
     INCLUDE_DIRS
         "."
     REQUIRES
