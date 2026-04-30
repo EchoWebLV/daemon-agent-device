@@ -129,17 +129,36 @@
 <div class="panel" id="panel-socials">
   <div class="card">
     <h3>X (TWITTER)</h3>
-    <p class="hint" id="x-hint">Connect your X account so Daemon can post drafts you approve on-device.</p>
+    <p class="hint" id="x-hint">Connect your X account. Daemon writes posts from your voice — tap to approve on the device and it goes live immediately.</p>
 
     <!-- setup: enter your dev-app credentials (shown when not configured) -->
     <div id="x-setup" style="display:none">
-      <p class="hint">
-        First-time setup. Register a Native App at
-        <a href="https://developer.x.com/en/portal/dashboard" target="_blank"
-           style="color:var(--accent)">developer.x.com</a>
-        with this redirect URI, then paste the OAuth 2.0 Client ID below.
+      <p class="hint" style="line-height:1.55">
+        First-time setup — register a Daemon app on X (~3 min):
       </p>
-      <label>Redirect URI (use exactly this in your X app)</label>
+      <ol class="hint" style="line-height:1.55;padding-left:18px;margin:6px 0 12px">
+        <li>Open
+          <a href="https://developer.x.com/en/portal/dashboard" target="_blank"
+             style="color:var(--accent)">developer.x.com/portal</a>
+          → <strong>Create Project</strong> → <strong>Create App</strong> inside it.</li>
+        <li>In the app's <strong>User authentication settings</strong>:
+          <ul style="padding-left:18px;margin:4px 0">
+            <li>App permissions: <strong>Read and write</strong></li>
+            <li>Type of App: <strong>Native App</strong></li>
+            <li>Callback URI / Redirect URL: <em>copy from the field below</em></li>
+            <li>Website URL: any valid URL (your blog or the redirect URI)</li>
+          </ul>
+        </li>
+        <li><strong>Save</strong>.</li>
+        <li>Open <strong>Keys and tokens</strong> → copy the
+          <strong>OAuth 2.0 Client ID</strong> (long string ending in <code>:1:ci</code>).</li>
+        <li>Paste it below and tap <strong>Save</strong>.</li>
+        <li>Tap <strong>Connect X</strong>, authorize on x.com, copy the code from the bounce page,
+          paste it back, tap <strong>Finish pairing</strong>.</li>
+        <li>Done — speak a post via PTT, approve on the device, it goes live.</li>
+      </ol>
+
+      <label>Redirect URI — paste this exact URL into your X app's Callback field</label>
       <input id="x-redir" type="text" />
       <label style="margin-top:8px">OAuth 2.0 Client ID</label>
       <input id="x-cid" type="text" placeholder="paste your client id..." />
