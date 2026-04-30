@@ -98,6 +98,19 @@ typedef enum {
 devcfg_theme_t devcfg_theme(void);
 void           devcfg_set_theme(devcfg_theme_t theme);
 
+// X (Twitter) OAuth tokens and handle. Persisted in NVS. Tokens are valid
+// until devcfg_x_token_expiry() (Unix timestamp). devcfg_x_connected()
+// returns true when both access and refresh tokens are non-empty.
+const char *devcfg_x_access_token(void);
+const char *devcfg_x_refresh_token(void);
+uint32_t    devcfg_x_token_expiry(void);
+const char *devcfg_x_handle(void);
+bool        devcfg_x_connected(void);
+
+void devcfg_set_x_tokens(const char *access, const char *refresh, uint32_t exp);
+void devcfg_set_x_handle(const char *handle);
+void devcfg_clear_x(void);
+
 #ifdef __cplusplus
 }
 #endif

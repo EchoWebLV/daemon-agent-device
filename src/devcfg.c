@@ -40,6 +40,10 @@ static const char *TAG = "devcfg";
 #define KEY_SVC_ENABLED     "svc_enabled"
 #define KEY_CREATURE        "creature"
 #define KEY_THEME           "theme"
+#define KEY_X_ACCESS_TOK    "x_access_tok"
+#define KEY_X_REFRESH_TOK   "x_refresh_tok"
+#define KEY_X_TOKEN_EXP     "x_token_exp"
+#define KEY_X_HANDLE        "x_handle"
 
 // CREATURE_DATA_COUNT comes from creatures_data.h — a runtime int sized from
 // the array literal, so adding rows in creatures_data.c just works.
@@ -156,6 +160,13 @@ static char    s_svc_enabled[SVC_ENABLED_MAX];
 static uint8_t s_creature_idx = 0;
 static uint8_t s_theme        = 0;   // 0 = dark, 1 = light
 
+// X (Twitter) OAuth state. Tokens are typically ~150 chars; the x_handle is
+// short. Sized generously to absorb any X-side growth without a future migration.
+static char     s_x_access_tok [512] = {0};
+static char     s_x_refresh_tok[512] = {0};
+static uint32_t s_x_token_exp        = 0;
+static char     s_x_handle     [32]  = {0};
+
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
     if (b < BL_MIN_DUTY) b = BL_MIN_DUTY;
@@ -202,6 +213,11 @@ static void load_u8(nvs_handle_t h, const char *key, uint8_t *out, uint8_t dflt)
     if (nvs_get_u8(h, key, out) != ESP_OK) *out = dflt;
 }
 
+static void load_u32(nvs_handle_t h, const char *key, uint32_t *v, uint32_t fallback) {
+    if (h == 0) { *v = fallback; return; }
+    if (nvs_get_u32(h, key, v) != ESP_OK) *v = fallback;
+}
+
 static void load_bool(nvs_handle_t h, const char *key, bool *out, bool dflt) {
     if (h == 0) { *out = dflt; return; }
     uint8_t v = 0;
@@ -220,6 +236,14 @@ static void save_u8(const char *key, uint8_t v) {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_u8(h, key, v);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void save_u32(const char *key, uint32_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u32(h, key, v);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -256,6 +280,14 @@ esp_err_t devcfg_init(void) {
     if (s_creature_idx >= CREATURE_DATA_COUNT) s_creature_idx = 0;
     load_u8  (h, KEY_THEME,         &s_theme, 0);
     if (s_theme > 1) s_theme = 0;
+    load_str(h, KEY_X_ACCESS_TOK,  s_x_access_tok,  sizeof(s_x_access_tok));
+    load_str(h, KEY_X_REFRESH_TOK, s_x_refresh_tok, sizeof(s_x_refresh_tok));
+    load_str(h, KEY_X_HANDLE,      s_x_handle,      sizeof(s_x_handle));
+    {
+        uint32_t v = 0;
+        load_u32(h, KEY_X_TOKEN_EXP, &v, 0);
+        s_x_token_exp = v;
+    }
 
     if (h != 0) nvs_close(h);
 
@@ -430,4 +462,41 @@ void devcfg_set_theme(devcfg_theme_t theme) {
     s_theme = v;
     save_u8(KEY_THEME, v);
     ESP_LOGI(TAG, "theme → %s", v ? "light" : "dark");
+}
+
+const char *devcfg_x_access_token(void)  { return s_x_access_tok; }
+const char *devcfg_x_refresh_token(void) { return s_x_refresh_tok; }
+uint32_t    devcfg_x_token_expiry(void)  { return s_x_token_exp; }
+const char *devcfg_x_handle(void)        { return s_x_handle; }
+
+void devcfg_set_x_tokens(const char *access, const char *refresh, uint32_t exp) {
+    if (!access)  access  = "";
+    if (!refresh) refresh = "";
+    strlcpy(s_x_access_tok,  access,  sizeof(s_x_access_tok));
+    strlcpy(s_x_refresh_tok, refresh, sizeof(s_x_refresh_tok));
+    s_x_token_exp = exp;
+    save_str(KEY_X_ACCESS_TOK,  s_x_access_tok);
+    save_str(KEY_X_REFRESH_TOK, s_x_refresh_tok);
+    save_u32(KEY_X_TOKEN_EXP,   exp);
+}
+
+void devcfg_set_x_handle(const char *handle) {
+    if (!handle) handle = "";
+    strlcpy(s_x_handle, handle, sizeof(s_x_handle));
+    save_str(KEY_X_HANDLE, s_x_handle);
+}
+
+void devcfg_clear_x(void) {
+    s_x_access_tok[0]  = 0;
+    s_x_refresh_tok[0] = 0;
+    s_x_token_exp      = 0;
+    s_x_handle[0]      = 0;
+    save_str(KEY_X_ACCESS_TOK,  "");
+    save_str(KEY_X_REFRESH_TOK, "");
+    save_u32(KEY_X_TOKEN_EXP,   0);
+    save_str(KEY_X_HANDLE,      "");
+}
+
+bool devcfg_x_connected(void) {
+    return s_x_access_tok[0] != 0 && s_x_refresh_tok[0] != 0;
 }
