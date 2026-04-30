@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "devcfg.h"
+#include "social_x.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -227,13 +228,73 @@ static esp_err_t handle_config_post(httpd_req_t *req) {
     return send_json(req, 200, "{\"ok\":true}");
 }
 
+// --- Social / X handlers -----------------------------------------------------
+
+// GET /social/x/state -> { "connected": bool, "handle"?: str }
+static esp_err_t handle_x_state(httpd_req_t *req) {
+    char body[160];
+    if (devcfg_x_connected()) {
+        snprintf(body, sizeof(body),
+                 "{\"connected\":true,\"handle\":\"%s\"}",
+                 devcfg_x_handle()[0] ? devcfg_x_handle() : "");
+    } else {
+        snprintf(body, sizeof(body), "{\"connected\":false}");
+    }
+    return send_json(req, 200, body);
+}
+
+// POST /social/x/begin -> { "auth_url": "..." }
+static esp_err_t handle_x_begin(httpd_req_t *req) {
+    char url[512];
+    if (!social_x_begin(url, sizeof(url))) {
+        return send_json(req, 500, "{\"error\":\"begin_failed\"}");
+    }
+    char body[600];
+    snprintf(body, sizeof(body), "{\"auth_url\":\"%s\"}", url);
+    return send_json(req, 200, body);
+}
+
+// POST /social/x/finish  body: { "code": "..." } -> { "ok": bool, ... }
+static esp_err_t handle_x_finish(httpd_req_t *req) {
+    char buf[2048];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return send_json(req, 400, "{\"error\":\"no_body\"}");
+    buf[len] = 0;
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad_json\"}");
+    cJSON *code = cJSON_GetObjectItem(root, "code");
+    if (!cJSON_IsString(code) || !code->valuestring) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"missing_code\"}");
+    }
+    char err[64] = {0};
+    bool ok = social_x_finish(code->valuestring, err, sizeof(err));
+    cJSON_Delete(root);
+    if (!ok) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", err);
+        return send_json(req, 400, body);
+    }
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"ok\":true,\"handle\":\"%s\"}",
+             devcfg_x_handle()[0] ? devcfg_x_handle() : "");
+    return send_json(req, 200, body);
+}
+
+// POST /social/x/disconnect -> { "ok": true }
+static esp_err_t handle_x_disconnect(httpd_req_t *req) {
+    social_x_disconnect();
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
 // --- Public API --------------------------------------------------------------
 esp_err_t server_start(void) {
     if (s_httpd) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port     = 80;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 12;
     cfg.lru_purge_enable = true;
     // The /say path runs the full AI pipeline on the httpd task — that's
     // up to four TLS handshakes (LLM, two Solana RPC calls, LLM retry)
@@ -251,6 +312,10 @@ esp_err_t server_start(void) {
         { .uri = "/say",    .method = HTTP_POST, .handler = handle_say         },
         { .uri = "/config", .method = HTTP_GET,  .handler = handle_config_get  },
         { .uri = "/config", .method = HTTP_POST, .handler = handle_config_post },
+        { .uri = "/social/x/state",      .method = HTTP_GET,  .handler = handle_x_state      },
+        { .uri = "/social/x/begin",      .method = HTTP_POST, .handler = handle_x_begin      },
+        { .uri = "/social/x/finish",     .method = HTTP_POST, .handler = handle_x_finish     },
+        { .uri = "/social/x/disconnect", .method = HTTP_POST, .handler = handle_x_disconnect },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &uris[i]),
