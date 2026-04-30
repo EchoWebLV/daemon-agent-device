@@ -230,17 +230,47 @@ static esp_err_t handle_config_post(httpd_req_t *req) {
 
 // --- Social / X handlers -----------------------------------------------------
 
-// GET /social/x/state -> { "connected": bool, "handle"?: str }
+// GET /social/x/state -> { connected, configured, handle?, client_id, redirect_uri }
 static esp_err_t handle_x_state(httpd_req_t *req) {
-    char body[160];
-    if (devcfg_x_connected()) {
-        snprintf(body, sizeof(body),
-                 "{\"connected\":true,\"handle\":\"%s\"}",
-                 devcfg_x_handle()[0] ? devcfg_x_handle() : "");
-    } else {
-        snprintf(body, sizeof(body), "{\"connected\":false}");
-    }
+    // Pre-size for the worst case: redirect URI ~200, client_id ~64, handle ~30,
+    // boilerplate ~80 → 512 is comfortable.
+    char body[512];
+    snprintf(body, sizeof(body),
+             "{\"connected\":%s,\"configured\":%s,"
+             "\"handle\":\"%s\",\"client_id\":\"%s\",\"redirect_uri\":\"%s\"}",
+             devcfg_x_connected()  ? "true" : "false",
+             devcfg_x_configured() ? "true" : "false",
+             devcfg_x_handle()       ? devcfg_x_handle()       : "",
+             devcfg_x_client_id()    ? devcfg_x_client_id()    : "",
+             devcfg_x_redirect_uri() ? devcfg_x_redirect_uri() : "");
     return send_json(req, 200, body);
+}
+
+// POST /social/x/config  body: { client_id, redirect_uri? } -> { ok: true }
+// Persists the dev-app credentials so each user can connect their own X
+// account without a firmware rebuild.
+static esp_err_t handle_x_config(httpd_req_t *req) {
+    char buf[1024];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return send_json(req, 400, "{\"error\":\"no_body\"}");
+    buf[len] = 0;
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad_json\"}");
+
+    cJSON *cid = cJSON_GetObjectItem(root, "client_id");
+    cJSON *uri = cJSON_GetObjectItem(root, "redirect_uri");
+
+    if (!cJSON_IsString(cid) || !cid->valuestring) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"missing_client_id\"}");
+    }
+
+    devcfg_set_x_client_id(cid->valuestring);
+    if (cJSON_IsString(uri) && uri->valuestring && uri->valuestring[0]) {
+        devcfg_set_x_redirect_uri(uri->valuestring);
+    }
+    cJSON_Delete(root);
+    return send_json(req, 200, "{\"ok\":true}");
 }
 
 // POST /social/x/begin -> { "auth_url": "..." }
@@ -313,6 +343,7 @@ esp_err_t server_start(void) {
         { .uri = "/config", .method = HTTP_GET,  .handler = handle_config_get  },
         { .uri = "/config", .method = HTTP_POST, .handler = handle_config_post },
         { .uri = "/social/x/state",      .method = HTTP_GET,  .handler = handle_x_state      },
+        { .uri = "/social/x/config",     .method = HTTP_POST, .handler = handle_x_config     },
         { .uri = "/social/x/begin",      .method = HTTP_POST, .handler = handle_x_begin      },
         { .uri = "/social/x/finish",     .method = HTTP_POST, .handler = handle_x_finish     },
         { .uri = "/social/x/disconnect", .method = HTTP_POST, .handler = handle_x_disconnect },

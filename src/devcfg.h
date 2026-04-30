@@ -111,6 +111,17 @@ void devcfg_set_x_tokens(const char *access, const char *refresh, uint32_t exp);
 void devcfg_set_x_handle(const char *handle);
 void devcfg_clear_x(void);
 
+// Per-device X dev-app credentials. Each user registers their own app at
+// developer.x.com and pastes the OAuth 2.0 Client ID via the SOCIALS tab —
+// no firmware rebuild needed. The redirect URI defaults to the bounce page
+// we host (daemon-x402s-seven.vercel.app/x-callback) on first boot, but can
+// be overridden if the user self-hosts the bounce page.
+const char *devcfg_x_client_id(void);
+const char *devcfg_x_redirect_uri(void);
+bool        devcfg_x_configured(void);     // true once a client_id is set
+void        devcfg_set_x_client_id(const char *id);
+void        devcfg_set_x_redirect_uri(const char *uri);
+
 #ifdef __cplusplus
 }
 #endif

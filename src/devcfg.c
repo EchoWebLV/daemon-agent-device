@@ -44,6 +44,8 @@ static const char *TAG = "devcfg";
 #define KEY_X_REFRESH_TOK   "x_refresh_tok"
 #define KEY_X_TOKEN_EXP     "x_token_exp"
 #define KEY_X_HANDLE        "x_handle"
+#define KEY_X_CLIENT_ID     "x_client_id"
+#define KEY_X_REDIRECT_URI  "x_redir_uri"
 
 // CREATURE_DATA_COUNT comes from creatures_data.h — a runtime int sized from
 // the array literal, so adding rows in creatures_data.c just works.
@@ -162,10 +164,14 @@ static uint8_t s_theme        = 0;   // 0 = dark, 1 = light
 
 // X (Twitter) OAuth state. Tokens are typically ~150 chars; the x_handle is
 // short. Sized generously to absorb any X-side growth without a future migration.
-static char     s_x_access_tok [512] = {0};
-static char     s_x_refresh_tok[512] = {0};
-static uint32_t s_x_token_exp        = 0;
-static char     s_x_handle     [32]  = {0};
+// Client ID + redirect URI are runtime-configurable via the SOCIALS tab so each
+// device owner can register their own X dev app without rebuilding firmware.
+static char     s_x_access_tok  [512] = {0};
+static char     s_x_refresh_tok [512] = {0};
+static uint32_t s_x_token_exp         = 0;
+static char     s_x_handle      [32]  = {0};
+static char     s_x_client_id   [128] = {0};
+static char     s_x_redirect_uri[256] = {0};
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -280,13 +286,24 @@ esp_err_t devcfg_init(void) {
     if (s_creature_idx >= CREATURE_DATA_COUNT) s_creature_idx = 0;
     load_u8  (h, KEY_THEME,         &s_theme, 0);
     if (s_theme > 1) s_theme = 0;
-    load_str(h, KEY_X_ACCESS_TOK,  s_x_access_tok,  sizeof(s_x_access_tok));
-    load_str(h, KEY_X_REFRESH_TOK, s_x_refresh_tok, sizeof(s_x_refresh_tok));
-    load_str(h, KEY_X_HANDLE,      s_x_handle,      sizeof(s_x_handle));
+    load_str(h, KEY_X_ACCESS_TOK,    s_x_access_tok,   sizeof(s_x_access_tok));
+    load_str(h, KEY_X_REFRESH_TOK,   s_x_refresh_tok,  sizeof(s_x_refresh_tok));
+    load_str(h, KEY_X_HANDLE,        s_x_handle,       sizeof(s_x_handle));
+    load_str(h, KEY_X_CLIENT_ID,     s_x_client_id,    sizeof(s_x_client_id));
+    load_str(h, KEY_X_REDIRECT_URI,  s_x_redirect_uri, sizeof(s_x_redirect_uri));
     {
         uint32_t v = 0;
         load_u32(h, KEY_X_TOKEN_EXP, &v, 0);
         s_x_token_exp = v;
+    }
+
+    // First-boot default for the redirect URI — points at the bounce page
+    // we host. Users only need to override this if they self-host the
+    // bounce page on a different domain.
+    if (s_x_redirect_uri[0] == '\0') {
+        strlcpy(s_x_redirect_uri,
+                "https://daemon-x402s-seven.vercel.app/x-callback",
+                sizeof(s_x_redirect_uri));
     }
 
     if (h != 0) nvs_close(h);
@@ -499,4 +516,23 @@ void devcfg_clear_x(void) {
 
 bool devcfg_x_connected(void) {
     return s_x_access_tok[0] != 0 && s_x_refresh_tok[0] != 0;
+}
+
+const char *devcfg_x_client_id(void)    { return s_x_client_id; }
+const char *devcfg_x_redirect_uri(void) { return s_x_redirect_uri; }
+
+bool devcfg_x_configured(void) {
+    return s_x_client_id[0] != 0 && s_x_redirect_uri[0] != 0;
+}
+
+void devcfg_set_x_client_id(const char *id) {
+    if (!id) id = "";
+    strlcpy(s_x_client_id, id, sizeof(s_x_client_id));
+    save_str(KEY_X_CLIENT_ID, s_x_client_id);
+}
+
+void devcfg_set_x_redirect_uri(const char *uri) {
+    if (!uri) uri = "";
+    strlcpy(s_x_redirect_uri, uri, sizeof(s_x_redirect_uri));
+    save_str(KEY_X_REDIRECT_URI, s_x_redirect_uri);
 }

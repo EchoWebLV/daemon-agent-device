@@ -131,9 +131,29 @@
     <h3>X (TWITTER)</h3>
     <p class="hint" id="x-hint">Connect your X account so Daemon can post drafts you approve on-device.</p>
 
-    <!-- not connected -->
+    <!-- setup: enter your dev-app credentials (shown when not configured) -->
+    <div id="x-setup" style="display:none">
+      <p class="hint">
+        First-time setup. Register a Native App at
+        <a href="https://developer.x.com/en/portal/dashboard" target="_blank"
+           style="color:var(--accent)">developer.x.com</a>
+        with this redirect URI, then paste the OAuth 2.0 Client ID below.
+      </p>
+      <label>Redirect URI (use exactly this in your X app)</label>
+      <input id="x-redir" type="text" />
+      <label style="margin-top:8px">OAuth 2.0 Client ID</label>
+      <input id="x-cid" type="text" placeholder="paste your client id..." />
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="x-save-cfg">Save</button>
+      </div>
+      <p class="error" id="x-cfg-err" style="display:none;margin-top:10px"></p>
+    </div>
+
+    <!-- not connected (configured but not paired) -->
     <div id="x-disc" style="display:none">
+      <p class="hint" id="x-cid-pre" style="font-size:11px;color:var(--dim)"></p>
       <button class="btn" id="x-connect">Connect X</button>
+      <button class="btn ghost" id="x-edit-cfg" style="margin-left:6px">Edit credentials</button>
     </div>
 
     <!-- pairing in progress -->
@@ -550,21 +570,53 @@ async function refreshXState() {
   try {
     const r = await fetch('/social/x/state');
     const j = await r.json();
-    const disc = document.getElementById('x-disc');
-    const pair = document.getElementById('x-pair');
-    const conn = document.getElementById('x-conn');
+    const setup = document.getElementById('x-setup');
+    const disc  = document.getElementById('x-disc');
+    const pair  = document.getElementById('x-pair');
+    const conn  = document.getElementById('x-conn');
+    setup.style.display = pair.style.display = disc.style.display = conn.style.display = 'none';
+
+    // Pre-fill the redirect URI either way (defaults from device on first boot).
+    const redirInput = document.getElementById('x-redir');
+    if (redirInput) redirInput.value = j.redirect_uri || '';
+
     if (j.connected) {
-      disc.style.display = 'none';
-      pair.style.display = 'none';
       conn.style.display = '';
       document.getElementById('x-handle').textContent = j.handle || '';
-    } else {
+    } else if (j.configured) {
       disc.style.display = '';
-      pair.style.display = 'none';
-      conn.style.display = 'none';
+      const cidPre = document.getElementById('x-cid-pre');
+      if (cidPre) cidPre.textContent = 'Configured client_id: ' +
+        (j.client_id ? j.client_id.slice(0, 8) + '…' : '(none)');
+    } else {
+      // Not yet configured — show setup form, pre-fill client_id if any.
+      setup.style.display = '';
+      const cidInput = document.getElementById('x-cid');
+      if (cidInput) cidInput.value = j.client_id || '';
     }
   } catch (e) { /* offline; leave UI alone */ }
 }
+
+document.getElementById('x-save-cfg').addEventListener('click', async () => {
+  const cid = document.getElementById('x-cid').value.trim();
+  const uri = document.getElementById('x-redir').value.trim();
+  const errEl = document.getElementById('x-cfg-err');
+  errEl.style.display = 'none';
+  if (!cid) { errEl.textContent = 'Paste your OAuth 2.0 Client ID first.'; errEl.style.display = ''; return; }
+  const r = await fetch('/social/x/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: cid, redirect_uri: uri }),
+  });
+  const j = await r.json();
+  if (j.ok) refreshXState();
+  else { errEl.textContent = 'Save failed: ' + (j.error || 'unknown'); errEl.style.display = ''; }
+});
+
+document.getElementById('x-edit-cfg').addEventListener('click', () => {
+  document.getElementById('x-disc').style.display = 'none';
+  document.getElementById('x-setup').style.display = '';
+});
 
 document.getElementById('x-connect').addEventListener('click', async () => {
   const r = await fetch('/social/x/begin', { method: 'POST' });
@@ -574,7 +626,7 @@ document.getElementById('x-connect').addEventListener('click', async () => {
     document.getElementById('x-disc').style.display = 'none';
     document.getElementById('x-pair').style.display = '';
   } else {
-    alert('Could not start pairing.');
+    alert('Could not start pairing — is the client_id correct?');
   }
 });
 

@@ -20,13 +20,6 @@
 #include "mbedtls/base64.h"
 #include "cJSON.h"
 
-#ifndef DAEMON_X_CLIENT_ID
-#define DAEMON_X_CLIENT_ID "PLACEHOLDER_NOT_CONFIGURED"
-#endif
-#ifndef DAEMON_X_REDIRECT_URI
-#define DAEMON_X_REDIRECT_URI "https://example.com/x-callback"
-#endif
-
 static const char *TAG = "social_x";
 
 // Pairing-time RAM slots. Cleared on success or on a fresh begin() call.
@@ -208,6 +201,10 @@ static char *json_dup_string(cJSON *root, const char *field) {
 }
 
 bool social_x_begin(char *out_url, size_t out_url_cap) {
+    if (!devcfg_x_configured()) {
+        ESP_LOGW(TAG, "X not configured — set client_id via SOCIALS tab first");
+        return false;
+    }
     char challenge[64];
     if (!make_pkce_pair(s_verifier_b64, sizeof(s_verifier_b64),
                         challenge,      sizeof(challenge))) {
@@ -219,8 +216,8 @@ bool social_x_begin(char *out_url, size_t out_url_cap) {
 
     char redir_enc[256];
     char client_enc[128];
-    url_encode(DAEMON_X_REDIRECT_URI, redir_enc,  sizeof(redir_enc));
-    url_encode(DAEMON_X_CLIENT_ID,    client_enc, sizeof(client_enc));
+    url_encode(devcfg_x_redirect_uri(), redir_enc,  sizeof(redir_enc));
+    url_encode(devcfg_x_client_id(),    client_enc, sizeof(client_enc));
     char scope_enc[128];
     url_encode("tweet.read tweet.write users.read offline.access",
                scope_enc, sizeof(scope_enc));
@@ -253,8 +250,8 @@ bool social_x_finish(const char *code, char *out_err, size_t out_err_cap) {
     }
 
     char redir_enc[256], client_enc[128], code_enc[256];
-    url_encode(DAEMON_X_REDIRECT_URI, redir_enc,  sizeof(redir_enc));
-    url_encode(DAEMON_X_CLIENT_ID,    client_enc, sizeof(client_enc));
+    url_encode(devcfg_x_redirect_uri(), redir_enc,  sizeof(redir_enc));
+    url_encode(devcfg_x_client_id(),    client_enc, sizeof(client_enc));
     url_encode(code,                  code_enc,   sizeof(code_enc));
 
     char *body = malloc(1024);
@@ -332,7 +329,7 @@ void social_x_disconnect(void) {
     const char *tok = devcfg_x_access_token();
     if (tok && tok[0]) {
         char client_enc[128], tok_enc[600];
-        url_encode(DAEMON_X_CLIENT_ID, client_enc, sizeof(client_enc));
+        url_encode(devcfg_x_client_id(), client_enc, sizeof(client_enc));
         url_encode(tok,                tok_enc,    sizeof(tok_enc));
         char *body = malloc(1024);
         if (body) {
@@ -395,7 +392,7 @@ static bool refresh_access_token(void) {
     if (!refresh || !refresh[0]) return false;
 
     char client_enc[128], rt_enc[600];
-    url_encode(DAEMON_X_CLIENT_ID, client_enc, sizeof(client_enc));
+    url_encode(devcfg_x_client_id(), client_enc, sizeof(client_enc));
     url_encode(refresh,            rt_enc,     sizeof(rt_enc));
 
     char *body = malloc(1024);
