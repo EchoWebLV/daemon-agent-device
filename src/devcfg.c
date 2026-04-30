@@ -46,6 +46,7 @@ static const char *TAG = "devcfg";
 #define KEY_X_HANDLE        "x_handle"
 #define KEY_X_CLIENT_ID     "x_client_id"
 #define KEY_X_REDIRECT_URI  "x_redir_uri"
+#define KEY_X_STYLE         "x_style"
 
 // CREATURE_DATA_COUNT comes from creatures_data.h — a runtime int sized from
 // the array literal, so adding rows in creatures_data.c just works.
@@ -172,6 +173,9 @@ static uint32_t s_x_token_exp         = 0;
 static char     s_x_handle      [32]  = {0};
 static char     s_x_client_id   [128] = {0};
 static char     s_x_redirect_uri[256] = {0};
+// Free-form style guide injected into the system prompt when post_to_x is
+// available. ~512 chars is enough for a few paragraphs of voice/tone notes.
+static char     s_x_style       [512] = {0};
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -291,6 +295,7 @@ esp_err_t devcfg_init(void) {
     load_str(h, KEY_X_HANDLE,        s_x_handle,       sizeof(s_x_handle));
     load_str(h, KEY_X_CLIENT_ID,     s_x_client_id,    sizeof(s_x_client_id));
     load_str(h, KEY_X_REDIRECT_URI,  s_x_redirect_uri, sizeof(s_x_redirect_uri));
+    load_str(h, KEY_X_STYLE,         s_x_style,        sizeof(s_x_style));
     {
         uint32_t v = 0;
         load_u32(h, KEY_X_TOKEN_EXP, &v, 0);
@@ -535,4 +540,12 @@ void devcfg_set_x_redirect_uri(const char *uri) {
     if (!uri) uri = "";
     strlcpy(s_x_redirect_uri, uri, sizeof(s_x_redirect_uri));
     save_str(KEY_X_REDIRECT_URI, s_x_redirect_uri);
+}
+
+const char *devcfg_x_style(void) { return s_x_style; }
+
+void devcfg_set_x_style(const char *style) {
+    if (!style) style = "";
+    strlcpy(s_x_style, style, sizeof(s_x_style));
+    save_str(KEY_X_STYLE, s_x_style);
 }

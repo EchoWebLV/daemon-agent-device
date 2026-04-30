@@ -122,6 +122,12 @@ bool        devcfg_x_configured(void);     // true once a client_id is set
 void        devcfg_set_x_client_id(const char *id);
 void        devcfg_set_x_redirect_uri(const char *uri);
 
+// Free-form writing-style instructions injected into the LLM's system prompt
+// for X posts only. Empty string = no override; the default Daemon voice is
+// used. Up to 512 chars.
+const char *devcfg_x_style(void);
+void        devcfg_set_x_style(const char *style);
+
 #ifdef __cplusplus
 }
 #endif

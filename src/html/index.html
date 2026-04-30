@@ -192,6 +192,21 @@
       <button class="btn ghost" id="x-disconnect">Disconnect</button>
     </div>
   </div>
+
+  <!-- writing style: separate card so it's always reachable once configured -->
+  <div class="card" id="x-style-card" style="display:none">
+    <h3>X WRITING STYLE</h3>
+    <p class="hint" style="line-height:1.55">
+      Free-form notes the model uses when drafting tweets. Voice, tone,
+      forbidden words, signature emoji, target audience — anything goes.
+      Empty = use the default Daemon voice.
+    </p>
+    <textarea id="x-style" placeholder="e.g. dry sarcastic tech-bro voice, lowercase only, never use hashtags, end with 'gm.'" style="min-height:90px"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="x-style-save">Save style</button>
+      <span id="x-style-saved" style="margin-left:10px;font-size:11px;color:var(--green);display:none">saved</span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -613,8 +628,31 @@ async function refreshXState() {
       const cidInput = document.getElementById('x-cid');
       if (cidInput) cidInput.value = j.client_id || '';
     }
+
+    // Style card: visible whenever the dev-app is configured (with or
+    // without a paired account) so the user can tune tone before pairing.
+    const styleCard = document.getElementById('x-style-card');
+    const styleEl   = document.getElementById('x-style');
+    if (styleCard) styleCard.style.display = j.configured ? '' : 'none';
+    if (styleEl   && document.activeElement !== styleEl) {
+      styleEl.value = j.style || '';
+    }
   } catch (e) { /* offline; leave UI alone */ }
 }
+
+document.getElementById('x-style-save').addEventListener('click', async () => {
+  const style = document.getElementById('x-style').value;
+  const saved = document.getElementById('x-style-saved');
+  const r = await fetch('/social/x/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ style }),
+  });
+  if (r.ok && saved) {
+    saved.style.display = '';
+    setTimeout(() => { saved.style.display = 'none'; }, 1500);
+  }
+});
 
 document.getElementById('x-save-cfg').addEventListener('click', async () => {
   const cid = document.getElementById('x-cid').value.trim();

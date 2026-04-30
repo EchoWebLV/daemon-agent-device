@@ -260,6 +260,17 @@ static void build_system_prompt(char *out, size_t cap,
             "error=\"user_cancelled\" the user declined; just acknowledge.\n");
     }
 
+    // Per-user X writing-style override. Layered AFTER the post_to_x guidance
+    // so it only colors the tweet text the user-style applies to, not the
+    // tool description itself.
+    n = strlen(out);
+    const char *x_style = devcfg_x_style();
+    if (devcfg_x_connected() && x_style && x_style[0] && n + 64 + strlen(x_style) < cap) {
+        snprintf(out + n, cap - n,
+            "X WRITING STYLE (apply only to post_to_x tweet text): %s\n",
+            x_style);
+    }
+
     append_tool_listing(out, cap, services, enabled);
 
     // Tool-call preamble protocol: the firmware speaks the tool's verdict

@@ -230,44 +230,59 @@ static esp_err_t handle_config_post(httpd_req_t *req) {
 
 // --- Social / X handlers -----------------------------------------------------
 
-// GET /social/x/state -> { connected, configured, handle?, client_id, redirect_uri }
+// GET /social/x/state -> { connected, configured, handle?, client_id, redirect_uri, style }
 static esp_err_t handle_x_state(httpd_req_t *req) {
-    // Pre-size for the worst case: redirect URI ~200, client_id ~64, handle ~30,
-    // boilerplate ~80 → 512 is comfortable.
-    char body[512];
-    snprintf(body, sizeof(body),
-             "{\"connected\":%s,\"configured\":%s,"
-             "\"handle\":\"%s\",\"client_id\":\"%s\",\"redirect_uri\":\"%s\"}",
-             devcfg_x_connected()  ? "true" : "false",
-             devcfg_x_configured() ? "true" : "false",
-             devcfg_x_handle()       ? devcfg_x_handle()       : "",
-             devcfg_x_client_id()    ? devcfg_x_client_id()    : "",
-             devcfg_x_redirect_uri() ? devcfg_x_redirect_uri() : "");
-    return send_json(req, 200, body);
+    // Style can be up to 512 chars; size the response buffer to absorb it
+    // plus the other fields without truncation.
+    char *body = malloc(1536);
+    if (!body) return send_json(req, 500, "{\"error\":\"oom\"}");
+
+    // We need to JSON-escape the style string in case it has quotes / backslashes
+    // / newlines. cJSON.h is already available in this file; build via cJSON
+    // for safety rather than hand-escaping.
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root,   "connected",    devcfg_x_connected());
+    cJSON_AddBoolToObject(root,   "configured",   devcfg_x_configured());
+    cJSON_AddStringToObject(root, "handle",       devcfg_x_handle()       ?: "");
+    cJSON_AddStringToObject(root, "client_id",    devcfg_x_client_id()    ?: "");
+    cJSON_AddStringToObject(root, "redirect_uri", devcfg_x_redirect_uri() ?: "");
+    cJSON_AddStringToObject(root, "style",        devcfg_x_style()        ?: "");
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) { free(body); return send_json(req, 500, "{\"error\":\"oom\"}"); }
+    esp_err_t rc = send_json(req, 200, out);
+    free(out);
+    free(body);
+    return rc;
 }
 
-// POST /social/x/config  body: { client_id, redirect_uri? } -> { ok: true }
-// Persists the dev-app credentials so each user can connect their own X
-// account without a firmware rebuild.
+// POST /social/x/config  body: { client_id?, redirect_uri?, style? } -> { ok: true }
+// Persists the dev-app credentials AND/OR the writing style. Each field is
+// optional; only fields present in the body are updated. style accepts an
+// empty string to clear it.
 static esp_err_t handle_x_config(httpd_req_t *req) {
-    char buf[1024];
-    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (len <= 0) return send_json(req, 400, "{\"error\":\"no_body\"}");
+    char *buf = malloc(2048);
+    if (!buf) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int len = httpd_req_recv(req, buf, 2048 - 1);
+    if (len <= 0) { free(buf); return send_json(req, 400, "{\"error\":\"no_body\"}"); }
     buf[len] = 0;
     cJSON *root = cJSON_Parse(buf);
+    free(buf);
     if (!root) return send_json(req, 400, "{\"error\":\"bad_json\"}");
 
-    cJSON *cid = cJSON_GetObjectItem(root, "client_id");
-    cJSON *uri = cJSON_GetObjectItem(root, "redirect_uri");
+    cJSON *cid   = cJSON_GetObjectItem(root, "client_id");
+    cJSON *uri   = cJSON_GetObjectItem(root, "redirect_uri");
+    cJSON *style = cJSON_GetObjectItem(root, "style");
 
-    if (!cJSON_IsString(cid) || !cid->valuestring) {
-        cJSON_Delete(root);
-        return send_json(req, 400, "{\"error\":\"missing_client_id\"}");
+    if (cJSON_IsString(cid) && cid->valuestring) {
+        devcfg_set_x_client_id(cid->valuestring);
     }
-
-    devcfg_set_x_client_id(cid->valuestring);
     if (cJSON_IsString(uri) && uri->valuestring && uri->valuestring[0]) {
         devcfg_set_x_redirect_uri(uri->valuestring);
+    }
+    if (cJSON_IsString(style)) {
+        // Allow empty string to clear the style.
+        devcfg_set_x_style(style->valuestring ? style->valuestring : "");
     }
     cJSON_Delete(root);
     return send_json(req, 200, "{\"ok\":true}");
