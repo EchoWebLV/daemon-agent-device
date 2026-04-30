@@ -21,6 +21,7 @@
 
 #include "devcfg.h"
 #include "price.h"
+#include "social_x.h"
 #include "swap.h"
 #include "voice.h"
 #include "wallet.h"
@@ -432,6 +433,31 @@ static int attach_tools(cJSON *root, const cJSON *services, const cJSON *enabled
         count++;
     }
 
+    // Built-in synthetic tool: post to X. Only exposed when the user has
+    // paired their X account so the LLM doesn't see the tool otherwise.
+    if (devcfg_x_connected()) {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "type", "function");
+        cJSON *fn = cJSON_AddObjectToObject(t, "function");
+        cJSON_AddStringToObject(fn, "name", "post_to_x");
+        cJSON_AddStringToObject(fn, "description",
+            "Draft a tweet for the user's review. Does NOT post immediately — "
+            "the user must approve on the device screen. Only call this when "
+            "the user clearly intends to post (e.g. 'post this', 'tweet that', "
+            "'share on X').");
+        cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+        cJSON_AddStringToObject(p, "type", "object");
+        cJSON *props = cJSON_AddObjectToObject(p, "properties");
+        cJSON *pt = cJSON_AddObjectToObject(props, "text");
+        cJSON_AddStringToObject(pt, "type", "string");
+        cJSON_AddStringToObject(pt, "description",
+            "The post text. <= 280 characters.");
+        cJSON *req = cJSON_AddArrayToObject(p, "required");
+        cJSON_AddItemToArray(req, cJSON_CreateString("text"));
+        cJSON_AddItemToArray(tools, t);
+        count++;
+    }
+
     return count;
 }
 
@@ -562,6 +588,28 @@ static void execute_tool(const cJSON *services, const cJSON *enabled,
             snprintf(out, cap, "{\"ok\":false,\"error\":\"%s\"}", r.error_msg);
         }
         if (args) cJSON_Delete(args);
+        return;
+    }
+
+    if (strcmp(tool_name, "post_to_x") == 0) {
+        cJSON *args = args_json ? cJSON_Parse(args_json) : NULL;
+        const cJSON *jt = args ? cJSON_GetObjectItem(args, "text") : NULL;
+        if (!cJSON_IsString(jt) || !jt->valuestring) {
+            snprintf(out, cap, "{\"ok\":false,\"error\":\"bad_args\"}");
+            if (args) cJSON_Delete(args);
+            return;
+        }
+        char url[200] = {0};
+        char err[64]  = {0};
+        bool ok = social_x_post(jt->valuestring, url, sizeof(url),
+                                                 err, sizeof(err));
+        cJSON_Delete(args);
+        if (ok) {
+            snprintf(out, cap, "{\"ok\":true,\"url\":\"%s\"}", url);
+        } else {
+            snprintf(out, cap, "{\"ok\":false,\"error\":\"%s\"}",
+                     err[0] ? err : "unknown");
+        }
         return;
     }
 
