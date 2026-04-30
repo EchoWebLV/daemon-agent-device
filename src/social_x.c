@@ -2,8 +2,10 @@
 //  X connector — see social_x.h.
 // ---------------------------------------------------------------------------
 #include "social_x.h"
+#include "x_post_screen.h"
 #include "devcfg.h"
 #include "secrets.h"
+#include "freertos/semphr.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -449,6 +451,23 @@ bool social_x_post(const char *text,
     }
     if (!devcfg_x_connected()) {
         cp_err(out_err, out_err_cap, "auth");
+        return false;
+    }
+
+    // Show approval modal — blocks this task until user resolves.
+    x_post_screen_args_t args = {0};
+    strlcpy(args.text,   text,                sizeof(args.text));
+    strlcpy(args.handle, devcfg_x_handle(),   sizeof(args.handle));
+
+    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    if (!sem) { cp_err(out_err, out_err_cap, "oom"); return false; }
+    x_post_ui_result_t ui = X_POST_UI_CANCEL_TIMEOUT;
+    x_post_screen_open(&args, sem, &ui);
+    xSemaphoreTake(sem, portMAX_DELAY);
+    vSemaphoreDelete(sem);
+
+    if (ui != X_POST_UI_CONFIRM) {
+        cp_err(out_err, out_err_cap, "user_cancelled");
         return false;
     }
 
