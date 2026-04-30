@@ -84,6 +84,7 @@
   <button class="tab active" data-tab="chat">CHAT</button>
   <button class="tab" data-tab="settings">SETTINGS</button>
   <button class="tab" data-tab="services">SERVICES</button>
+  <button class="tab" data-tab="socials">SOCIALS</button>
 </div>
 
 <div class="panel active" id="panel-chat">
@@ -122,6 +123,35 @@
     </div>
     <div class="filters" id="filters"></div>
     <div id="svclist"></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-socials">
+  <div class="card">
+    <h3>X (TWITTER)</h3>
+    <p class="hint" id="x-hint">Connect your X account so Daemon can post drafts you approve on-device.</p>
+
+    <!-- not connected -->
+    <div id="x-disc" style="display:none">
+      <button class="btn" id="x-connect">Connect X</button>
+    </div>
+
+    <!-- pairing in progress -->
+    <div id="x-pair" style="display:none">
+      <p class="hint">Authorize on x.com, then paste the code below.</p>
+      <input id="x-code" placeholder="Paste code..." />
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="x-finish">Finish pairing</button>
+        <button class="btn ghost" id="x-cancel">Cancel</button>
+      </div>
+      <p class="error" id="x-pair-err" style="display:none;margin-top:10px"></p>
+    </div>
+
+    <!-- connected -->
+    <div id="x-conn" style="display:none">
+      <p>Connected as <strong>@<span id="x-handle"></span></strong></p>
+      <button class="btn ghost" id="x-disconnect">Disconnect</button>
+    </div>
   </div>
 </div>
 
@@ -514,5 +544,77 @@ $('#addSvc').onclick = () => {
 
 // ────────── boot ──────────
 loadCfg();
+
+// --- SOCIALS / X --------------------------------------------------------
+async function refreshXState() {
+  try {
+    const r = await fetch('/social/x/state');
+    const j = await r.json();
+    const disc = document.getElementById('x-disc');
+    const pair = document.getElementById('x-pair');
+    const conn = document.getElementById('x-conn');
+    if (j.connected) {
+      disc.style.display = 'none';
+      pair.style.display = 'none';
+      conn.style.display = '';
+      document.getElementById('x-handle').textContent = j.handle || '';
+    } else {
+      disc.style.display = '';
+      pair.style.display = 'none';
+      conn.style.display = 'none';
+    }
+  } catch (e) { /* offline; leave UI alone */ }
+}
+
+document.getElementById('x-connect').addEventListener('click', async () => {
+  const r = await fetch('/social/x/begin', { method: 'POST' });
+  const j = await r.json();
+  if (j.auth_url) {
+    window.open(j.auth_url, '_blank');
+    document.getElementById('x-disc').style.display = 'none';
+    document.getElementById('x-pair').style.display = '';
+  } else {
+    alert('Could not start pairing.');
+  }
+});
+
+document.getElementById('x-cancel').addEventListener('click', () => {
+  document.getElementById('x-pair').style.display = 'none';
+  document.getElementById('x-disc').style.display = '';
+});
+
+document.getElementById('x-finish').addEventListener('click', async () => {
+  const code = document.getElementById('x-code').value.trim();
+  const errEl = document.getElementById('x-pair-err');
+  errEl.style.display = 'none';
+  if (!code) { errEl.textContent = 'Paste the code from x.com first.'; errEl.style.display = ''; return; }
+  const r = await fetch('/social/x/finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  const j = await r.json();
+  if (j.ok) {
+    document.getElementById('x-code').value = '';
+    refreshXState();
+  } else {
+    errEl.textContent = 'Failed: ' + (j.error || 'unknown');
+    errEl.style.display = '';
+  }
+});
+
+document.getElementById('x-disconnect').addEventListener('click', async () => {
+  if (!confirm('Disconnect from X?')) return;
+  await fetch('/social/x/disconnect', { method: 'POST' });
+  refreshXState();
+});
+
+document.querySelectorAll('.tab').forEach(t => {
+  if (t.dataset.tab === 'socials') {
+    t.addEventListener('click', refreshXState);
+  }
+});
+
+refreshXState();
 </script>
 </body></html>
