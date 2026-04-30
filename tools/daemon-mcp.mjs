@@ -26,15 +26,12 @@ function parseArgIp() {
   if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
   return null;
 }
-const DAEMON_IP   = parseArgIp() || process.env.DAEMON_IP;
-const DAEMON_BASE = DAEMON_IP ? `http://${DAEMON_IP}` : null;
-
-if (!DAEMON_BASE) {
-  // We don't fail at startup — the client may still want to call tools/list
-  // and inspect the surface. Each tool call will error cleanly until the
-  // user sets DAEMON_IP.
-  log("warn", "DAEMON_IP not set; tool calls will fail until configured");
-}
+// Resolution order: --ip flag > DAEMON_IP env > daemon.local (mDNS).
+// `daemon.local` works on Bonjour-aware hosts (macOS, most Linux with
+// Avahi, Windows 10+). The firmware advertises this hostname as soon as
+// Wi-Fi associates.
+const DAEMON_HOST = parseArgIp() || process.env.DAEMON_IP || "daemon.local";
+const DAEMON_BASE = `http://${DAEMON_HOST}`;
 
 // ---- minimal logger (stderr only — stdout is sacred for JSON-RPC frames) ---
 function log(level, ...args) {

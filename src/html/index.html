@@ -193,6 +193,36 @@
     </div>
   </div>
 
+  <!-- Claude Code (MCP) — separate card, always visible -->
+  <div class="card">
+    <h3>CLAUDE CODE (MCP)</h3>
+    <p class="hint" style="line-height:1.55">
+      Wire Daemon into Claude Code so it can speak on demand from any
+      conversation. Three tools are exposed:
+      <strong>daemon_notify</strong> (speak text — fast, free, no LLM),
+      <strong>daemon_say</strong> (speak in character through the on-device LLM),
+      <strong>daemon_state</strong> (price + balance + status).
+    </p>
+    <ol class="hint" style="line-height:1.55;padding-left:18px;margin:6px 0 8px">
+      <li>From your local clone of the <code>board-game</code> repo, run:</li>
+    </ol>
+    <pre id="mcp-cmd" class="preview" style="user-select:all;cursor:text">cd /path/to/board-game &amp;&amp; claude mcp add daemon node "$PWD/tools/daemon-mcp.mjs"</pre>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="mcp-copy">Copy command</button>
+      <span id="mcp-copied" style="margin-left:10px;font-size:11px;color:var(--green);display:none">copied</span>
+    </div>
+    <p class="hint" style="font-size:11px;margin-top:10px;line-height:1.45">
+      Defaults to <code>daemon.local</code> (mDNS — works on macOS / most
+      Linux / Win 10+). If your network blocks mDNS, append
+      <code>-- --ip <span id="mcp-ip">…</span></code> to the command.
+    </p>
+    <ol class="hint" start="2" style="line-height:1.55;padding-left:18px;margin:6px 0 0">
+      <li>Restart Claude Code.</li>
+      <li>Run <code>/mcp</code> — should list <strong>daemon</strong> with three tools.</li>
+      <li>Try it: "<em>Ping the daemon and tell it I'm done</em>."</li>
+    </ol>
+  </div>
+
   <!-- writing style: separate card so it's always reachable once configured -->
   <div class="card" id="x-style-card" style="display:none">
     <h3>X WRITING STYLE</h3>
@@ -639,6 +669,21 @@ async function refreshXState() {
     }
   } catch (e) { /* offline; leave UI alone */ }
 }
+
+// MCP card: fill the IP placeholder + wire the Copy button. The card is
+// always visible (not state-driven) so this runs once at load.
+(function wireMcpCard() {
+  const ipEl = document.getElementById('mcp-ip');
+  if (ipEl) ipEl.textContent = location.hostname || 'daemon.local';
+  const copyBtn = document.getElementById('mcp-copy');
+  const copied  = document.getElementById('mcp-copied');
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    const txt = document.getElementById('mcp-cmd').textContent.trim();
+    try { await navigator.clipboard.writeText(txt); }
+    catch { /* fallback: select the pre block */ }
+    if (copied) { copied.style.display = ''; setTimeout(() => { copied.style.display = 'none'; }, 1500); }
+  });
+})();
 
 document.getElementById('x-style-save').addEventListener('click', async () => {
   const style = document.getElementById('x-style').value;

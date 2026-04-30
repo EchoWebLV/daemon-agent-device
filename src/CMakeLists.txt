@@ -87,4 +87,7 @@ idf_component_register(
         # See buttons.c. Already pulled transitively through esp-box-3,
         # but listed explicitly because we use its API directly.
         button
+        # mDNS — advertise `daemon.local` once Wi-Fi associates so the MCP
+        # server (and curl from any laptop) can reach the device by name.
+        mdns
 )

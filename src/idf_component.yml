@@ -31,3 +31,7 @@ dependencies:
   # through esp-box-3 but pinned here so an upstream BSP refactor can't
   # silently drop it.
   espressif/button:                "^4.0.0"
+  # mDNS so Daemon advertises itself as `daemon.local` on the local network.
+  # Lets the MCP server (and curl from any laptop) reach the device by name
+  # instead of looking up the IP every time it changes.
+  espressif/mdns:                  "^1.5.0"

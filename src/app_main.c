@@ -18,6 +18,7 @@
 #include "esp_flash.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "mdns.h"
 
 #include "ai.h"
 #include "buttons.h"
@@ -154,6 +155,19 @@ void app_main(void) {
         // wifi failure — no listener without a network to listen on.
         ESP_ERROR_CHECK(server_start());
         server_set_status("idle");
+
+        // mDNS so Claude Code's MCP server and curl can reach us by name.
+        // The hostname becomes "daemon.local" on Bonjour-aware hosts. We
+        // also advertise the HTTP service so network browsers list us.
+        // Failure is non-fatal — the IP-based path keeps working.
+        if (mdns_init() == ESP_OK) {
+            mdns_hostname_set("daemon");
+            mdns_instance_name_set("Daemon");
+            mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+            ESP_LOGI(TAG, "mDNS up — http://daemon.local/");
+        } else {
+            ESP_LOGW(TAG, "mdns_init failed; reach by IP only");
+        }
     }
 
     // AI client + /say handler. ai_begin() resets conversation history and
