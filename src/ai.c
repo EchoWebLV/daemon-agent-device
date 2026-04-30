@@ -245,6 +245,21 @@ static void build_system_prompt(char *out, size_t cap,
         "If it returns error=\"cancelled\" the user declined; just acknowledge. "
         "For other errors, summarise the error_msg.\n");
 
+    n = strlen(out);
+    if (devcfg_x_connected() && n + 480 < cap) {
+        snprintf(out + n, cap - n,
+            "Built-in capability: post_to_x(text). Posts a tweet to the user's "
+            "connected X account. CALL THIS TOOL WHENEVER THE USER ASKS YOU TO "
+            "WRITE / POST / TWEET / SHARE something — even loosely. Examples "
+            "that should trigger it: 'tweet about birds', 'write a tweet about X', "
+            "'post that I just shipped', 'share something funny on X'. The text "
+            "you pass IS the tweet — keep it under 280 chars, no quotes around "
+            "it. The device shows an approval modal and posts only if the user "
+            "confirms; do not describe the approval flow. When the tool returns "
+            "ok=true with a url, briefly confirm the post landed. If it returns "
+            "error=\"user_cancelled\" the user declined; just acknowledge.\n");
+    }
+
     append_tool_listing(out, cap, services, enabled);
 
     // Tool-call preamble protocol: the firmware speaks the tool's verdict
