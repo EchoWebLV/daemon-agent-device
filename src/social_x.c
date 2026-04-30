@@ -347,6 +347,44 @@ void social_x_disconnect(void) {
     devcfg_clear_x();
     ESP_LOGI(TAG, "disconnected");
 }
+// Make a JSON-escaped copy of `s` into `out` for use inside a JSON string.
+// Handles \", \\, \n, \r, \t. Other control bytes get \uXXXX.
+// cap is the size of the output buffer; result is always NUL-terminated.
+// Returns false on truncation.
+static bool json_escape(const char *s, char *out, size_t cap) {
+    static const char H[] = "0123456789abcdef";
+    size_t o = 0;
+    if (cap == 0) return false;
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            if (o + 2 >= cap) goto trunc;
+            out[o++] = '\\'; out[o++] = c;
+        } else if (c == '\n') {
+            if (o + 2 >= cap) goto trunc;
+            out[o++] = '\\'; out[o++] = 'n';
+        } else if (c == '\r') {
+            if (o + 2 >= cap) goto trunc;
+            out[o++] = '\\'; out[o++] = 'r';
+        } else if (c == '\t') {
+            if (o + 2 >= cap) goto trunc;
+            out[o++] = '\\'; out[o++] = 't';
+        } else if (c < 0x20) {
+            if (o + 6 >= cap) goto trunc;
+            out[o++] = '\\'; out[o++] = 'u'; out[o++] = '0'; out[o++] = '0';
+            out[o++] = H[(c >> 4) & 0xF]; out[o++] = H[c & 0xF];
+        } else {
+            if (o + 1 >= cap) goto trunc;
+            out[o++] = c;
+        }
+    }
+    out[o] = 0;
+    return true;
+trunc:
+    out[cap ? cap - 1 : 0] = 0;
+    return false;
+}
+
 // Refresh the access token using the stored refresh token. Returns true on
 // success and updates devcfg. On failure, returns false; caller decides how
 // to surface it (typically: clear and force re-pair).
@@ -397,7 +435,88 @@ static bool refresh_access_token(void) {
 bool social_x_post(const char *text,
                    char *out_url, size_t out_url_cap,
                    char *out_err, size_t out_err_cap) {
-    (void)text; (void)out_url; (void)out_url_cap;
-    (void)out_err; (void)out_err_cap;
+    if (out_url && out_url_cap) out_url[0] = 0;
+    if (out_err && out_err_cap) out_err[0] = 0;
+
+    if (!text || !text[0]) {
+        cp_err(out_err, out_err_cap, "empty");
+        return false;
+    }
+    size_t tlen = strlen(text);
+    if (tlen > 280) {
+        cp_err(out_err, out_err_cap, "too_long");
+        return false;
+    }
+    if (!devcfg_x_connected()) {
+        cp_err(out_err, out_err_cap, "auth");
+        return false;
+    }
+
+    char escaped[1024];
+    if (!json_escape(text, escaped, sizeof(escaped))) {
+        cp_err(out_err, out_err_cap, "too_long");
+        return false;
+    }
+    char body[1100];
+    int n = snprintf(body, sizeof(body), "{\"text\":\"%s\"}", escaped);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        cp_err(out_err, out_err_cap, "too_long");
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const char *tok = devcfg_x_access_token();
+        char *resp = NULL; int st = 0;
+        bool ok = http_post_with_auth("https://api.x.com/2/tweets",
+                                      body, "application/json", tok,
+                                      &resp, &st);
+        if (!ok) {
+            cp_err(out_err, out_err_cap, "network");
+            free(resp);
+            return false;
+        }
+        if (st == 401 && attempt == 0) {
+            free(resp);
+            if (!refresh_access_token()) {
+                devcfg_clear_x();
+                cp_err(out_err, out_err_cap, "auth");
+                return false;
+            }
+            continue;
+        }
+        if (st == 429) {
+            cp_err(out_err, out_err_cap, "rate_limited");
+            free(resp);
+            return false;
+        }
+        if (st < 200 || st >= 300 || !resp) {
+            ESP_LOGW(TAG, "post failed status=%d body=%s", st,
+                     resp ? resp : "(null)");
+            cp_err(out_err, out_err_cap, "network");
+            free(resp);
+            return false;
+        }
+
+        cJSON *root = cJSON_Parse(resp);
+        free(resp);
+        char *id = NULL;
+        if (root) {
+            cJSON *data = cJSON_GetObjectItem(root, "data");
+            if (data) id = json_dup_string(data, "id");
+            cJSON_Delete(root);
+        }
+        if (!id) {
+            cp_err(out_err, out_err_cap, "parse");
+            return false;
+        }
+        if (out_url && out_url_cap) {
+            snprintf(out_url, out_url_cap,
+                     "https://x.com/%s/status/%s",
+                     devcfg_x_handle()[0] ? devcfg_x_handle() : "i", id);
+        }
+        free(id);
+        return true;
+    }
+    cp_err(out_err, out_err_cap, "auth");
     return false;
 }
