@@ -80,10 +80,59 @@ static void make_state_hex(char *out, size_t cap) {
     out[2 * sizeof(b)] = 0;
 }
 
-// stub bodies — implemented in later tasks
+// URL-encode helper — narrow, only what we put into auth URL params.
+static void url_encode(const char *in, char *out, size_t cap) {
+    static const char H[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 4 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') ||
+                           c == '-' || c == '.' || c == '_' || c == '~';
+        if (unreserved) { out[o++] = c; }
+        else {
+            out[o++] = '%';
+            out[o++] = H[(c >> 4) & 0xF];
+            out[o++] = H[(c >> 0) & 0xF];
+        }
+    }
+    if (o < cap) out[o] = 0;
+}
+
 bool social_x_begin(char *out_url, size_t out_url_cap) {
-    (void)out_url; (void)out_url_cap;
-    return false;
+    char challenge[64];
+    if (!make_pkce_pair(s_verifier_b64, sizeof(s_verifier_b64),
+                        challenge,      sizeof(challenge))) {
+        ESP_LOGE(TAG, "PKCE generation failed");
+        return false;
+    }
+    make_state_hex(s_state, sizeof(s_state));
+    s_pairing = true;
+
+    char redir_enc[256];
+    char client_enc[128];
+    url_encode(DAEMON_X_REDIRECT_URI, redir_enc,  sizeof(redir_enc));
+    url_encode(DAEMON_X_CLIENT_ID,    client_enc, sizeof(client_enc));
+    char scope_enc[128];
+    url_encode("tweet.read tweet.write users.read offline.access",
+               scope_enc, sizeof(scope_enc));
+
+    int n = snprintf(out_url, out_url_cap,
+        "https://x.com/i/oauth2/authorize"
+        "?response_type=code"
+        "&client_id=%s"
+        "&redirect_uri=%s"
+        "&scope=%s"
+        "&code_challenge=%s"
+        "&code_challenge_method=S256"
+        "&state=%s",
+        client_enc, redir_enc, scope_enc, challenge, s_state);
+    if (n < 0 || (size_t)n >= out_url_cap) {
+        ESP_LOGE(TAG, "auth URL truncated");
+        return false;
+    }
+    ESP_LOGI(TAG, "pairing started (verifier kept in RAM)");
+    return true;
 }
 bool social_x_finish(const char *code, char *out_err, size_t out_err_cap) {
     (void)code; (void)out_err; (void)out_err_cap;
