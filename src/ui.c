@@ -356,6 +356,106 @@ void ui_show_wifi(void) {
     load_screen_anim(wifi_screen(), "wifi");
 }
 
+// --- live theme switch ------------------------------------------------------
+//
+// Tear down every cached screen, apply the new palette, rebuild them, and
+// reload whichever one was active. Deferred via lv_async_call so the event
+// handler that fired the theme change can return cleanly before its widget
+// gets deleted out from under it.
+
+typedef enum {
+    REBUILD_TARGET_CREATURE,
+    REBUILD_TARGET_MENU,
+    REBUILD_TARGET_WALLET,
+    REBUILD_TARGET_INFO,
+    REBUILD_TARGET_CONFIG,
+    REBUILD_TARGET_SETTINGS,
+    REBUILD_TARGET_WIFI,
+    REBUILD_TARGET_NONE,
+} rebuild_target_t;
+
+typedef struct {
+    ui_theme_t       theme;
+    rebuild_target_t target;
+} rebuild_ctx_t;
+
+static rebuild_target_t identify_active_screen(void) {
+    lv_obj_t *active = lv_screen_active();
+    if (!active) return REBUILD_TARGET_NONE;
+    if (active == creature_screen()) return REBUILD_TARGET_CREATURE;
+    if (active == menu_screen())     return REBUILD_TARGET_MENU;
+    if (active == wallet_screen())   return REBUILD_TARGET_WALLET;
+    if (active == info_screen())     return REBUILD_TARGET_INFO;
+    if (active == config_screen())   return REBUILD_TARGET_CONFIG;
+    if (active == settings_screen()) return REBUILD_TARGET_SETTINGS;
+    if (active == wifi_screen())     return REBUILD_TARGET_WIFI;
+    return REBUILD_TARGET_NONE;
+}
+
+static void load_target(rebuild_target_t t) {
+    switch (t) {
+    case REBUILD_TARGET_CREATURE: lv_screen_load(creature_screen()); break;
+    case REBUILD_TARGET_MENU:     lv_screen_load(menu_screen());     break;
+    case REBUILD_TARGET_WALLET:   lv_screen_load(wallet_screen());   break;
+    case REBUILD_TARGET_INFO:     lv_screen_load(info_screen());     break;
+    case REBUILD_TARGET_CONFIG:   lv_screen_load(config_screen());   break;
+    case REBUILD_TARGET_SETTINGS: lv_screen_load(settings_screen()); break;
+    case REBUILD_TARGET_WIFI:     lv_screen_load(wifi_screen());     break;
+    case REBUILD_TARGET_NONE:     lv_screen_load(creature_screen()); break;
+    }
+}
+
+static void do_rebuild(void *arg) {
+    rebuild_ctx_t *ctx = (rebuild_ctx_t *)arg;
+    if (!ctx) return;
+
+    // Hop to a transient blank screen first — deleting the active screen
+    // out from under LVGL crashes the renderer.
+    lv_obj_t *blank = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(blank, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(blank, LV_OPA_COVER, LV_PART_MAIN);
+    lv_screen_load(blank);
+
+    creature_screen_destroy();
+    menu_screen_destroy();
+    wallet_screen_destroy();
+    info_screen_destroy();
+    config_screen_destroy();
+    settings_screen_destroy();
+    wifi_screen_destroy();
+
+    scr_palette_apply((int)ctx->theme);
+
+    creature_screen_init();
+    menu_screen_init();
+    wallet_screen_init();
+    info_screen_init();
+    config_screen_init();
+    settings_screen_init();
+    wifi_screen_init();
+
+    // Re-attach gesture handlers — they live on each screen root, which
+    // we just rebuilt. Without this, swipe navigation goes dead after a
+    // theme change.
+    ui_tune_gestures();
+
+    load_target(ctx->target);
+    lv_obj_delete(blank);
+    free(ctx);
+}
+
+void ui_apply_theme(ui_theme_t theme) {
+    devcfg_set_theme((devcfg_theme_t)theme);
+    rebuild_ctx_t *ctx = malloc(sizeof(*ctx));
+    if (!ctx) {
+        ESP_LOGE(TAG, "ui_apply_theme: oom");
+        return;
+    }
+    ctx->theme  = theme;
+    ctx->target = identify_active_screen();
+    lv_async_call(do_rebuild, ctx);
+}
+
 // --- broadcasts ------------------------------------------------------------
 
 void ui_set_status(const char *s) {

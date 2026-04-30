@@ -20,7 +20,6 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_system.h"
-#include "esp_timer.h"
 
 static const char *TAG = "settings_screen";
 
@@ -119,33 +118,14 @@ static void vol_slider_changed(lv_event_t *e) {
     if (s_vol_value) lv_label_set_text_fmt(s_vol_value, "%" PRId32, v);
 }
 
-// Theme toggle handler. The runtime palette is set once at boot from
-// devcfg_theme(), so flipping it mid-session has no visible effect on
-// already-built widgets. Persist the new value and reboot — the next
-// boot constructs every screen against the new palette. The 250 ms
-// delay gives the switch its on/off animation and the user a moment to
-// register the click before the panel blacks out for the restart.
-static void theme_restart_cb(void *arg) {
-    (void)arg;
-    esp_restart();
-}
-
+// Theme toggle handler. ui_apply_theme persists the new theme and rebuilds
+// every cached screen with the new palette — no reboot, no Wi-Fi flap, no
+// price-fetch reset. It defers the rebuild via lv_async_call, so this
+// event handler returns cleanly before the firing widget gets deleted.
 static void theme_switch_changed(lv_event_t *e) {
     lv_obj_t *sw = lv_event_get_target(e);
     bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    devcfg_set_theme(checked ? DEVCFG_THEME_LIGHT : DEVCFG_THEME_DARK);
-    // Fire-and-forget timer; survives only until restart.
-    esp_timer_handle_t t = NULL;
-    const esp_timer_create_args_t args = {
-        .callback = theme_restart_cb,
-        .name     = "theme_restart",
-    };
-    if (esp_timer_create(&args, &t) == ESP_OK) {
-        esp_timer_start_once(t, 250 * 1000);  // microseconds
-    } else {
-        // Fallback: restart immediately if the timer subsystem refused us.
-        esp_restart();
-    }
+    ui_apply_theme(checked ? UI_THEME_LIGHT : UI_THEME_DARK);
 }
 
 static void bri_slider_changed(lv_event_t *e) {

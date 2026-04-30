@@ -68,6 +68,13 @@ void ui_set_status(const char *s);
 void ui_set_price(const char *s);
 void ui_set_usdc(const char *s);
 
+// Apply a theme live — no reboot. Tears down all cached screens, applies
+// the new palette, rebuilds them, and reloads whichever screen was active.
+// Safe to call from inside an LVGL event handler — defers via lv_async_call
+// so the firing widget isn't destroyed under its own feet.
+typedef enum { UI_THEME_DARK = 0, UI_THEME_LIGHT = 1 } ui_theme_t;
+void ui_apply_theme(ui_theme_t theme);
+
 // Creature subtitle + mood + talking mouth.
 void ui_set_subtitle(const char *s);
 typedef int ui_mood_t;   // re-exports creature_mood_t through a stable alias
