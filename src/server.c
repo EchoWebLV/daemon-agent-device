@@ -15,6 +15,7 @@
 #include "cJSON.h"
 #include "devcfg.h"
 #include "social_x.h"
+#include "ui.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -105,6 +106,36 @@ static esp_err_t handle_state(httpd_req_t *req) {
     char body[sizeof(escaped) + 32];
     snprintf(body, sizeof(body), "{\"status\":\"%s\"}", escaped);
     return send_json(req, 200, body);
+}
+
+// POST /notify  body: { "text": "..." } -> { "ok": true }
+// Speaks `text` directly without going through the LLM. Use case: external
+// systems (Claude Code stop hooks, CI pipelines, doorbell, …) that just
+// want to push a string at the device. Bypasses chat history + x402 cost
+// since there's no model call.
+static esp_err_t handle_notify(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > BODY_MAX) {
+        return send_json(req, 400, "{\"error\":\"bad body\"}");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int got = httpd_req_recv(req, body, req->content_len);
+    if (got <= 0) { free(body); return send_json(req, 400, "{\"error\":\"empty\"}"); }
+    body[got] = 0;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad_json\"}");
+    cJSON *txt = cJSON_GetObjectItem(root, "text");
+    if (!cJSON_IsString(txt) || !txt->valuestring || !txt->valuestring[0]) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"missing_text\"}");
+    }
+
+    // Updates subtitle, sets mood TALK, kicks voice_speak() async.
+    ui_deliver_reply(txt->valuestring);
+    cJSON_Delete(root);
+    return send_json(req, 200, "{\"ok\":true}");
 }
 
 static esp_err_t handle_say(httpd_req_t *req) {
@@ -355,6 +386,7 @@ esp_err_t server_start(void) {
         { .uri = "/",       .method = HTTP_GET,  .handler = handle_root        },
         { .uri = "/state",  .method = HTTP_GET,  .handler = handle_state       },
         { .uri = "/say",    .method = HTTP_POST, .handler = handle_say         },
+        { .uri = "/notify", .method = HTTP_POST, .handler = handle_notify      },
         { .uri = "/config", .method = HTTP_GET,  .handler = handle_config_get  },
         { .uri = "/config", .method = HTTP_POST, .handler = handle_config_post },
         { .uri = "/social/x/state",      .method = HTTP_GET,  .handler = handle_x_state      },
