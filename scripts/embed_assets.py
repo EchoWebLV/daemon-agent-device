@@ -36,6 +36,9 @@ ASSETS: list[tuple[str, str]] = [
     # straight off the device (GET /mcp.mjs) and configure Claude Code
     # without needing the repo.
     ("tools/daemon-mcp.mjs",    "mcp_mjs"),
+    # One-shot installer that downloads mcp.mjs and registers it with
+    # Claude Code (`claude mcp add daemon -- …`). Served at /install.sh.
+    ("src/html/install.sh",     "install_sh"),
 ]
 
 

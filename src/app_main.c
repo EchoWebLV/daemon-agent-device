@@ -27,6 +27,7 @@
 #include "display.h"
 #include "price.h"
 #include "server.h"
+#include "session_log.h"
 #include "testharness.h"
 #include "touch.h"
 #include "ui.h"
@@ -118,6 +119,11 @@ void app_main(void) {
 
     // Device settings (backlight PWM comes online here at the stored duty).
     ESP_ERROR_CHECK(devcfg_init());
+
+    // Session log: ring buffer of "what Claude just did" entries that gets
+    // injected into the chat system prompt. Mutex must exist before any
+    // append (which can land on the httpd task) or format (AI task).
+    session_log_init();
 
     // TEMP: wipe any stored custom personality so the built-in PERSONA wins.
     // A stale prompt (possibly from a previous build) was overriding ai.c's

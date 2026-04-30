@@ -21,6 +21,7 @@
 
 #include "devcfg.h"
 #include "price.h"
+#include "session_log.h"
 #include "social_x.h"
 #include "swap.h"
 #include "voice.h"
@@ -232,6 +233,23 @@ static void build_system_prompt(char *out, size_t cap,
     double p = price_sol_usd();
     if (p > 0 && used + 48 < cap) {
         snprintf(out + used, cap - used, "Current SOL price: $%.2f USD.\n", p);
+    }
+
+    // Recent actions Claude Code logged via daemon_log. Lets the user ask
+    // "what did we just implement?" by voice and get a real answer instead
+    // of a guess. Skipped silently when the buffer is empty.
+    n = strlen(out);
+    char log_block[2200];
+    size_t log_n = session_log_format(log_block, sizeof(log_block));
+    if (log_n > 0 && (size_t)n + log_n + 256 < cap) {
+        snprintf(out + n, cap - n,
+            "\nRECENT ACTIONS (oldest first, most recent last) — Claude Code "
+            "has been logging what it just did. When the user asks 'what did "
+            "we do?', 'what did we just implement?', 'what was the last "
+            "thing?', or anything similar about recent work, answer ONLY "
+            "from this list. Summarise it; don't read it verbatim. If the "
+            "list is short or empty, say so honestly:\n%s",
+            log_block);
     }
 
     n = strlen(out);

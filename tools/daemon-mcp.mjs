@@ -114,6 +114,33 @@ const TOOLS = {
       return JSON.stringify(r);
     },
   },
+
+  daemon_log: {
+    description:
+      "Record a one-sentence summary of a meaningful step you just " +
+      "completed (a feature shipped, a bug fixed, a decision made, a " +
+      "commit landed). Describe WHAT was accomplished, not what command " +
+      "was run. Examples: 'Added session log ring buffer to firmware', " +
+      "'Fixed blockhash caching bug in x402.c', 'Decided against NVS " +
+      "persistence for v1'. The user can later ask the Daemon by voice " +
+      "'what did we just do?' and the device replays your log entries " +
+      "as context. Call this proactively after every meaningful step. " +
+      "Free, no USDC cost.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "One sentence, under 200 chars, describing what was accomplished.",
+        },
+      },
+      required: ["text"],
+    },
+    async run({ text }) {
+      const r = await postJson("/log", { text });
+      return r.ok ? `Logged: "${text}"` : JSON.stringify(r);
+    },
+  },
 };
 
 // ---- JSON-RPC dispatch -----------------------------------------------------

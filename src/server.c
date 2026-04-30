@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "devcfg.h"
+#include "session_log.h"
 #include "social_x.h"
 #include "ui.h"
 #include "esp_check.h"
@@ -27,6 +28,8 @@ extern const char   index_html_start[];
 extern const size_t index_html_len;
 extern const char   mcp_mjs_start[];
 extern const size_t mcp_mjs_len;
+extern const char   install_sh_start[];
+extern const size_t install_sh_len;
 
 // --- Module state ------------------------------------------------------------
 #define STATUS_MAX 64
@@ -109,6 +112,15 @@ static esp_err_t handle_mcp_mjs(httpd_req_t *req) {
     return httpd_resp_send(req, mcp_mjs_start, mcp_mjs_len);
 }
 
+// GET /install.sh — one-shot installer that downloads mcp.mjs and runs
+// `claude mcp add daemon …` on the user's machine. Designed to be piped:
+//   curl -fsSL http://<host>/install.sh | sh -s <host>
+static esp_err_t handle_install_sh(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
+    return httpd_resp_send(req, install_sh_start, install_sh_len);
+}
+
 static esp_err_t handle_state(httpd_req_t *req) {
     // Worst-case JSON escape of a control byte is \uXXXX (6x), so size the
     // escape buffer 6x the status capacity; the compiler uses the upper bound
@@ -146,6 +158,34 @@ static esp_err_t handle_notify(httpd_req_t *req) {
 
     // Updates subtitle, sets mood TALK, kicks voice_speak() async.
     ui_deliver_reply(txt->valuestring);
+    cJSON_Delete(root);
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
+// POST /log — Claude Code (via the daemon_log MCP tool) appends one line of
+// "what I just did" context. The on-device chat path injects the joined
+// buffer into the system prompt so voice queries like "what did we just
+// implement?" can be answered without round-tripping back to the host.
+static esp_err_t handle_log(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > BODY_MAX) {
+        return send_json(req, 400, "{\"error\":\"bad body\"}");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int got = httpd_req_recv(req, body, req->content_len);
+    if (got <= 0) { free(body); return send_json(req, 400, "{\"error\":\"empty\"}"); }
+    body[got] = 0;
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad_json\"}");
+    cJSON *txt = cJSON_GetObjectItem(root, "text");
+    if (!cJSON_IsString(txt) || !txt->valuestring || !txt->valuestring[0]) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"missing_text\"}");
+    }
+
+    session_log_append(txt->valuestring);
     cJSON_Delete(root);
     return send_json(req, 200, "{\"ok\":true}");
 }
@@ -396,10 +436,12 @@ esp_err_t server_start(void) {
 
     static const httpd_uri_t uris[] = {
         { .uri = "/",        .method = HTTP_GET,  .handler = handle_root        },
-        { .uri = "/mcp.mjs", .method = HTTP_GET,  .handler = handle_mcp_mjs     },
+        { .uri = "/mcp.mjs",    .method = HTTP_GET,  .handler = handle_mcp_mjs     },
+        { .uri = "/install.sh", .method = HTTP_GET,  .handler = handle_install_sh  },
         { .uri = "/state",   .method = HTTP_GET,  .handler = handle_state       },
         { .uri = "/say",    .method = HTTP_POST, .handler = handle_say         },
         { .uri = "/notify", .method = HTTP_POST, .handler = handle_notify      },
+        { .uri = "/log",    .method = HTTP_POST, .handler = handle_log         },
         { .uri = "/config", .method = HTTP_GET,  .handler = handle_config_get  },
         { .uri = "/config", .method = HTTP_POST, .handler = handle_config_post },
         { .uri = "/social/x/state",      .method = HTTP_GET,  .handler = handle_x_state      },

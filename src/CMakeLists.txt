@@ -21,6 +21,7 @@ idf_component_register(
         "menu_screen.c"
         "price.c"
         "server.c"
+        "session_log.c"
         "social_x.c"
         "settings_screen.c"
         "solana_tx.c"
@@ -42,6 +43,7 @@ idf_component_register(
         # server.c serves for GET /.
         "generated/index_html.c"
         "generated/mcp_mjs.c"
+        "generated/install_sh.c"
     INCLUDE_DIRS
         "."
     REQUIRES
