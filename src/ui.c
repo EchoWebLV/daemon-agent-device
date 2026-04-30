@@ -434,9 +434,11 @@ static void do_rebuild(void *arg) {
     settings_screen_init();
     wifi_screen_init();
 
-    // Re-attach gesture handlers — they live on each screen root, which
-    // we just rebuilt. Without this, swipe navigation goes dead after a
-    // theme change.
+    // Re-attach gesture handlers — the old callbacks were tied to the
+    // (now-deleted) original screen roots, so swipes go dead without this.
+    // ui_tune_gestures() only adjusts the threshold; install_swipe_handlers
+    // is what actually wires the LV_EVENT_GESTURE callbacks.
+    install_swipe_handlers();
     ui_tune_gestures();
 
     load_target(ctx->target);
