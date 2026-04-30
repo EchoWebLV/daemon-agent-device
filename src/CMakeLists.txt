@@ -21,6 +21,7 @@ idf_component_register(
         "menu_screen.c"
         "price.c"
         "server.c"
+        "social_x.c"
         "settings_screen.c"
         "solana_tx.c"
         "stt.c"
