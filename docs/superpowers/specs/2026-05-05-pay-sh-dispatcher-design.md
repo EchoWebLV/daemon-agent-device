@@ -393,19 +393,21 @@ Modeled directly on [src/swap_screen.c](../../../src/swap_screen.c). Same
 hold-to-confirm primitive (touch-IC hold detection ≈ 3s).
 
 ```
-┌───────────────────────────────┐
+┌────────────────────────[X]────┐
 │  Pay $0.42 to AgentMail?      │
 │  Send email                   │
 │                               │
-│  [Hold to confirm  ●●●○○○]    │
-│  Swipe left to cancel         │
+│        ╭──╮                   │
+│        │ 3│  hold              │
+│        ╰──╯                   │
 └───────────────────────────────┘
 ```
 
-Cancel triggers:
-- 3s hold completes → `CONFIRM_OK`
-- Swipe left → `CONFIRM_DENIED`
-- 30s timeout → `CONFIRM_DENIED`
+Cancel triggers (mirroring [swap_screen.c](../../../src/swap_screen.c) exactly — swipe is intentionally NOT a trigger because the CTP panel emits gesture events as capacitive jitter during a static hold):
+- 3s continuous touch on the dial → `CONFIRM_OK`
+- Touch released before 3s → `CONFIRM_DENIED` (release-cancel)
+- Top-right `[X]` button tapped → `CONFIRM_DENIED`
+- 30s with no touch → `CONFIRM_DENIED` (timeout)
 - PTT button press → `CONFIRM_DENIED` (uses generation counter, cancels everything cleanly)
 
 Voice cue: TTS speaks `"<price> to <provider>. Hold to confirm."` only
@@ -508,7 +510,7 @@ full summary round, same as today.
 | Guard decision | Unit (host) | Decision matrix: 8 cases (auto / confirm / refuse × under / over daily cap), assert correct enum |
 | Daily counter | Unit (host) | UTC-day rollover: write at 23:59, read at 00:01, assert reset; reboot mid-day persists |
 | HTTP endpoints | Integration (device) | POST/GET `/api/services` and `/api/spending` round-trip, persist across reboot |
-| Hold-confirm modal | Hardware manual | Hold → confirm, swipe → cancel, 30s timeout → cancel, PTT-press → cancel |
+| Hold-confirm modal | Hardware manual | Hold 3s → confirm, release < 3s → cancel, [X] tap → cancel, 30s timeout → cancel, PTT-press → cancel |
 | End-to-end (free) | Hardware manual | Wire AgentMail / Crush Rewards / dtelecom (free tiers) via web admin, voice "send a test email" / "search shoes" / "transcribe this", verify result |
 | End-to-end (paid) | Hardware manual | Smallest-price provider (~$0.001), real USDC, one call, verify on-chain transfer + counter increment |
 | WiFi failure | Hardware manual | Kill WiFi between 402-receive and sign — verify no signature submitted |
