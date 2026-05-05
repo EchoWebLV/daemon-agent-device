@@ -376,6 +376,53 @@ static esp_err_t handle_x_disconnect(httpd_req_t *req) {
     return send_json(req, 200, "{\"ok\":true}");
 }
 
+// --- Spending handlers -------------------------------------------------------
+
+// GET /api/spending -> { auto_max_cents, confirm_max_cents, daily_cap_cents,
+//                        today_micros, today_utc_day }
+static esp_err_t handle_spending_get(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return send_json(req, 500, "{\"error\":\"oom\"}");
+
+    cJSON_AddNumberToObject(root, "auto_max_cents",    (double)devcfg_spend_auto_max_cents());
+    cJSON_AddNumberToObject(root, "confirm_max_cents", (double)devcfg_spend_confirm_max_cents());
+    cJSON_AddNumberToObject(root, "daily_cap_cents",   (double)devcfg_spend_daily_cap_cents());
+    cJSON_AddNumberToObject(root, "today_micros",      (double)devcfg_spend_today_micros());
+    cJSON_AddNumberToObject(root, "today_utc_day",     (double)devcfg_spend_today_utc_day());
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) return send_json(req, 500, "{\"error\":\"oom\"}");
+    esp_err_t rc = send_json(req, 200, out);
+    cJSON_free(out);
+    return rc;
+}
+
+// POST /api/spending  body: { auto_max_cents?, confirm_max_cents?, daily_cap_cents? }
+// Each field is optional; only present fields are updated. Reply { "ok": true }.
+static esp_err_t handle_spending_post(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > 256) {
+        return send_json(req, 400, "{\"error\":\"bad length\"}");
+    }
+    char buf[257];
+    int n = read_body(req, buf, sizeof(buf));
+    if (n < 0) return send_json(req, 400, "{\"error\":\"recv\"}");
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad json\"}");
+
+    const cJSON *j_auto    = cJSON_GetObjectItemCaseSensitive(root, "auto_max_cents");
+    const cJSON *j_confirm = cJSON_GetObjectItemCaseSensitive(root, "confirm_max_cents");
+    const cJSON *j_daily   = cJSON_GetObjectItemCaseSensitive(root, "daily_cap_cents");
+
+    if (cJSON_IsNumber(j_auto))    devcfg_set_spend_auto_max_cents((uint32_t)j_auto->valuedouble);
+    if (cJSON_IsNumber(j_confirm)) devcfg_set_spend_confirm_max_cents((uint32_t)j_confirm->valuedouble);
+    if (cJSON_IsNumber(j_daily))   devcfg_set_spend_daily_cap_cents((uint32_t)j_daily->valuedouble);
+
+    cJSON_Delete(root);
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
 // --- Public API --------------------------------------------------------------
 esp_err_t server_start(void) {
     if (s_httpd) return ESP_OK;
@@ -407,6 +454,8 @@ esp_err_t server_start(void) {
         { .uri = "/social/x/begin",      .method = HTTP_POST, .handler = handle_x_begin      },
         { .uri = "/social/x/finish",     .method = HTTP_POST, .handler = handle_x_finish     },
         { .uri = "/social/x/disconnect", .method = HTTP_POST, .handler = handle_x_disconnect },
+        { .uri = "/api/spending",        .method = HTTP_GET,  .handler = handle_spending_get  },
+        { .uri = "/api/spending",        .method = HTTP_POST, .handler = handle_spending_post },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &uris[i]),
