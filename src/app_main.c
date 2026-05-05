@@ -25,6 +25,7 @@
 #include "creature_screen.h"
 #include "devcfg.h"
 #include "display.h"
+#include "payapi.h"
 #include "price.h"
 #include "server.h"
 #include "testharness.h"
@@ -168,6 +169,12 @@ void app_main(void) {
         } else {
             ESP_LOGW(TAG, "mdns_init failed; reach by IP only");
         }
+
+        // Pay.sh dispatcher: fetch catalog + enabled providers' openapi specs,
+        // slim into LLM tools, register with ai.c. Spawns a background task
+        // that doesn't block. payapi_init is idempotent so reconnect events
+        // don't re-spawn the task.
+        payapi_init();
     }
 
     // AI client + /say handler. ai_begin() resets conversation history and
