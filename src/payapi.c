@@ -3,8 +3,6 @@
 // ---------------------------------------------------------------------------
 #include "payapi.h"
 
-#include <string.h>
-
 #include "cJSON.h"
 #include "esp_log.h"
 
