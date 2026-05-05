@@ -507,7 +507,7 @@ static volatile bool s_speech_in_flight = false;
 // matches — lets a fresh press interrupt a busy task without waiting for
 // the old HTTPS round-trip to unwind. Old tasks become silent zombies that
 // just free their pcm and exit.
-static volatile uint32_t s_ptt_gen = 0;
+volatile uint32_t s_ptt_gen = 0;  // extern'd by pay_confirm_screen.c and payapi.c
 
 // Per-press state captured by ptt_start, consumed by speech_task. Static
 // rather than packed into pcm because lv_async_call carries a single void*

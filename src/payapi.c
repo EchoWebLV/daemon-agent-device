@@ -17,7 +17,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "pay_confirm_screen.h"
+#include "voice.h"
 #include "wifi_sta.h"
+
+extern volatile uint32_t s_ptt_gen;  // declared in creature_screen.c
 
 static const char *TAG = "payapi";
 
@@ -965,7 +969,6 @@ x402_guard_decision_t payapi_guard(uint64_t actual_micros,
                                    const char *description,
                                    void *user)
 {
-    (void)description;
     (void)user;
 
     uint64_t today  = devcfg_spend_today_micros();
@@ -982,18 +985,23 @@ x402_guard_decision_t payapi_guard(uint64_t actual_micros,
     if (actual_micros <= auto_) {
         return X402_GUARD_AUTO;
     }
-    if (actual_micros <= conf_) {
-        // TODO(Task 12): open pay_confirm_screen modal here. For now refuse
-        // anything that would have needed the modal — never silently pay
-        // above the auto cap.
-        ESP_LOGW(TAG, "guard REFUSE: hold-confirm path not yet implemented "
-                       "(actual=%llu, auto=%llu, conf=%llu)",
-                 actual_micros, auto_, conf_);
+    if (actual_micros > conf_) {
+        ESP_LOGW(TAG, "guard REFUSE: actual=%llu > confirm cap=%llu",
+                 actual_micros, conf_);
         return X402_GUARD_REFUSE;
     }
-    ESP_LOGW(TAG, "guard REFUSE: actual=%llu > confirm cap=%llu",
-             actual_micros, conf_);
-    return X402_GUARD_REFUSE;
+
+    // Hold-confirm window. Speak the price first IF >= $1.00.
+    if (actual_micros >= 1000000ULL) {
+        char say[96];
+        double d = (double)actual_micros / 1e6;
+        snprintf(say, sizeof(say), "%.2f to confirm. Hold the screen.", d);
+        voice_speak_chunk(say);  // non-blocking: copies into queue internally
+    }
+
+    return pay_confirm_screen_show_blocking(actual_micros,
+                                            description ? description : "",
+                                            s_ptt_gen);
 }
 
 // ---------------------------------------------------------------------------
