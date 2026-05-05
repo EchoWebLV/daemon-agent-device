@@ -115,16 +115,15 @@
 </div>
 
 <div class="panel" id="panel-services">
-  <div class="card">
-    <h3>X402 SERVICES</h3>
-    <p class="hint">Enable services the model can call as tools. Each call is paid in USDC from Daemon's wallet via the x402 protocol.</p>
-    <div class="row" style="gap:6px;margin-bottom:8px">
-      <input id="svcSearch" placeholder="search services…"/>
-      <button class="btn" id="addSvc">+ add</button>
-    </div>
-    <div class="filters" id="filters"></div>
-    <div id="svclist"></div>
+  <h2>Services</h2>
+  <div class="row">
+    <button class="btn" id="services-refresh-catalog">Refresh catalog</button>
+    <span id="services-catalog-meta" style="margin-left:10px;font-size:12px;color:var(--dim);align-self:center"></span>
   </div>
+  <div id="services-meter" style="margin:10px 0;font-size:13px">Tools enabled: <span id="services-tool-count">0</span> / 50</div>
+  <div id="services-list"></div>
+  <button class="btn" id="services-save" style="margin-top:10px">Save</button>
+  <p id="services-status" style="font-size:12px;min-height:16px;margin:8px 0 0"></p>
 </div>
 
 <div class="panel" id="panel-socials">
@@ -876,6 +875,189 @@ document.querySelectorAll('.tab').forEach(t => {
       clearInterval(spendPollTimer);
       spendPollTimer = null;
     });
+  }
+});
+
+// ────────── services (pay.sh catalog) ──────────
+let catalog = null;         // cached pay.sh response
+let enabled = { v: 1, items: [] };  // local edit buffer
+let providerStatus = {};            // fqn → { loaded, tool_count }
+
+async function loadServicesState() {
+  try {
+    const sr = await fetch('/api/services');
+    const sj = await sr.json();
+    enabled = { v: 1, items: sj.items || [] };
+    providerStatus = {};
+    for (const p of (sj.providers || [])) providerStatus[p.fqn] = p;
+    if (!catalog) {
+      const cr = await fetch('https://pay.sh/api/catalog');
+      catalog = await cr.json();
+    }
+    document.getElementById('services-catalog-meta').textContent =
+      catalog.provider_count + ' providers';
+    await renderServicesList();
+  } catch(e) {
+    document.getElementById('services-status').textContent = 'Error loading: ' + e;
+  }
+}
+
+function isEnabled(fqn) {
+  return enabled.items.some(i => i.fqn === fqn);
+}
+function getEnabledItem(fqn) {
+  return enabled.items.find(i => i.fqn === fqn);
+}
+
+function setProviderEnabled(prov, on) {
+  enabled.items = enabled.items.filter(i => i.fqn !== prov.fqn);
+  if (on) {
+    enabled.items.push({
+      fqn: prov.fqn,
+      service_url: prov.service_url,
+      endpoints: 'all',
+    });
+  }
+  renderServicesList();
+}
+
+async function ensureProviderEndpoints(prov) {
+  if (prov._openapi) return prov._openapi;
+  try {
+    const r = await fetch(`${prov.service_url}/openapi.json`);
+    const j = await r.json();
+    const eps = [];
+    for (const [path, methods] of Object.entries(j.paths || {})) {
+      for (const m of ['get', 'post', 'put', 'patch', 'delete']) {
+        if (!methods[m]) continue;
+        eps.push(`${m.toUpperCase()} ${path}`);
+      }
+    }
+    prov._openapi = eps;
+    return eps;
+  } catch (e) {
+    return null;
+  }
+}
+
+function setEndpointEnabled(prov, ep, on) {
+  let item = getEnabledItem(prov.fqn);
+  if (!item) {
+    item = { fqn: prov.fqn, service_url: prov.service_url, endpoints: [] };
+    enabled.items.push(item);
+  }
+  if (item.endpoints === 'all') {
+    item.endpoints = (prov._openapi || []).slice();
+  }
+  if (on) {
+    if (!item.endpoints.includes(ep)) item.endpoints.push(ep);
+  } else {
+    item.endpoints = item.endpoints.filter(x => x !== ep);
+  }
+}
+
+function totalEnabledEndpoints() {
+  let n = 0;
+  for (const i of enabled.items) {
+    n += i.endpoints === 'all'
+      ? (catalog.providers.find(p => p.fqn === i.fqn)?.endpoint_count ?? 999)
+      : i.endpoints.length;
+  }
+  return n;
+}
+
+async function renderServicesList() {
+  const root = document.getElementById('services-list');
+  root.innerHTML = '';
+  document.getElementById('services-tool-count').textContent =
+    totalEnabledEndpoints();
+  if (!catalog || !catalog.providers) return;
+  for (const prov of catalog.providers) {
+    const row = document.createElement('div');
+    row.className = 'service-row';
+    row.style.cssText = 'padding:8px 0;border-top:1px solid var(--border)';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = isEnabled(prov.fqn);
+    cb.style.marginRight = '8px';
+    cb.addEventListener('change', () => setProviderEnabled(prov, cb.checked));
+    const stat = providerStatus[prov.fqn];
+    const label = document.createElement('span');
+    label.style.fontSize = '13px';
+    label.textContent =
+      prov.title + '  ' + prov.category +
+      '  $' + prov.min_price_usd.toFixed(3) + '–$' + prov.max_price_usd.toFixed(2) +
+      (stat ? '  ' + (stat.loaded ? '✓' : '✗') + ' ' + stat.tool_count + ' tools' : '');
+    row.appendChild(cb);
+    row.appendChild(label);
+
+    if (cb.checked) {
+      const sub = document.createElement('div');
+      sub.style.marginLeft = '24px';
+      const eps = await ensureProviderEndpoints(prov);
+      if (!eps) {
+        sub.textContent = '(failed to load openapi)';
+        sub.style.cssText = 'margin-left:24px;font-size:11px;color:var(--dim)';
+      } else {
+        for (const ep of eps) {
+          const ecb = document.createElement('input');
+          ecb.type = 'checkbox';
+          ecb.style.marginRight = '6px';
+          const item = getEnabledItem(prov.fqn);
+          ecb.checked = (item && (item.endpoints === 'all'
+                              || item.endpoints.includes(ep)));
+          ecb.addEventListener('change', () => {
+            setEndpointEnabled(prov, ep, ecb.checked);
+            document.getElementById('services-tool-count').textContent =
+              totalEnabledEndpoints();
+          });
+          const elbl = document.createElement('span');
+          elbl.textContent = ep;
+          elbl.style.fontSize = '11px';
+          const erow = document.createElement('div');
+          erow.style.padding = '3px 0';
+          erow.appendChild(ecb);
+          erow.appendChild(elbl);
+          sub.appendChild(erow);
+        }
+      }
+      row.appendChild(sub);
+    }
+    root.appendChild(row);
+  }
+}
+
+async function saveServices() {
+  try {
+    const r = await fetch('/api/services', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(enabled),
+    });
+    const st = document.getElementById('services-status');
+    if (r.ok) {
+      st.style.color = 'var(--green)';
+      st.textContent = 'Saved. Re-fetching providers in background.';
+    } else {
+      st.style.color = 'var(--red)';
+      st.textContent = 'Save failed.';
+    }
+    setTimeout(() => { st.textContent = ''; }, 2500);
+  } catch(e) {
+    document.getElementById('services-status').textContent = 'Error: ' + e;
+  }
+}
+
+document.getElementById('services-save').addEventListener('click', saveServices);
+document.getElementById('services-refresh-catalog').addEventListener('click', async () => {
+  const r = await fetch('/api/services/refresh_catalog', { method: 'POST' });
+  if (r.ok) { catalog = null; loadServicesState(); }
+});
+
+// Hook loadServicesState to SERVICES tab activation.
+document.querySelectorAll('.tab').forEach(t => {
+  if (t.dataset.tab === 'services') {
+    t.addEventListener('click', loadServicesState);
   }
 });
 </script>
