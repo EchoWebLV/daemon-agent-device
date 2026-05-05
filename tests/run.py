@@ -5,6 +5,25 @@ tests/run.py — host driver for the on-device smoke-test harness.
 See docs/superpowers/specs/2026-04-22-e2e-device-tests-design.md for the
 protocol and test-case contract. Everything the runner needs lives in this
 single file on purpose: readable top-to-bottom, no test framework.
+
+Manual E2E checklist (hardware required — run after flashing the pay-sh-dispatcher firmware):
+
+1. Free-tier path — enable AgentMail in web admin -> voice "create a test inbox" ->
+   tool fires -> response spoken; no modal.
+
+2. Hold-confirm path — drop auto cap to $0.0001 -> enable a $0.01 provider -> voice a
+   request -> modal opens -> hold 3s confirms; release early denies.
+
+3. TTS cue threshold — voice a request that resolves to >= $1 cost -> TTS speaks the
+   price BEFORE the modal opens; sub-$1 is silent.
+
+4. Daily-cap refusal — set daily cap = today + small headroom -> voice a request that
+   would exceed -> "That'd put you over your spending limits." spoken; counter unchanged.
+
+5. PTT mid-modal — trigger pay-confirm modal -> press PTT -> modal closes DENIED.
+
+6. Reboot persistence — paid call increments counter -> reboot -> settings detail shows
+   same today; UTC-midnight rollover resets to 0.
 """
 
 import argparse
@@ -401,12 +420,108 @@ def _make_x402_case(
     return fn
 
 
+# --- payapi cases ----------------------------------------------------------
+
+def c_payapi_catalog_refresh(dev: Device) -> str:
+    """PAYAPI REFRESH_CATALOG: catalog fetch succeeds and reports >= 1 provider."""
+    resp = dev.send("TEST PAYAPI REFRESH_CATALOG", timeout=15.0)[0]
+    assert "ok=1" in resp, f"got: {resp}"
+    return f"({resp.strip()})"
+
+
+def c_payapi_provider_refresh(dev: Device) -> str:
+    """PAYAPI REFRESH_PROVIDER: per-provider openapi fetch includes expected fqn."""
+    # Ensure catalog is present first (idempotent).
+    dev.send("TEST PAYAPI REFRESH_CATALOG", timeout=15.0)
+    resp = dev.send("TEST PAYAPI REFRESH_PROVIDER agentmail/email", timeout=20.0)[0]
+    assert "fqn=agentmail/email" in resp, f"got: {resp}"
+    return f"({resp.strip()})"
+
+
+def c_payapi_guard_auto(dev: Device) -> str:
+    """PAYAPI GUARD: 50000 micros (~$0.05) is under the default $0.10 auto cap -> AUTO."""
+    resp = dev.send("TEST PAYAPI GUARD 50000", timeout=5.0)[0]
+    assert "decision=AUTO" in resp, f"got: {resp}"
+    return "(decision=AUTO)"
+
+
+def c_payapi_guard_refuse_over_confirm(dev: Device) -> str:
+    """PAYAPI GUARD: 6000000 micros ($6.00) exceeds default $5 confirm cap -> REFUSE."""
+    resp = dev.send("TEST PAYAPI GUARD 6000000", timeout=5.0)[0]
+    assert "decision=REFUSE" in resp, f"got: {resp}"
+    return "(decision=REFUSE)"
+
+
+def c_spend_today(dev: Device) -> str:
+    """SPEND TODAY: returns a non-negative micros counter."""
+    resp = dev.send("TEST SPEND TODAY", timeout=3.0)[0]
+    assert "micros=" in resp, f"got: {resp}"
+    micros = int(resp.split("micros=")[1].split()[0])
+    assert micros >= 0, f"negative micros: {micros}"
+    return f"(micros={micros})"
+
+
+def c_spend_add(dev: Device) -> str:
+    """SPEND ADD: round-trips a delta; counter increases by exactly that amount."""
+    before = int(dev.send("TEST SPEND TODAY", timeout=3.0)[0].split("micros=")[1].split()[0])
+    add_resp = dev.send("TEST SPEND ADD 1000", timeout=3.0)[0]
+    assert "added" in add_resp, f"ADD replied: {add_resp}"
+    after = int(dev.send("TEST SPEND TODAY", timeout=3.0)[0].split("micros=")[1].split()[0])
+    assert after == before + 1000, f"expected {before + 1000}, got {after}"
+    # Undo: device has no SPEND SUB, but we can note the +1000 is negligible
+    # against real budgets and the next test run will just accumulate. Acceptable.
+    return f"(before={before}, after={after})"
+
+
+def _make_spending_http_case(ip: str) -> Callable[[Device], str]:
+    """Build a spending GET/POST round-trip case that talks to the device HTTP server.
+    Pulled out as a factory so the case can close over the `ip` from CLI args."""
+    def fn(dev: Device) -> str:
+        import json as J
+        import urllib.request
+
+        base = f"http://{ip}/api/spending"
+
+        # Read current state.
+        j1 = J.loads(urllib.request.urlopen(base, timeout=5).read())
+        assert "auto_max_cents" in j1, f"missing auto_max_cents in {j1}"
+
+        # Write new values.
+        body = J.dumps({
+            "auto_max_cents":    25,
+            "confirm_max_cents": 750,
+            "daily_cap_cents":   1500,
+        }).encode()
+        req = urllib.request.Request(
+            base, data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+
+        # Verify the change.
+        j2 = J.loads(urllib.request.urlopen(base, timeout=5).read())
+        assert j2["auto_max_cents"] == 25, f"auto_max_cents not updated: {j2}"
+
+        # Restore defaults so subsequent runs aren't surprised.
+        restore = J.dumps({
+            "auto_max_cents":    10,
+            "confirm_max_cents": 500,
+            "daily_cap_cents":   1000,
+        }).encode()
+        req2 = urllib.request.Request(
+            base, data=restore, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req2, timeout=5).read()
+
+        return f"(auto_max_cents 25 confirmed; defaults restored)"
+    fn.__name__ = "c_spending_endpoints_round_trip"
+    return fn
+
+
 # --- Main ------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Daemon device E2E smoke tests")
     ap.add_argument("--port",      default=None, help="override USB port auto-detect")
     ap.add_argument("--rpc",       default=DEFAULT_RPC, help="Solana RPC URL")
+    ap.add_argument("--ip",        default=None, help="device IP for HTTP endpoint tests")
     ap.add_argument("--only",      default=None, help="case-name substring filter")
     ap.add_argument("--skip-x402", action="store_true", help="skip paid cases")
     args = ap.parse_args()
@@ -447,6 +562,16 @@ def main() -> int:
             (f"x402_{label}", _make_x402_case(label, url, lo, hi))
             for (label, url, lo, hi) in X402_URLS
         ],
+        # payapi + spending harness cases (Task 17)
+        ("payapi_catalog_refresh",          c_payapi_catalog_refresh),
+        ("payapi_provider_refresh",         c_payapi_provider_refresh),
+        ("payapi_guard_auto",               c_payapi_guard_auto),
+        ("payapi_guard_refuse_over_confirm", c_payapi_guard_refuse_over_confirm),
+        ("spend_today",                     c_spend_today),
+        ("spend_add",                       c_spend_add),
+        *([
+            ("spending_endpoints_round_trip", _make_spending_http_case(args.ip)),
+          ] if args.ip else []),
     ]
 
     dev.begin()
