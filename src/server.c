@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "devcfg.h"
+#include "payapi.h"
 #include "social_x.h"
 #include "ui.h"
 #include "esp_check.h"
@@ -423,13 +424,143 @@ static esp_err_t handle_spending_post(httpd_req_t *req) {
     return send_json(req, 200, "{\"ok\":true}");
 }
 
+// --- Services handlers -------------------------------------------------------
+
+// GET /api/services -> { items, providers, catalog_synced_at }
+// `items` comes from the persisted enabled-services blob; `providers` and
+// `catalog_synced_at` come from payapi_status_json().
+static esp_err_t handle_services_get(httpd_req_t *req) {
+    // Parse enabled services blob. Default is an empty list.
+    cJSON *enabled_root = cJSON_Parse(devcfg_pay_enabled_services());
+    cJSON *items_src = enabled_root
+        ? cJSON_GetObjectItemCaseSensitive(enabled_root, "items")
+        : NULL;
+    cJSON *items = (items_src && cJSON_IsArray(items_src))
+        ? cJSON_Duplicate(items_src, true)
+        : cJSON_CreateArray();
+    cJSON_Delete(enabled_root);  // safe even if NULL
+
+    // Get per-provider status from payapi.
+    cJSON *status = payapi_status_json();
+    cJSON *providers = status
+        ? cJSON_DetachItemFromObjectCaseSensitive(status, "providers")
+        : cJSON_CreateArray();
+    cJSON *synced_at = status
+        ? cJSON_DetachItemFromObjectCaseSensitive(status, "catalog_synced_at")
+        : cJSON_CreateNull();
+    cJSON_Delete(status);
+
+    // Build response envelope.
+    cJSON *root = cJSON_CreateObject();
+    if (!root || !items || !providers || !synced_at) {
+        cJSON_Delete(root);
+        cJSON_Delete(items);
+        cJSON_Delete(providers);
+        cJSON_Delete(synced_at);
+        return send_json(req, 500, "{\"error\":\"oom\"}");
+    }
+    cJSON_AddItemToObject(root, "items",             items);
+    cJSON_AddItemToObject(root, "providers",         providers);
+    cJSON_AddItemToObject(root, "catalog_synced_at", synced_at);
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) return send_json(req, 500, "{\"error\":\"oom\"}");
+    esp_err_t rc = send_json(req, 200, out);
+    cJSON_free(out);
+    return rc;
+}
+
+// POST /api/services  body: { v:1, items:[{fqn, service_url, endpoints}] }
+// Persists the new enabled-services list then synchronously refreshes each
+// provider's openapi spec. Reply { "ok": true }.
+// Body cap: 16 KB. This handler makes outbound HTTP calls per provider —
+// the web admin's UX is "Save and wait."
+static esp_err_t handle_services_post(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > 16384) {
+        return send_json(req, 400, "{\"error\":\"bad length\"}");
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int n = read_body(req, buf, req->content_len + 1);
+    if (n < 0) { free(buf); return send_json(req, 400, "{\"error\":\"recv\"}"); }
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad json\"}");
+
+    cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "items");
+    if (!cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"items must be array\"}");
+    }
+
+    // Persist: build { v:1, items:<dup> } and store in NVS.
+    cJSON *persist = cJSON_CreateObject();
+    if (!persist) { cJSON_Delete(root); return send_json(req, 500, "{\"error\":\"oom\"}"); }
+    cJSON_AddNumberToObject(persist, "v", 1);
+    cJSON_AddItemToObject(persist, "items", cJSON_Duplicate(items, true));
+    char *json_str = cJSON_PrintUnformatted(persist);
+    cJSON_Delete(persist);
+    if (json_str) {
+        devcfg_set_pay_enabled_services(json_str);
+        cJSON_free(json_str);
+    }
+
+    // Refresh each enabled provider synchronously.
+    int count = cJSON_GetArraySize(items);
+    ESP_LOGI(TAG, "services POST: refreshing %d providers", count);
+    cJSON *item;
+    cJSON_ArrayForEach(item, items) {
+        cJSON *fqn = cJSON_GetObjectItemCaseSensitive(item, "fqn");
+        if (cJSON_IsString(fqn) && fqn->valuestring && fqn->valuestring[0]) {
+            payapi_refresh_provider(fqn->valuestring);
+        }
+    }
+
+    cJSON_Delete(root);
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
+// POST /api/services/refresh_catalog — triggers a full catalog re-fetch.
+// Body is not read. Reply { "ok": true/false }.
+static esp_err_t handle_services_refresh_catalog(httpd_req_t *req) {
+    bool ok = payapi_refresh_catalog();
+    return send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// POST /api/services/refresh_provider  body: { fqn: string }
+// Re-fetches the openapi spec for a single provider.
+// Reply { "ok": true/false }. Missing/invalid fqn -> 400.
+static esp_err_t handle_services_refresh_provider(httpd_req_t *req) {
+    if (req->content_len == 0 || req->content_len > 256) {
+        return send_json(req, 400, "{\"error\":\"bad length\"}");
+    }
+    char buf[257];
+    int n = read_body(req, buf, sizeof(buf));
+    if (n < 0) return send_json(req, 400, "{\"error\":\"recv\"}");
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return send_json(req, 400, "{\"error\":\"bad json\"}");
+
+    cJSON *fqn = cJSON_GetObjectItemCaseSensitive(root, "fqn");
+    if (!cJSON_IsString(fqn) || !fqn->valuestring || !fqn->valuestring[0]) {
+        cJSON_Delete(root);
+        return send_json(req, 400, "{\"error\":\"missing fqn\"}");
+    }
+
+    bool ok = payapi_refresh_provider(fqn->valuestring);
+    cJSON_Delete(root);
+    return send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
 // --- Public API --------------------------------------------------------------
 esp_err_t server_start(void) {
     if (s_httpd) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port     = 80;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
     cfg.lru_purge_enable = true;
     // The /say path runs the full AI pipeline on the httpd task — that's
     // up to four TLS handshakes (LLM, two Solana RPC calls, LLM retry)
@@ -454,8 +585,12 @@ esp_err_t server_start(void) {
         { .uri = "/social/x/begin",      .method = HTTP_POST, .handler = handle_x_begin      },
         { .uri = "/social/x/finish",     .method = HTTP_POST, .handler = handle_x_finish     },
         { .uri = "/social/x/disconnect", .method = HTTP_POST, .handler = handle_x_disconnect },
-        { .uri = "/api/spending",        .method = HTTP_GET,  .handler = handle_spending_get  },
-        { .uri = "/api/spending",        .method = HTTP_POST, .handler = handle_spending_post },
+        { .uri = "/api/spending",                       .method = HTTP_GET,  .handler = handle_spending_get              },
+        { .uri = "/api/spending",                       .method = HTTP_POST, .handler = handle_spending_post             },
+        { .uri = "/api/services",                       .method = HTTP_GET,  .handler = handle_services_get              },
+        { .uri = "/api/services",                       .method = HTTP_POST, .handler = handle_services_post             },
+        { .uri = "/api/services/refresh_catalog",       .method = HTTP_POST, .handler = handle_services_refresh_catalog  },
+        { .uri = "/api/services/refresh_provider",      .method = HTTP_POST, .handler = handle_services_refresh_provider },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &uris[i]),
