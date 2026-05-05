@@ -9,6 +9,7 @@
 #include "settings_screen.h"
 #include "screens_common.h"
 #include "devcfg.h"
+#include "payapi.h"
 #include "ui.h"
 #include "voice.h"
 #include "wifi_sta.h"
@@ -50,6 +51,10 @@ static lv_obj_t *s_bri_value  = NULL;
 // esp_restart() ~250 ms later (long enough for the user to see the switch
 // land in the new position before the screen blacks out).
 static lv_obj_t *s_theme_switch = NULL;
+
+// Spending row value label — updated by settings_screen_refresh() so it
+// reflects web-admin changes without a full screen rebuild.
+static lv_obj_t *s_spend_row_value = NULL;
 
 static settings_wifi_click_cb_t s_wifi_click_cb = NULL;
 
@@ -95,6 +100,124 @@ static void add_close_button(lv_obj_t *bar) {
     lv_label_set_text(x, LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_color(x, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
     lv_obj_center(x);
+}
+
+// --- Spending detail screen -----------------------------------------------
+//
+// Full-screen overlay (on top of the settings screen) showing all three
+// caps plus today's running total and a hint to use the web admin.
+// Mirrors the approach used by wallet_screen.c sub-screens: create an
+// lv_obj on lv_scr_act() and delete it from the Back button handler.
+
+static void spend_detail_back_clicked(lv_event_t *e) {
+    lv_obj_t *detail = (lv_obj_t *)lv_event_get_user_data(e);
+    if (detail) lv_obj_delete(detail);
+}
+
+static void spend_row_clicked(lv_event_t *e) {
+    (void)e;
+
+    // Snapshot all values before taking the LVGL mutex.
+    uint32_t auto_c    = devcfg_spend_auto_max_cents();
+    uint32_t conf_c    = devcfg_spend_confirm_max_cents();
+    uint32_t daily_c   = devcfg_spend_daily_cap_cents();
+    uint64_t today_u   = devcfg_spend_today_micros();
+
+    char ip[16] = "";
+    if (wifi_sta_is_connected()) {
+        wifi_sta_ip_str(ip, sizeof(ip));
+    }
+
+    // Build the hint string outside the mutex.
+    char hint[64];
+    if (ip[0]) {
+        snprintf(hint, sizeof(hint), "Edit on web at %s", ip);
+    } else {
+        snprintf(hint, sizeof(hint), "Edit on web at this device's IP");
+    }
+
+    // today_u is in micros (1e-6 USD). Format as $X.XXXX.
+    char today_str[32];
+    snprintf(today_str, sizeof(today_str),
+             "$%u.%04u",
+             (unsigned)(today_u / 1000000ULL),
+             (unsigned)((today_u % 1000000ULL) / 100ULL));
+
+    // Full-screen overlay sitting on top of whatever is active.
+    lv_obj_t *detail = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(detail, SCR_W, SCR_H);
+    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(detail, SCR_COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(detail, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(detail, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(detail, 12, LV_PART_MAIN);
+    lv_obj_remove_flag(detail, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title.
+    lv_obj_t *title = lv_label_create(detail);
+    lv_label_set_text(title, "Spending");
+    lv_obj_set_style_text_color(title, SCR_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // Helper macro: add a label pair (key + value) at a given y offset.
+    // We use raw lv_obj_create / lv_label_create calls to keep the style
+    // consistent with the rest of the file.
+    int dy = 28;
+
+    // Auto cap.
+    lv_obj_t *lbl_auto = lv_label_create(detail);
+    lv_label_set_text_fmt(lbl_auto, "Auto-pay up to:   $%u.%02u",
+                          (unsigned)(auto_c / 100u), (unsigned)(auto_c % 100u));
+    lv_obj_set_style_text_color(lbl_auto, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_align(lbl_auto, LV_ALIGN_TOP_LEFT, 0, dy);
+    dy += 22;
+
+    // Confirm cap.
+    lv_obj_t *lbl_conf = lv_label_create(detail);
+    lv_label_set_text_fmt(lbl_conf, "Confirm up to:    $%u.%02u",
+                          (unsigned)(conf_c / 100u), (unsigned)(conf_c % 100u));
+    lv_obj_set_style_text_color(lbl_conf, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_align(lbl_conf, LV_ALIGN_TOP_LEFT, 0, dy);
+    dy += 22;
+
+    // Daily cap.
+    lv_obj_t *lbl_daily = lv_label_create(detail);
+    lv_label_set_text_fmt(lbl_daily, "Daily cap:        $%u.%02u",
+                          (unsigned)(daily_c / 100u), (unsigned)(daily_c % 100u));
+    lv_obj_set_style_text_color(lbl_daily, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_align(lbl_daily, LV_ALIGN_TOP_LEFT, 0, dy);
+    dy += 22;
+
+    // Divider gap.
+    dy += 8;
+
+    // Today's spend.
+    lv_obj_t *lbl_today = lv_label_create(detail);
+    lv_label_set_text_fmt(lbl_today, "Today's spend:    %s", today_str);
+    lv_obj_set_style_text_color(lbl_today, SCR_COLOR_ACCENT_HI, LV_PART_MAIN);
+    lv_obj_align(lbl_today, LV_ALIGN_TOP_LEFT, 0, dy);
+    dy += 28;
+
+    // Hint.
+    lv_obj_t *lbl_hint = lv_label_create(detail);
+    lv_label_set_text(lbl_hint, hint);
+    lv_obj_set_style_text_color(lbl_hint, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_label_set_long_mode(lbl_hint, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lbl_hint, SCR_W - 24);
+    lv_obj_align(lbl_hint, LV_ALIGN_TOP_LEFT, 0, dy);
+
+    // Back button — anchored to the bottom centre.
+    lv_obj_t *back_btn = lv_button_create(detail);
+    lv_obj_set_size(back_btn, 100, 36);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, SCR_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_radius(back_btn, 8, LV_PART_MAIN);
+    lv_obj_add_event_cb(back_btn, spend_detail_back_clicked, LV_EVENT_CLICKED, detail);
+
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_color(back_lbl, SCR_COLOR_BG, LV_PART_MAIN);
+    lv_obj_center(back_lbl);
 }
 
 static void wifi_row_clicked(lv_event_t *e) {
@@ -258,6 +381,30 @@ bool settings_screen_init(void) {
 
     y += 64;
 
+    // SPENDING row (read-only; tap opens detail screen)
+    lv_obj_t *spend_row = make_row(s_scr, y);
+    lv_obj_add_flag(spend_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(spend_row, spend_row_clicked, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *spend_title = lv_label_create(spend_row);
+    lv_label_set_text(spend_title, "Spending");
+    lv_obj_set_style_text_color(spend_title, SCR_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_align(spend_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    s_spend_row_value = lv_label_create(spend_row);
+    lv_label_set_text(s_spend_row_value, "$0.10 auto / $10.00 cap");
+    lv_label_set_long_mode(s_spend_row_value, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_spend_row_value, SCR_W - 56);
+    lv_obj_set_style_text_color(s_spend_row_value, SCR_COLOR_DIM, LV_PART_MAIN);
+    lv_obj_align(s_spend_row_value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_t *spend_chevron = lv_label_create(spend_row);
+    lv_label_set_text(spend_chevron, ">");
+    lv_obj_set_style_text_color(spend_chevron, SCR_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_align(spend_chevron, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    y += 64;
+
     // THEME row — flip dark ↔ light. Toggling fires a delayed esp_restart
     // so every screen rebuilds against the freshly-applied palette.
     lv_obj_t *theme_row = make_row(s_scr, y);
@@ -299,13 +446,14 @@ void settings_screen_destroy(void) {
     s_wifi_row     = NULL;
     s_wifi_title   = NULL;
     s_wifi_sub     = NULL;
-    s_bt_switch    = NULL;
-    s_vol_slider   = NULL;
-    s_vol_value    = NULL;
-    s_bri_slider   = NULL;
-    s_bri_value    = NULL;
-    s_theme_switch = NULL;
-    s_scr          = NULL;
+    s_bt_switch      = NULL;
+    s_vol_slider     = NULL;
+    s_vol_value      = NULL;
+    s_bri_slider     = NULL;
+    s_bri_value      = NULL;
+    s_theme_switch   = NULL;
+    s_spend_row_value = NULL;
+    s_scr            = NULL;
     lvgl_port_unlock();
 }
 
@@ -349,6 +497,15 @@ void settings_screen_refresh(void) {
         snprintf(wifi_sub, sizeof(wifi_sub), "not connected  |  tap to scan");
     }
 
+    // Spending row: format auto/daily caps as "$X.XX auto / $X.XX cap".
+    uint32_t auto_c  = devcfg_spend_auto_max_cents();
+    uint32_t daily_c = devcfg_spend_daily_cap_cents();
+    char spend_sub[48];
+    snprintf(spend_sub, sizeof(spend_sub),
+             "$%u.%02u auto / $%u.%02u cap",
+             (unsigned)(auto_c / 100u), (unsigned)(auto_c % 100u),
+             (unsigned)(daily_c / 100u), (unsigned)(daily_c % 100u));
+
     if (!lvgl_port_lock(0)) return;
     lv_label_set_text(s_wifi_sub, wifi_sub);
 
@@ -360,6 +517,8 @@ void settings_screen_refresh(void) {
 
     lv_slider_set_value(s_bri_slider, bri, LV_ANIM_OFF);
     lv_label_set_text_fmt(s_bri_value, "%u", (unsigned)bri);
+
+    if (s_spend_row_value) lv_label_set_text(s_spend_row_value, spend_sub);
 
     lvgl_port_unlock();
 }
