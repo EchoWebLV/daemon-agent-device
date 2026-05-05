@@ -6,6 +6,7 @@
 #include "creatures_data.h"
 
 #include <string.h>
+#include <time.h>
 
 #include "driver/ledc.h"
 #include "esp_check.h"
@@ -47,6 +48,11 @@ static const char *TAG = "devcfg";
 #define KEY_X_CLIENT_ID     "x_client_id"
 #define KEY_X_REDIRECT_URI  "x_redir_uri"
 #define KEY_X_STYLE         "x_style"
+#define KEY_PAY_ENABLED     "pay_enabled"
+#define KEY_SPND_AUTO_C     "spnd_auto_c"
+#define KEY_SPND_CONF_C     "spnd_conf_c"
+#define KEY_SPND_DAILY_C    "spnd_daily_c"
+#define KEY_SPND_TODAY      "spnd_today"
 
 // CREATURE_DATA_COUNT comes from creatures_data.h — a runtime int sized from
 // the array literal, so adding rows in creatures_data.c just works.
@@ -147,6 +153,9 @@ static const char DEFAULT_SERVICES_ENABLED_JSON[] =
 // the custom-services bound or the library saves will silently truncate.
 #define SVC_CUSTOM_MAX      4096
 #define SVC_ENABLED_MAX      512
+// pay_enabled_services: JSON blob listing per-service payment permissions.
+// Sized to fit a list of ~16 service IDs with their allow/confirm flags.
+#define PAY_ENABLED_MAX      512
 
 // ---- Module state -----------------------------------------------------------
 static bool    s_ready       = false;
@@ -176,6 +185,19 @@ static char     s_x_redirect_uri[256] = {0};
 // Free-form style guide injected into the system prompt when post_to_x is
 // available. ~512 chars is enough for a few paragraphs of voice/tone notes.
 static char     s_x_style       [512] = {0};
+
+// x402 payment controls ---------------------------------------------------
+static char     s_pay_enabled   [PAY_ENABLED_MAX] = {0};
+static uint32_t s_spnd_auto_c   = 10;    // $0.10
+static uint32_t s_spnd_conf_c   = 500;   // $5.00
+static uint32_t s_spnd_daily_c  = 1000;  // $10.00
+
+// Packed blob persisted under KEY_SPND_TODAY.
+typedef struct {
+    int32_t  utc_day;   // time(NULL)/86400 for the day this counter covers
+    uint64_t micros;    // cumulative spend in micros (1e-6 USD) for that day
+} spend_today_t;
+static spend_today_t s_today = {0, 0};
 
 // Small helpers ---------------------------------------------------------------
 static void apply_brightness(uint8_t b) {
@@ -267,6 +289,28 @@ static void save_str(const char *key, const char *v) {
     nvs_close(h);
 }
 
+static void save_blob(const char *key, const void *data, size_t len) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, key, data, len);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Apply UTC-day rollover to s_today if the wall clock is post-2001 and the
+// stored day is in the past. Returns true if a rollover occurred.
+#define EPOCH_2001  978307200   // 2001-01-01 00:00:00 UTC as Unix timestamp
+static bool maybe_rollover_today(void) {
+    time_t now = time(NULL);
+    if (now < EPOCH_2001) return false;   // SNTP not yet synced; skip
+    int32_t today = (int32_t)(now / 86400);
+    if (s_today.utc_day >= today) return false;
+    s_today.utc_day = today;
+    s_today.micros  = 0;
+    save_blob(KEY_SPND_TODAY, &s_today, sizeof(s_today));
+    return true;
+}
+
 // Public API ------------------------------------------------------------------
 esp_err_t devcfg_init(void) {
     if (s_ready) return ESP_OK;
@@ -343,6 +387,23 @@ esp_err_t devcfg_init(void) {
                     nvs_close(hw);
                 }
                 break;
+            }
+        }
+    }
+
+    // x402 payment controls
+    load_str (h, KEY_PAY_ENABLED,  s_pay_enabled,  sizeof(s_pay_enabled));
+    load_u32 (h, KEY_SPND_AUTO_C,  &s_spnd_auto_c,  10);
+    load_u32 (h, KEY_SPND_CONF_C,  &s_spnd_conf_c,  500);
+    load_u32 (h, KEY_SPND_DAILY_C, &s_spnd_daily_c, 1000);
+    {
+        // Load the today blob. If missing or wrong size, leave defaults (0,0).
+        if (h != 0) {
+            size_t blen = sizeof(s_today);
+            if (nvs_get_blob(h, KEY_SPND_TODAY, &s_today, &blen) != ESP_OK ||
+                blen != sizeof(s_today)) {
+                s_today.utc_day = 0;
+                s_today.micros  = 0;
             }
         }
     }
@@ -548,4 +609,62 @@ void devcfg_set_x_style(const char *style) {
     if (!style) style = "";
     strlcpy(s_x_style, style, sizeof(s_x_style));
     save_str(KEY_X_STYLE, s_x_style);
+}
+
+// ---------------------------------------------------------------------------
+// x402 payment spending controls
+// ---------------------------------------------------------------------------
+
+const char *devcfg_pay_enabled_services(void) {
+    // Never return NULL; callers (pay.c, config endpoint) can dereference
+    // unconditionally. Empty cache means nothing has been configured yet.
+    return s_pay_enabled[0] ? s_pay_enabled : "{\"v\":1,\"items\":[]}";
+}
+
+void devcfg_set_pay_enabled_services(const char *json) {
+    if (json == NULL) json = "";
+    if (strlen(json) >= sizeof(s_pay_enabled)) {
+        ESP_LOGW(TAG, "pay_enabled write rejected: %u > %u",
+                 (unsigned)strlen(json), (unsigned)sizeof(s_pay_enabled) - 1);
+        return;
+    }
+    strlcpy(s_pay_enabled, json, sizeof(s_pay_enabled));
+    save_str(KEY_PAY_ENABLED, s_pay_enabled);
+}
+
+uint32_t devcfg_spend_auto_max_cents(void)    { return s_spnd_auto_c; }
+uint32_t devcfg_spend_confirm_max_cents(void) { return s_spnd_conf_c; }
+uint32_t devcfg_spend_daily_cap_cents(void)   { return s_spnd_daily_c; }
+
+void devcfg_set_spend_auto_max_cents(uint32_t cents) {
+    if (cents == s_spnd_auto_c) return;
+    s_spnd_auto_c = cents;
+    save_u32(KEY_SPND_AUTO_C, cents);
+}
+
+void devcfg_set_spend_confirm_max_cents(uint32_t cents) {
+    if (cents == s_spnd_conf_c) return;
+    s_spnd_conf_c = cents;
+    save_u32(KEY_SPND_CONF_C, cents);
+}
+
+void devcfg_set_spend_daily_cap_cents(uint32_t cents) {
+    if (cents == s_spnd_daily_c) return;
+    s_spnd_daily_c = cents;
+    save_u32(KEY_SPND_DAILY_C, cents);
+}
+
+uint64_t devcfg_spend_today_micros(void) {
+    maybe_rollover_today();
+    return s_today.micros;
+}
+
+void devcfg_add_spend_today_micros(uint64_t delta) {
+    maybe_rollover_today();
+    s_today.micros += delta;
+    save_blob(KEY_SPND_TODAY, &s_today, sizeof(s_today));
+}
+
+int32_t devcfg_spend_today_utc_day(void) {
+    return s_today.utc_day;
 }

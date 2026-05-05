@@ -128,6 +128,41 @@ void        devcfg_set_x_redirect_uri(const char *uri);
 const char *devcfg_x_style(void);
 void        devcfg_set_x_style(const char *style);
 
+// ---------------------------------------------------------------------------
+// x402 payment spending controls
+//
+// pay_enabled_services: JSON blob listing which x402 services are allowed to
+// auto-pay or prompt for confirmation. Returns "{\"v\":1,\"items\":[]}" when
+// nothing stored yet (never NULL).
+//
+// Spending caps (in US cents):
+//   auto_max     — single tx that can proceed without user confirmation ($0.10)
+//   confirm_max  — single tx that requires a confirmation prompt ($5.00)
+//   daily_cap    — aggregate ceiling for the current UTC day ($10.00)
+//
+// today blob: tracks cumulative spend (in micros, i.e. 1e-6 USD) for the
+// current UTC day. The getter and add-delta function both auto-roll when the
+// UTC day advances (guarded by a post-2001 wall-clock check so pre-SNTP
+// reads are no-ops). devcfg_spend_today_utc_day() returns the stored day
+// number (seconds / 86400) — or 0 if nothing has been saved yet.
+// ---------------------------------------------------------------------------
+const char *devcfg_pay_enabled_services(void);
+void        devcfg_set_pay_enabled_services(const char *json);
+
+uint32_t devcfg_spend_auto_max_cents(void);
+void     devcfg_set_spend_auto_max_cents(uint32_t cents);
+
+uint32_t devcfg_spend_confirm_max_cents(void);
+void     devcfg_set_spend_confirm_max_cents(uint32_t cents);
+
+uint32_t devcfg_spend_daily_cap_cents(void);
+void     devcfg_set_spend_daily_cap_cents(uint32_t cents);
+
+uint64_t devcfg_spend_today_micros(void);
+void     devcfg_add_spend_today_micros(uint64_t delta);
+
+int32_t  devcfg_spend_today_utc_day(void);
+
 #ifdef __cplusplus
 }
 #endif
