@@ -965,11 +965,35 @@ x402_guard_decision_t payapi_guard(uint64_t actual_micros,
                                    const char *description,
                                    void *user)
 {
-    ESP_LOGI(TAG, "payapi_guard");
-    (void)actual_micros;
     (void)description;
     (void)user;
-    return X402_GUARD_AUTO;
+
+    uint64_t today  = devcfg_spend_today_micros();
+    uint64_t auto_  = (uint64_t)devcfg_spend_auto_max_cents()    * 10000ULL;
+    uint64_t conf_  = (uint64_t)devcfg_spend_confirm_max_cents() * 10000ULL;
+    uint64_t daily_ = (uint64_t)devcfg_spend_daily_cap_cents()   * 10000ULL;
+
+    if (today + actual_micros > daily_) {
+        ESP_LOGW(TAG, "guard REFUSE: would exceed daily cap "
+                       "(today=%llu + actual=%llu > daily=%llu)",
+                 today, actual_micros, daily_);
+        return X402_GUARD_REFUSE;
+    }
+    if (actual_micros <= auto_) {
+        return X402_GUARD_AUTO;
+    }
+    if (actual_micros <= conf_) {
+        // TODO(Task 12): open pay_confirm_screen modal here. For now refuse
+        // anything that would have needed the modal — never silently pay
+        // above the auto cap.
+        ESP_LOGW(TAG, "guard REFUSE: hold-confirm path not yet implemented "
+                       "(actual=%llu, auto=%llu, conf=%llu)",
+                 actual_micros, auto_, conf_);
+        return X402_GUARD_REFUSE;
+    }
+    ESP_LOGW(TAG, "guard REFUSE: actual=%llu > confirm cap=%llu",
+             actual_micros, conf_);
+    return X402_GUARD_REFUSE;
 }
 
 // ---------------------------------------------------------------------------

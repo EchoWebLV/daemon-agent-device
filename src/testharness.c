@@ -38,6 +38,7 @@
 // the only caller that needs to see all of these together, so we intentionally
 // fan-in the dependencies here rather than in a public header.
 #include "ai.h"
+#include "devcfg.h"
 #include "payapi.h"
 #include "swap.h"
 #include "ui.h"
@@ -404,6 +405,38 @@ static void handle_payapi_refresh_provider(const char *fqn) {
     resp_ok(buf);
 }
 
+static void handle_payapi_guard(const char *args) {
+    if (!args || !args[0]) {
+        resp_err("payapi guard missing micros");
+        return;
+    }
+    uint64_t micros = (uint64_t)strtoull(args, NULL, 10);
+    x402_guard_decision_t d = payapi_guard(micros, "test", NULL);
+    static const char *names[] = { "AUTO", "CONFIRM_OK", "CONFIRM_DENIED", "REFUSE" };
+    const char *name = (d >= 0 && (size_t)d < (sizeof(names)/sizeof(names[0])))
+                       ? names[d] : "UNKNOWN";
+    char buf[48];
+    snprintf(buf, sizeof(buf), "decision=%s", name);
+    resp_ok(buf);
+}
+
+static void handle_spend_today(void) {
+    uint64_t micros = devcfg_spend_today_micros();
+    char buf[48];
+    snprintf(buf, sizeof(buf), "micros=%" PRIu64, micros);
+    resp_ok(buf);
+}
+
+static void handle_spend_add(const char *args) {
+    if (!args || !args[0]) {
+        resp_err("spend add missing micros");
+        return;
+    }
+    uint64_t micros = (uint64_t)strtoull(args, NULL, 10);
+    devcfg_add_spend_today_micros(micros);
+    resp_ok("added");
+}
+
 // ---------- dispatcher -----------------------------------------------------
 
 static void dispatch_line(const char *line) {
@@ -467,7 +500,7 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- PAYAPI REFRESH_CATALOG / REFRESH_PROVIDER <fqn> --------------------
+    // --- PAYAPI REFRESH_CATALOG / REFRESH_PROVIDER <fqn> / GUARD <micros> ---
     if ((rest = match_token(after_test, "PAYAPI"))) {
         if (match_token(rest, "REFRESH_CATALOG")) { handle_payapi_refresh_catalog(); return; }
         const char *args;
@@ -475,7 +508,20 @@ static void dispatch_line(const char *line) {
             handle_payapi_refresh_provider(args);
             return;
         }
+        if ((args = match_token(rest, "GUARD"))) {
+            handle_payapi_guard(args);
+            return;
+        }
         resp_err("payapi bad_subverb");
+        return;
+    }
+
+    // --- SPEND TODAY / SPEND ADD <micros> -----------------------------------
+    if ((rest = match_token(after_test, "SPEND"))) {
+        if (match_token(rest, "TODAY")) { handle_spend_today(); return; }
+        const char *args;
+        if ((args = match_token(rest, "ADD"))) { handle_spend_add(args); return; }
+        resp_err("spend bad_subverb");
         return;
     }
 
