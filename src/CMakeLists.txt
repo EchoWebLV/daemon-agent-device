@@ -19,6 +19,7 @@ idf_component_register(
         "info_screen.c"
         "mic.c"
         "menu_screen.c"
+        "payapi.c"
         "price.c"
         "server.c"
         "social_x.c"
