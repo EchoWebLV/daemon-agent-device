@@ -733,50 +733,42 @@ static void x402_call_internal(const char *method,
         // Parse amount and human-readable description from the decoded JSON
         // so we can populate out->cost_micros/cost_usd and run the guard
         // BEFORE any signing happens.
-        {
-            cJSON *pr_j = cJSON_Parse(desc);
-            if (pr_j) {
-                cJSON *opt_j = pick_solana_accept(pr_j);
-                if (opt_j) {
-                    const cJSON *amt_j     = cJSON_GetObjectItem(opt_j, "amount");
-                    const cJSON *amt_max_j = cJSON_GetObjectItem(opt_j, "maxAmountRequired");
-                    const char  *amt_s     = NULL;
-                    if (cJSON_IsString(amt_j)     && amt_j->valuestring)     amt_s = amt_j->valuestring;
-                    else if (cJSON_IsString(amt_max_j) && amt_max_j->valuestring) amt_s = amt_max_j->valuestring;
-                    if (amt_s) {
-                        out->cost_micros = (uint64_t)strtoull(amt_s, NULL, 10);
-                        out->cost_usd    = (double)out->cost_micros / 1e6;
-                    }
+        // silently truncates beyond 127 bytes; guard callbacks use this only for display
+        char desc_str[128] = {0};
+        cJSON *pr_j = cJSON_Parse(desc);
+        if (pr_j) {
+            // Cost from the Solana accept entry
+            cJSON *opt_j = pick_solana_accept(pr_j);
+            if (opt_j) {
+                const cJSON *amt_j     = cJSON_GetObjectItem(opt_j, "amount");
+                const cJSON *amt_max_j = cJSON_GetObjectItem(opt_j, "maxAmountRequired");
+                const char  *amt_s     = NULL;
+                if (cJSON_IsString(amt_j)     && amt_j->valuestring)     amt_s = amt_j->valuestring;
+                else if (cJSON_IsString(amt_max_j) && amt_max_j->valuestring) amt_s = amt_max_j->valuestring;
+                if (amt_s) {
+                    out->cost_micros = (uint64_t)strtoull(amt_s, NULL, 10);
+                    out->cost_usd    = (double)out->cost_micros / 1e6;
                 }
-                cJSON_Delete(pr_j);
             }
+            // Human-readable description for the guard callback
+            const cJSON *d = cJSON_GetObjectItem(pr_j, "description");
+            if (cJSON_IsString(d) && d->valuestring)
+                strlcpy(desc_str, d->valuestring, sizeof(desc_str));
+            cJSON_Delete(pr_j);
         }
 
         // Guard hook: fires after cost is known, before signing.
         if (guard) {
-            // Extract the top-level "description" string if present (human-readable).
-            const char *guard_desc = "";
-            char desc_str[128] = {0};
-            cJSON *pr_j2 = cJSON_Parse(desc);
-            if (pr_j2) {
-                const cJSON *d = cJSON_GetObjectItem(pr_j2, "description");
-                if (cJSON_IsString(d) && d->valuestring) {
-                    strlcpy(desc_str, d->valuestring, sizeof(desc_str));
-                    guard_desc = desc_str;
-                }
-                cJSON_Delete(pr_j2);
-            }
-
-            x402_guard_decision_t decision = guard(out->cost_micros, guard_desc, guard_user);
+            x402_guard_decision_t decision = guard(out->cost_micros, desc_str, guard_user);
             if (decision == X402_GUARD_CONFIRM_DENIED) {
-                ESP_LOGI(TAG, "guard: user_declined (%.5f USDC)", out->cost_usd);
+                ESP_LOGW(TAG, "guard: user_declined (%.5f USDC)", out->cost_usd);
                 out->status = 402;
                 snprintf(out->error, sizeof(out->error), "user_declined");
                 free(desc); free(b64);
                 xSemaphoreGive(s_handle_mutex);
                 goto done;
             } else if (decision == X402_GUARD_REFUSE) {
-                ESP_LOGI(TAG, "guard: policy_refused (%.5f USDC)", out->cost_usd);
+                ESP_LOGW(TAG, "guard: policy_refused (%.5f USDC)", out->cost_usd);
                 out->status = 402;
                 snprintf(out->error, sizeof(out->error), "policy_refused");
                 free(desc); free(b64);
