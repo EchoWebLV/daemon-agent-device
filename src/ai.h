@@ -36,6 +36,16 @@ bool ai_ask(const char *user, char *reply_out, size_t reply_cap);
 // reply is written to `reply_out` for subtitle display + history append.
 bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap);
 
+// Same as ai_ask_streaming, but the SSE pump consults `should_continue`
+// before processing each record. If it returns false, the stream is
+// abandoned mid-flight (HTTP body read short-circuits, no more chunks
+// hand off to voice_speak_chunk, function returns whatever it had so
+// far). Used by the PTT interrupt path so a fresh press abandons the
+// previous reply instead of letting it queue audio for several seconds.
+bool ai_ask_streaming_cancellable(const char *user, char *reply_out, size_t reply_cap,
+                                   bool (*should_continue)(void *user_data),
+                                   void *user_data);
+
 // Single-turn prompt that does NOT touch the conversation history. Used
 // for ambient / one-off utterances (e.g. the wallet ticker chatter).
 bool ai_ask_one_shot(const char *prompt, char *reply_out, size_t reply_cap);

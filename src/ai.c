@@ -1182,6 +1182,14 @@ typedef struct {
     stream_tc_t tool_calls[STREAM_MAX_TOOL_CALLS];
     int         tool_call_count;
     char        finish_reason[32];
+
+    // Caller-supplied cancel hook. NULL means no cancellation. When set,
+    // stream_chunk_cb consults it after each fully-received SSE record so
+    // a stale streaming task can return promptly once the user has pressed
+    // PTT to interrupt.
+    bool   (*should_continue)(void *user_data);
+    void    *cancel_user_data;
+    bool     cancelled;            // latched once should_continue returns false
 } stream_ctx_t;
 
 // Reset just the per-round transient fields. Tool_calls are reset on a
@@ -1355,6 +1363,16 @@ static void process_sse_record(stream_ctx_t *c, const char *record, size_t len) 
 static bool stream_chunk_cb(const char *data, size_t len, void *user) {
     stream_ctx_t *c = (stream_ctx_t *)user;
     if (!c) return false;
+    // Cancellation gate: once the caller's should_continue returns false
+    // we latch `cancelled` and refuse to feed any further bytes through to
+    // process_sse_record. This is what lets a PTT interrupt abandon the
+    // in-flight reply instead of letting the SSE pump keep enqueueing
+    // voice_speak_chunk audio for several more seconds.
+    if (!c->cancelled && c->should_continue &&
+        !c->should_continue(c->cancel_user_data)) {
+        c->cancelled = true;
+    }
+    if (c->cancelled) return false;
     size_t room = STREAM_RAW_BUF - 1 - c->raw_len;
     size_t take = len < room ? len : room;
     if (take > 0) {
@@ -1477,6 +1495,12 @@ static void stream_url_for(const char *base, char *out, size_t cap) {
 }
 
 bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
+    return ai_ask_streaming_cancellable(user, reply_out, reply_cap, NULL, NULL);
+}
+
+bool ai_ask_streaming_cancellable(const char *user, char *reply_out, size_t reply_cap,
+                                   bool (*should_continue)(void *user_data),
+                                   void *user_data) {
     if (!user || !user[0] || !reply_out || reply_cap == 0) return false;
     reply_out[0] = '\0';
 
@@ -1495,6 +1519,8 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
         pop_last_turn();
         return false;
     }
+    ctx->should_continue   = should_continue;
+    ctx->cancel_user_data  = user_data;
 
     char base_url[160];
     strlcpy(base_url, resolve_llm_url(devcfg_llm_model()), sizeof(base_url));
@@ -1521,6 +1547,15 @@ bool ai_ask_streaming(const char *user, char *reply_out, size_t reply_cap) {
         x402_result_t r = {0};
         x402_call_stream("POST", stream_url, body, NULL,
                          stream_chunk_cb, ctx, &r);
+
+        // Caller cancelled mid-stream (PTT interrupt). Bail without writing
+        // an error string into reply_out — the new task already owns the
+        // UI, and we don't want to leak a partial-sentence flush into TTS.
+        if (ctx->cancelled) {
+            ESP_LOGI(TAG, "stream cancelled by caller");
+            ok = false;
+            break;
+        }
 
         // End-of-stream flush: any trailing partial sentence (no closing
         // punctuation) still goes to TTS so we don't drop the tail.

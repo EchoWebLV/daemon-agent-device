@@ -50,6 +50,11 @@ bool voice_is_speaking(void);
 // nothing is playing.
 void voice_stop(void);
 
+// Stop the current utterance AND drop any queued chunks. Use this when
+// the user has actively cancelled (PTT interrupt) so a stale streaming
+// task can't keep enqueueing audio after the cancel.
+void voice_clear(void);
+
 // Software volume. 0..21, applied as a linear multiplier on the PCM samples
 // before they go to I2S. 0 = mute, 21 = unity gain.
 void voice_set_volume(uint8_t v);

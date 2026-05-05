@@ -400,6 +400,15 @@ void voice_stop(void) {
     s_stop_requested = true;
 }
 
+// Stop AND drain any queued chunks. Used by the PTT interrupt path so a
+// stale streaming task can't replay old audio after the user has pressed
+// to interrupt — voice_stop alone leaves enqueued chunks behind, which
+// the audio task picks up the moment the current playback returns.
+void voice_clear(void) {
+    s_stop_requested = true;
+    if (s_queue) xQueueReset(s_queue);
+}
+
 void voice_set_volume(uint8_t v) {
     if (v > 21) v = 21;
     s_volume_0_21 = v;

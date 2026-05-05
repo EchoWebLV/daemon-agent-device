@@ -502,6 +502,19 @@ bool creature_screen_init(void) {
 
 static volatile bool s_speech_in_flight = false;
 
+// Generation counter, bumped on every PTT press. speech_task captures its
+// generation at spawn and only mutates UI / s_speech_in_flight if it still
+// matches — lets a fresh press interrupt a busy task without waiting for
+// the old HTTPS round-trip to unwind. Old tasks become silent zombies that
+// just free their pcm and exit.
+static volatile uint32_t s_ptt_gen = 0;
+
+// Per-press state captured by ptt_start, consumed by speech_task. Static
+// rather than packed into pcm because lv_async_call carries a single void*
+// and the task arg is also a single void* — same pattern as s_speech_frames.
+static volatile uint32_t s_ptt_press_ms  = 0;   // start-of-press timestamp
+static volatile bool     s_ptt_was_busy  = false;  // bot busy when press began
+
 // Filler phrases for the post-release "Hmm." / "Let me see." beat. Edit
 // to taste — keep them short so the audio finishes well before the LLM
 // reply arrives (~6-9 s end-to-end), and natural enough to read as a
@@ -540,6 +553,15 @@ static void filler_delay_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// Cancel hook handed to ai_ask_streaming_cancellable. user_data points to
+// the speech_task's captured generation; we return false the moment a new
+// PTT press has bumped the global, which makes the SSE pump drop the rest
+// of the body and return early.
+static bool speech_should_continue(void *user_data) {
+    uint32_t my_gen = *(uint32_t *)user_data;
+    return my_gen == s_ptt_gen;
+}
+
 static void speech_task(void *arg) {
     int16_t *pcm    = (int16_t *)arg;
     size_t   frames = 0;
@@ -551,6 +573,22 @@ static void speech_task(void *arg) {
     extern volatile size_t s_speech_frames;
     frames = s_speech_frames;
     s_speech_frames = 0;
+
+    // Snapshot the generation we belong to. If the user presses the button
+    // again mid-flight, ptt_start bumps s_ptt_gen; we then bail at the next
+    // checkpoint without writing to the UI or clearing s_speech_in_flight
+    // (the newer task owns that state now). Not const because we hand its
+    // address to the streaming cancel callback below.
+    uint32_t my_gen = s_ptt_gen;
+    #define PTT_STALE() (my_gen != s_ptt_gen)
+    #define PTT_BAIL_IF_STALE() do { \
+        if (PTT_STALE()) { \
+            ESP_LOGI(TAG, "speech_task gen=%lu superseded by gen=%lu, aborting", \
+                     (unsigned long)my_gen, (unsigned long)s_ptt_gen); \
+            vTaskDeleteWithCaps(NULL); \
+            return; \
+        } \
+    } while (0)
 
     // Filler word, ~50% of the time, fired ~1 s AFTER the button releases
     // (i.e. ~1 s into speech_task). Immediate fillers felt over-eager —
@@ -571,6 +609,8 @@ static void speech_task(void *arg) {
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
     mic_buffer_free(pcm);
 
+    PTT_BAIL_IF_STALE();
+
     if (!got_text || !transcript[0]) {
         ESP_LOGW(TAG, "STT returned no text — telling the user");
         ui_set_subtitle("I didn't catch that.");
@@ -578,6 +618,8 @@ static void speech_task(void *arg) {
         vTaskDeleteWithCaps(NULL);
         return;
     }
+
+    PTT_BAIL_IF_STALE();
 
     // Surface the transcript on screen so the user can sanity-check what
     // Whisper heard before the AI reply replaces it.
@@ -601,10 +643,18 @@ static void speech_task(void *arg) {
     const char *model = devcfg_llm_model();
     bool is_shannon = model && strncasecmp(model, "shannon/", 8) == 0;
 
+    // Cancel-check user_data is &my_gen. The streaming SSE pump consults
+    // it after every record so a fresh PTT press abandons the in-flight
+    // reply within one chunk's worth of latency rather than waiting for
+    // the full HTTP body to drain.
     char reply[1024] = {0};
     bool ok = is_shannon
         ? ai_ask(transcript, reply, sizeof(reply))
-        : ai_ask_streaming(transcript, reply, sizeof(reply));
+        : ai_ask_streaming_cancellable(transcript, reply, sizeof(reply),
+                                        speech_should_continue, &my_gen);
+
+    PTT_BAIL_IF_STALE();
+
     if (ok && reply[0]) {
         ui_set_subtitle(reply);
         if (is_shannon) {
@@ -619,12 +669,31 @@ static void speech_task(void *arg) {
     }
     s_speech_in_flight = false;
     vTaskDeleteWithCaps(NULL);
+<<<<<<< Updated upstream
+=======
+    #undef PTT_STALE
+    #undef PTT_BAIL_IF_STALE
+>>>>>>> Stashed changes
 }
 
 volatile size_t s_speech_frames = 0;
 
 void creature_screen_ptt_start(void) {
-    if (s_speech_in_flight || mic_is_recording()) return;
+    if (mic_is_recording()) return;   // Can't double-start the mic.
+
+    // If the bot is mid-thought or mid-utterance, treat this press as an
+    // interrupt: halt audio + drained queued chunks immediately, bump the
+    // generation so the in-flight speech_task aborts at its next checkpoint.
+    // The new recording starts regardless.
+    s_ptt_was_busy = s_speech_in_flight || voice_is_speaking();
+    if (s_ptt_was_busy) {
+        voice_clear();
+        ESP_LOGI(TAG, "ptt: interrupting in-flight (next gen=%lu)",
+                 (unsigned long)(s_ptt_gen + 1));
+    }
+    s_ptt_gen++;
+    s_ptt_press_ms = esp_log_timestamp();
+
     if (mic_record_start() == ESP_OK) {
         ui_set_subtitle("Listening...");
     } else {
@@ -637,6 +706,21 @@ void creature_screen_ptt_stop(void) {
     int16_t *pcm    = NULL;
     size_t   frames = 0;
     esp_err_t err = mic_record_stop(&pcm, &frames);
+
+    // Stop-only gesture: a short tap during a busy state means "shut up,
+    // I don't have anything new to ask." Drop the audio without spawning
+    // STT/AI. The 1 s threshold separates "tap to interrupt" from a real
+    // PTT recording. Outside the busy case, the existing <100 ms junk
+    // check below still handles accidental brushes.
+    uint32_t hold_ms = esp_log_timestamp() - s_ptt_press_ms;
+    if (s_ptt_was_busy && hold_ms < 1000) {
+        ESP_LOGI(TAG, "ptt: interrupt-only tap (%lums) — dropping audio",
+                 (unsigned long)hold_ms);
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+
     if (err != ESP_OK || !pcm || frames < 1600) {   // <100 ms = junk
         if (pcm) mic_buffer_free(pcm);
         ui_set_subtitle("");
