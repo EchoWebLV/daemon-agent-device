@@ -680,11 +680,39 @@ bool payapi_refresh_provider(const char *fqn) {
     }
 
     if (!local_service_url) {
-        ESP_LOGW(TAG, "payapi_refresh_provider: %s not in catalog", fqn);
-        free(local_fqn);
-        free(local_title);
-        free(local_service_url);
-        return false;
+        // Fall back to the persisted enabled-services blob. The spec guarantees
+        // service_url is mirrored there at save time so boot doesn't require a
+        // fresh catalog fetch for already-saved providers.
+        bool found_via_persisted = false;
+        cJSON *persisted = cJSON_Parse(devcfg_pay_enabled_services());
+        if (persisted) {
+            cJSON *p_items = cJSON_GetObjectItem(persisted, "items");
+            cJSON *it;
+            cJSON_ArrayForEach(it, p_items) {
+                cJSON *e_fqn = cJSON_GetObjectItem(it, "fqn");
+                cJSON *e_svc = cJSON_GetObjectItem(it, "service_url");
+                if (cJSON_IsString(e_fqn) && cJSON_IsString(e_svc) &&
+                    strcmp(e_fqn->valuestring, fqn) == 0) {
+                    local_service_url  = strdup(e_svc->valuestring);
+                    local_fqn         = strdup(fqn);
+                    local_title       = strdup(fqn);   // best available without catalog
+                    local_min_cents   = 0;
+                    local_max_cents   = 0;
+                    local_free_tier   = false;
+                    found_via_persisted = true;
+                    break;
+                }
+            }
+            cJSON_Delete(persisted);
+        }
+        if (!found_via_persisted) {
+            ESP_LOGW(TAG, "payapi_refresh_provider: %s not in catalog and not in saved enabled-services", fqn);
+            free(local_fqn);
+            free(local_title);
+            free(local_service_url);
+            return false;
+        }
+        ESP_LOGI(TAG, "payapi_refresh_provider: %s using persisted service_url", fqn);
     }
 
     // 2. Fetch openapi.json. (No mutex held here.)

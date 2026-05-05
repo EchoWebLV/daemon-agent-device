@@ -825,11 +825,13 @@ async function loadSpending() {
     $('#spend-auto').value    = ((j.auto_max_cents    || 0) / 100).toFixed(2);
     $('#spend-confirm').value = ((j.confirm_max_cents || 0) / 100).toFixed(2);
     $('#spend-daily').value   = ((j.daily_cap_cents   || 0) / 100).toFixed(2);
-    const todayCents = j.today_cents || 0;
-    const capCents   = j.daily_cap_cents || 0;
-    $('#spend-today-usd').textContent = '$' + (todayCents / 100).toFixed(2);
-    $('#spend-cap-usd').textContent   = '$' + (capCents   / 100).toFixed(2);
-    const pct = capCents > 0 ? Math.min(100, Math.round(todayCents / capCents * 100)) : 0;
+    const todayMicros = j.today_micros || 0;
+    const todayUsd    = todayMicros / 1e6;
+    const capCents    = j.daily_cap_cents || 0;
+    const capUsd      = capCents / 100;
+    $('#spend-today-usd').textContent = '$' + todayUsd.toFixed(2);
+    $('#spend-cap-usd').textContent   = '$' + capUsd.toFixed(2);
+    const pct = capUsd > 0 ? Math.min(100, Math.round(todayUsd / capUsd * 100)) : 0;
     $('#spend-progress').value = pct;
   } catch(e) { /* offline */ }
 }

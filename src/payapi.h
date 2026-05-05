@@ -19,8 +19,10 @@
 extern "C" {
 #endif
 
-// Lifecycle. Call once after wifi_sta_got_ip event; idempotent — re-calls
-// retrigger a refresh of all enabled providers' openapi specs.
+// Spawns a background task on first call that fetches the catalog and
+// loads enabled providers. Subsequent calls (e.g., wifi reconnect) are
+// no-ops; the task runs once per boot. Use payapi_refresh_catalog() or
+// payapi_refresh_provider(fqn) to retrigger after init.
 void payapi_init(void);
 
 // Force-refresh the catalog only. Web admin "Refresh catalog" button.
