@@ -669,11 +669,8 @@ static void speech_task(void *arg) {
     }
     s_speech_in_flight = false;
     vTaskDeleteWithCaps(NULL);
-<<<<<<< Updated upstream
-=======
     #undef PTT_STALE
     #undef PTT_BAIL_IF_STALE
->>>>>>> Stashed changes
 }
 
 volatile size_t s_speech_frames = 0;
