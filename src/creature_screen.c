@@ -42,6 +42,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
@@ -573,7 +575,7 @@ static void speech_task(void *arg) {
         ESP_LOGW(TAG, "STT returned no text — telling the user");
         ui_set_subtitle("I didn't catch that.");
         s_speech_in_flight = false;
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -616,7 +618,7 @@ static void speech_task(void *arg) {
         ui_set_subtitle(reply);
     }
     s_speech_in_flight = false;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 volatile size_t s_speech_frames = 0;
@@ -649,8 +651,12 @@ void creature_screen_ptt_stop(void) {
     s_speech_in_flight = true;
     // 16 KB stack: ai_handle_say does HTTPS via mbedTLS (handshake eats
     // 5-8 KB) + the 1 KB reply buffer + STT scratch — 8 KB overflowed.
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        speech_task, "speech", 16384, pcm, 5, NULL, 0);
+    // Stack lives in PSRAM (TCB stays in internal RAM): 16 KB internal
+    // allocations started failing once the stack of background tasks
+    // (mDNS, HTTP server, X auth, etc.) grew. Network-bound work, so
+    // the PSRAM access penalty is invisible against TLS round-trips.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+        speech_task, "speech", 16384, pcm, 5, NULL, 0, MALLOC_CAP_SPIRAM);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "speech_task spawn failed");
         mic_buffer_free(pcm);
