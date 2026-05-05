@@ -3,11 +3,13 @@
 // ---------------------------------------------------------------------------
 #include "payapi.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "cJSON.h"
+#include "devcfg.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -39,12 +41,46 @@ typedef struct {
 } payapi_catalog_t;
 
 // ---------------------------------------------------------------------------
+// Tool registry types
+// ---------------------------------------------------------------------------
+
+#define PAYAPI_OPENAPI_CAP   (256 * 1024)   // up to ~250 KB raw spec
+#define PAYAPI_TOOL_NAME_LEN 64
+
+typedef struct {
+    char     name[PAYAPI_TOOL_NAME_LEN]; // pay_xxx_yyy_aaaa
+    char    *fqn;                        // strdup, owned
+    char    *service_url;                // strdup, owned
+    char    *method;                     // strdup, owned (GET/POST/...)
+    char    *path;                       // strdup, owned (template)
+    char    *description;                // strdup, owned (LLM-facing)
+    char    *params_schema_json;         // serialized JSON object string
+    uint32_t price_usd_max_cents;        // ceiling from catalog
+} payapi_tool_t;
+
+typedef struct {
+    char    *fqn;
+    bool     loaded;
+    int      tool_count;
+    char     last_error[64];
+    int64_t  tried_at;
+} payapi_provider_status_t;
+
+// ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
 static SemaphoreHandle_t s_catalog_mutex = NULL;
 static payapi_catalog_t  s_catalog       = {0};
 static bool              s_initialized   = false;
+
+static SemaphoreHandle_t          s_tools_mutex = NULL;
+static payapi_tool_t             *s_tools       = NULL;
+static size_t                     s_tool_count  = 0;
+static size_t                     s_tool_cap    = 0;
+static payapi_provider_status_t  *s_status      = NULL;
+static size_t                     s_status_cnt  = 0;
+static size_t                     s_status_cap  = 0;
 
 // ---------------------------------------------------------------------------
 // HTTP GET helper — PSRAM-backed, NUL-terminated, caller frees
@@ -278,12 +314,512 @@ bool payapi_refresh_catalog(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool registry helpers — must be called under s_tools_mutex
+// ---------------------------------------------------------------------------
+
+// Free all strdup'd strings in one tool entry (does NOT free the entry itself).
+static void tool_free_strings(payapi_tool_t *t) {
+    if (!t) return;
+    free(t->fqn);
+    free(t->service_url);
+    free(t->method);
+    free(t->path);
+    free(t->description);
+    free(t->params_schema_json);
+    memset(t, 0, sizeof(*t));
+}
+
+// Remove all tools whose fqn matches. Compacts the array in place.
+static void tools_drop_provider_locked(const char *fqn) {
+    if (!fqn || !s_tools) return;
+    size_t write = 0;
+    for (size_t i = 0; i < s_tool_count; i++) {
+        if (s_tools[i].fqn && strcmp(s_tools[i].fqn, fqn) == 0) {
+            tool_free_strings(&s_tools[i]);
+        } else {
+            if (write != i) s_tools[write] = s_tools[i];
+            write++;
+        }
+    }
+    s_tool_count = write;
+}
+
+// Append a fully-populated tool to s_tools[]. Grows via PSRAM realloc.
+static bool tools_append_locked(const payapi_tool_t *t) {
+    if (s_tool_count >= s_tool_cap) {
+        size_t new_cap = s_tool_cap ? s_tool_cap * 2 : 16;
+        payapi_tool_t *nb = (payapi_tool_t *)heap_caps_realloc(
+            s_tools, new_cap * sizeof(payapi_tool_t), MALLOC_CAP_SPIRAM);
+        if (!nb) {
+            ESP_LOGE(TAG, "tools_append: PSRAM realloc failed");
+            return false;
+        }
+        s_tools    = nb;
+        s_tool_cap = new_cap;
+    }
+    s_tools[s_tool_count++] = *t;
+    return true;
+}
+
+// Upsert a provider status entry. fqn is strdup'd on insert.
+static void status_upsert_locked(const char *fqn, bool loaded,
+                                 int tool_count, const char *error) {
+    // Find existing
+    for (size_t i = 0; i < s_status_cnt; i++) {
+        if (s_status[i].fqn && strcmp(s_status[i].fqn, fqn) == 0) {
+            s_status[i].loaded     = loaded;
+            s_status[i].tool_count = tool_count;
+            s_status[i].tried_at   = (int64_t)time(NULL);
+            if (error && *error) {
+                snprintf(s_status[i].last_error, sizeof(s_status[i].last_error),
+                         "%s", error);
+            } else {
+                s_status[i].last_error[0] = '\0';
+            }
+            return;
+        }
+    }
+    // Insert
+    if (s_status_cnt >= s_status_cap) {
+        size_t new_cap = s_status_cap ? s_status_cap * 2 : 8;
+        payapi_provider_status_t *nb = (payapi_provider_status_t *)heap_caps_realloc(
+            s_status, new_cap * sizeof(payapi_provider_status_t), MALLOC_CAP_SPIRAM);
+        if (!nb) {
+            ESP_LOGE(TAG, "status_upsert: PSRAM realloc failed");
+            return;
+        }
+        s_status     = nb;
+        s_status_cap = new_cap;
+    }
+    payapi_provider_status_t *e = &s_status[s_status_cnt++];
+    memset(e, 0, sizeof(*e));
+    e->fqn        = strdup(fqn);
+    e->loaded     = loaded;
+    e->tool_count = tool_count;
+    e->tried_at   = (int64_t)time(NULL);
+    if (error && *error) {
+        snprintf(e->last_error, sizeof(e->last_error), "%s", error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FNV-1a hash (32-bit)
+// ---------------------------------------------------------------------------
+
+static uint32_t fnv1a(const char *s) {
+    uint32_t h = 0x811c9dc5u;
+    for (; *s; s++) { h ^= (uint8_t)*s; h *= 0x01000193u; }
+    return h;
+}
+
+// ---------------------------------------------------------------------------
+// Tool name builder
+// ---------------------------------------------------------------------------
+// out must be PAYAPI_TOOL_NAME_LEN bytes.
+// Format: pay_<short_fqn:≤12>_<short_op:≤12>_<4hex>
+// short_fqn/short_op: lowercase alphanumeric only; op is last path segment.
+
+static void build_tool_name(char out[PAYAPI_TOOL_NAME_LEN],
+                             const char *fqn, const char *method,
+                             const char *path) {
+    // short_fqn: keep lowercase alnum, max 12 chars
+    char short_fqn[13] = {0};
+    size_t fi = 0;
+    for (const char *p = fqn; *p && fi < 12; p++) {
+        if (isalnum((unsigned char)*p)) {
+            short_fqn[fi++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    if (fi == 0) { short_fqn[0] = 'x'; fi = 1; }
+    short_fqn[fi] = '\0';
+
+    // short_op: last segment of path (after final '/'), max 12 alnum chars
+    const char *last_slash = strrchr(path, '/');
+    const char *seg = last_slash ? last_slash + 1 : path;
+    char short_op[13] = {0};
+    size_t oi = 0;
+    for (const char *p = seg; *p && oi < 12; p++) {
+        if (isalnum((unsigned char)*p)) {
+            short_op[oi++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    if (oi == 0) { short_op[0] = 'r'; oi = 1; }  // root path
+    short_op[oi] = '\0';
+
+    // Hash: FNV-1a over "fqn|method|path"
+    char hashbuf[256];
+    snprintf(hashbuf, sizeof(hashbuf), "%s|%s|%s", fqn, method, path);
+    uint32_t h = fnv1a(hashbuf);
+    uint16_t h16 = (uint16_t)(h & 0xFFFFu);
+
+    snprintf(out, PAYAPI_TOOL_NAME_LEN, "pay_%s_%s_%04x",
+             short_fqn, short_op, (unsigned)h16);
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI slimmer
+// ---------------------------------------------------------------------------
+// Returns cJSON_PrintUnformatted string (caller must free), or NULL on failure.
+// Walks one operation object, merges path/query params + request body schema
+// into {type:"object", properties:{...}, required:[...]}.
+
+static char *slim_op_to_params_json(const cJSON *operation,
+                                    const cJSON *components) {
+    cJSON *props    = cJSON_CreateObject();
+    cJSON *required = cJSON_CreateArray();
+    if (!props || !required) {
+        cJSON_Delete(props);
+        cJSON_Delete(required);
+        return NULL;
+    }
+
+    // 1. path/query parameters
+    cJSON *params = cJSON_GetObjectItem(operation, "parameters");
+    if (cJSON_IsArray(params)) {
+        cJSON *param;
+        cJSON_ArrayForEach(param, params) {
+            cJSON *name_j   = cJSON_GetObjectItem(param, "name");
+            cJSON *schema_j = cJSON_GetObjectItem(param, "schema");
+            if (!cJSON_IsString(name_j) || !name_j->valuestring ||
+                !cJSON_IsObject(schema_j)) continue;
+            cJSON *clone = cJSON_Duplicate(schema_j, 1);
+            if (clone) cJSON_AddItemToObject(props, name_j->valuestring, clone);
+            // check required flag on the parameter
+            cJSON *req_j = cJSON_GetObjectItem(param, "required");
+            if (cJSON_IsTrue(req_j)) {
+                cJSON_AddItemToArray(required, cJSON_CreateString(name_j->valuestring));
+            }
+        }
+    }
+
+    // 2. requestBody.content["application/json"].schema
+    cJSON *rb = cJSON_GetObjectItem(operation, "requestBody");
+    if (cJSON_IsObject(rb)) {
+        cJSON *content = cJSON_GetObjectItem(rb, "content");
+        if (cJSON_IsObject(content)) {
+            cJSON *app_json = cJSON_GetObjectItem(content, "application/json");
+            if (cJSON_IsObject(app_json)) {
+                cJSON *schema = cJSON_GetObjectItem(app_json, "schema");
+                if (cJSON_IsObject(schema)) {
+                    // Resolve one $ref hop into components/schemas/<name>
+                    cJSON *ref = cJSON_GetObjectItem(schema, "$ref");
+                    if (cJSON_IsString(ref) && ref->valuestring &&
+                        components) {
+                        // Expected form: "#/components/schemas/<name>"
+                        const char *refstr = ref->valuestring;
+                        const char *prefix = "#/components/schemas/";
+                        if (strncmp(refstr, prefix, strlen(prefix)) == 0) {
+                            const char *sname = refstr + strlen(prefix);
+                            cJSON *schemas = cJSON_GetObjectItem(components, "schemas");
+                            if (cJSON_IsObject(schemas)) {
+                                cJSON *resolved = cJSON_GetObjectItem(schemas, sname);
+                                if (cJSON_IsObject(resolved)) schema = resolved;
+                            }
+                        }
+                    }
+
+                    // Merge schema properties into props
+                    cJSON *body_props = cJSON_GetObjectItem(schema, "properties");
+                    if (cJSON_IsObject(body_props)) {
+                        cJSON *prop;
+                        cJSON_ArrayForEach(prop, body_props) {
+                            if (!prop->string) continue;
+                            cJSON *clone = cJSON_Duplicate(prop, 1);
+                            if (clone) cJSON_AddItemToObject(props, prop->string, clone);
+                        }
+                    }
+                    // Merge required array
+                    cJSON *body_req = cJSON_GetObjectItem(schema, "required");
+                    if (cJSON_IsArray(body_req)) {
+                        cJSON *r;
+                        cJSON_ArrayForEach(r, body_req) {
+                            if (cJSON_IsString(r) && r->valuestring)
+                                cJSON_AddItemToArray(required, cJSON_CreateString(r->valuestring));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Wrap result
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        cJSON_Delete(props);
+        cJSON_Delete(required);
+        return NULL;
+    }
+    cJSON_AddStringToObject(root, "type", "object");
+    cJSON_AddItemToObject(root, "properties", props);
+    if (cJSON_GetArraySize(required) > 0) {
+        cJSON_AddItemToObject(root, "required", required);
+    } else {
+        cJSON_Delete(required);
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Description builder
+// ---------------------------------------------------------------------------
+// Returns heap_caps_malloc (PSRAM) string. Caller frees.
+
+static char *build_tool_description(const char *title, const char *summary,
+                                    const char *method, const char *path,
+                                    bool has_free_tier,
+                                    uint32_t min_price_usd_cents) {
+    char price_hint[32];
+    if (has_free_tier && min_price_usd_cents == 0) {
+        snprintf(price_hint, sizeof(price_hint), "free");
+    } else {
+        snprintf(price_hint, sizeof(price_hint), "~$%.3f per call",
+                 min_price_usd_cents / 100.0);
+    }
+
+    // "<title>: <summary>. <price hint>. <METHOD> <path>"
+    char *desc = NULL;
+    size_t len = strlen(title ? title : "") + strlen(summary ? summary : "")
+               + strlen(price_hint) + strlen(method ? method : "")
+               + strlen(path ? path : "") + 32;
+    desc = (char *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!desc) return NULL;
+    snprintf(desc, len, "%s: %s. %s. %s %s",
+             title    ? title    : "",
+             summary  ? summary  : "",
+             price_hint,
+             method   ? method   : "",
+             path     ? path     : "");
+    return desc;
+}
+
+// ---------------------------------------------------------------------------
+// Enabled-service check helper
+// ---------------------------------------------------------------------------
+
+// Check if a given (fqn, method, path) is enabled in the items array from
+// devcfg_pay_enabled_services(). items is the "items" cJSON array.
+static bool endpoint_enabled(const cJSON *items, const char *fqn,
+                              const char *method, const char *path) {
+    if (!cJSON_IsArray(items)) return false;
+    cJSON *item;
+    cJSON_ArrayForEach(item, items) {
+        cJSON *item_fqn = cJSON_GetObjectItem(item, "fqn");
+        if (!cJSON_IsString(item_fqn) || !item_fqn->valuestring) continue;
+        if (strcmp(item_fqn->valuestring, fqn) != 0) continue;
+        // fqn matches
+        cJSON *eps = cJSON_GetObjectItem(item, "endpoints");
+        if (cJSON_IsString(eps) && eps->valuestring &&
+            strcmp(eps->valuestring, "all") == 0) {
+            return true;
+        }
+        if (cJSON_IsArray(eps)) {
+            // Build "<METHOD> <path>" string to match against
+            char needle[256];
+            snprintf(needle, sizeof(needle), "%s %s", method, path);
+            cJSON *ep;
+            cJSON_ArrayForEach(ep, eps) {
+                if (cJSON_IsString(ep) && ep->valuestring &&
+                    strcmp(ep->valuestring, needle) == 0) {
+                    return true;
+                }
+            }
+        }
+        return false;  // fqn found but no matching endpoint
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Per-provider driver
+// ---------------------------------------------------------------------------
+
+bool payapi_refresh_provider(const char *fqn) {
+    if (!fqn || !fqn[0]) {
+        ESP_LOGW(TAG, "payapi_refresh_provider: null/empty fqn");
+        return false;
+    }
+    ESP_LOGI(TAG, "payapi_refresh_provider: %s", fqn);
+
+    // 1. Snapshot catalog entry under its mutex.
+    char  *local_fqn         = NULL;
+    char  *local_title       = NULL;
+    char  *local_service_url = NULL;
+    uint32_t local_min_cents = 0;
+    uint32_t local_max_cents = 0;
+    bool     local_free_tier = false;
+
+    if (xSemaphoreTake(s_catalog_mutex, portMAX_DELAY) == pdTRUE) {
+        for (size_t i = 0; i < s_catalog.count; i++) {
+            if (s_catalog.items[i].fqn &&
+                strcmp(s_catalog.items[i].fqn, fqn) == 0) {
+                local_fqn         = strdup(s_catalog.items[i].fqn);
+                local_title       = strdup(s_catalog.items[i].title
+                                         ? s_catalog.items[i].title : "");
+                local_service_url = strdup(s_catalog.items[i].service_url);
+                local_min_cents   = s_catalog.items[i].min_price_usd_cents;
+                local_max_cents   = s_catalog.items[i].max_price_usd_cents;
+                local_free_tier   = s_catalog.items[i].has_free_tier;
+                break;
+            }
+        }
+        xSemaphoreGive(s_catalog_mutex);
+    }
+
+    if (!local_service_url) {
+        ESP_LOGW(TAG, "payapi_refresh_provider: %s not in catalog", fqn);
+        free(local_fqn);
+        free(local_title);
+        free(local_service_url);
+        return false;
+    }
+
+    // 2. Fetch openapi.json. (No mutex held here.)
+    char openapi_url[512];
+    snprintf(openapi_url, sizeof(openapi_url), "%s/openapi.json", local_service_url);
+
+    char *body = http_get_psram(openapi_url, PAYAPI_OPENAPI_CAP);
+    if (!body) {
+        ESP_LOGW(TAG, "payapi_refresh_provider: fetch failed for %s", fqn);
+        if (s_tools_mutex && xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
+            status_upsert_locked(fqn, false, 0, "fetch_failed");
+            xSemaphoreGive(s_tools_mutex);
+        }
+        free(local_fqn); free(local_title); free(local_service_url);
+        return false;
+    }
+
+    // 3. Parse JSON.
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        ESP_LOGW(TAG, "payapi_refresh_provider: JSON parse failed for %s", fqn);
+        if (s_tools_mutex && xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
+            status_upsert_locked(fqn, false, 0, "parse_failed");
+            xSemaphoreGive(s_tools_mutex);
+        }
+        free(local_fqn); free(local_title); free(local_service_url);
+        return false;
+    }
+
+    // 4. Extract paths + components.
+    cJSON *paths      = cJSON_GetObjectItem(root, "paths");
+    cJSON *components = cJSON_GetObjectItem(root, "components");  // may be NULL
+
+    // 5. Read enabled-services filter.
+    cJSON *enabled_cfg = cJSON_Parse(devcfg_pay_enabled_services());
+    cJSON *items_arr   = NULL;
+    if (enabled_cfg) {
+        items_arr = cJSON_GetObjectItem(enabled_cfg, "items");
+    }
+
+    // HTTP method names to walk.
+    static const char *METHODS[] = {"get","post","put","patch","delete"};
+    static const int   NMETHOD   = 5;
+
+    // 6+7. Under s_tools_mutex: drop old, append new.
+    if (!s_tools_mutex) s_tools_mutex = xSemaphoreCreateMutex();
+
+    int added = 0;
+    if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
+        tools_drop_provider_locked(fqn);
+
+        if (cJSON_IsObject(paths)) {
+            cJSON *path_item;
+            cJSON_ArrayForEach(path_item, paths) {
+                const char *path_str = path_item->string;
+                if (!path_str) continue;
+
+                for (int mi = 0; mi < NMETHOD; mi++) {
+                    cJSON *op = cJSON_GetObjectItem(path_item, METHODS[mi]);
+                    if (!cJSON_IsObject(op)) continue;
+
+                    // Upper-case method for matching & storage
+                    char method_up[8];
+                    snprintf(method_up, sizeof(method_up), "%s", METHODS[mi]);
+                    for (char *c = method_up; *c; c++) *c = (char)toupper((unsigned char)*c);
+
+                    // Check if this endpoint is enabled
+                    if (!endpoint_enabled(items_arr, fqn, method_up, path_str)) continue;
+
+                    // Extract summary for description
+                    cJSON *sum_j = cJSON_GetObjectItem(op, "summary");
+                    const char *summary = (cJSON_IsString(sum_j) && sum_j->valuestring)
+                                         ? sum_j->valuestring : "";
+
+                    // Build tool
+                    payapi_tool_t t = {0};
+                    build_tool_name(t.name, fqn, method_up, path_str);
+                    t.fqn               = strdup(fqn);
+                    t.service_url       = strdup(local_service_url);
+                    t.method            = strdup(method_up);
+                    t.path              = strdup(path_str);
+                    t.description       = build_tool_description(
+                                              local_title, summary,
+                                              method_up, path_str,
+                                              local_free_tier, local_min_cents);
+                    t.params_schema_json = slim_op_to_params_json(op, components);
+                    t.price_usd_max_cents = local_max_cents;
+
+                    // If any strdup failed, skip this tool cleanly
+                    if (!t.fqn || !t.service_url || !t.method || !t.path) {
+                        tool_free_strings(&t);
+                        continue;
+                    }
+                    if (!t.params_schema_json) {
+                        // Provide an empty schema rather than failing
+                        t.params_schema_json = strdup("{\"type\":\"object\",\"properties\":{}}");
+                    }
+
+                    if (tools_append_locked(&t)) {
+                        added++;
+                    } else {
+                        tool_free_strings(&t);
+                    }
+                }
+            }
+        }
+
+        // 8. Update status.
+        status_upsert_locked(fqn, true, added, NULL);
+        xSemaphoreGive(s_tools_mutex);
+    }
+
+    cJSON_Delete(enabled_cfg);
+    cJSON_Delete(root);
+    free(local_fqn);
+    free(local_title);
+    free(local_service_url);
+
+    ESP_LOGI(TAG, "%s: registered %d tools", fqn, added);
+    return added > 0;
+}
+
+// ---------------------------------------------------------------------------
 // Background task
 // ---------------------------------------------------------------------------
 
 static void payapi_task(void *arg) {
     (void)arg;
+    if (!s_tools_mutex) s_tools_mutex = xSemaphoreCreateMutex();
     payapi_refresh_catalog();
+
+    cJSON *enabled = cJSON_Parse(devcfg_pay_enabled_services());
+    if (enabled) {
+        cJSON *items = cJSON_GetObjectItem(enabled, "items");
+        if (cJSON_IsArray(items)) {
+            cJSON *it;
+            cJSON_ArrayForEach(it, items) {
+                cJSON *fqn_j = cJSON_GetObjectItem(it, "fqn");
+                if (cJSON_IsString(fqn_j) && fqn_j->valuestring &&
+                    fqn_j->valuestring[0])
+                    payapi_refresh_provider(fqn_j->valuestring);
+            }
+        }
+        cJSON_Delete(enabled);
+    }
     vTaskDelete(NULL);
 }
 
@@ -301,6 +837,13 @@ void payapi_init(void) {
             return;     // s_initialized stays false → next call retries
         }
     }
+    if (!s_tools_mutex) {
+        s_tools_mutex = xSemaphoreCreateMutex();
+        if (!s_tools_mutex) {
+            ESP_LOGE(TAG, "payapi_init: tools mutex create failed, aborting");
+            return;
+        }
+    }
     s_initialized = true;
 
     // Stack lives in PSRAM (TCB stays in internal RAM), mirroring speech_task.
@@ -312,14 +855,8 @@ void payapi_init(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Stubs (Tasks 5-17)
+// Stubs (Tasks 6-17)
 // ---------------------------------------------------------------------------
-
-bool payapi_refresh_provider(const char *fqn)
-{
-    ESP_LOGI(TAG, "payapi_refresh_provider: %s", fqn ? fqn : "(null)");
-    return false;
-}
 
 bool payapi_resolve(const char *tool_name, payapi_tool_info_t *out)
 {

@@ -392,6 +392,18 @@ static void handle_payapi_refresh_catalog(void) {
     else    resp_err(buf);
 }
 
+static void handle_payapi_refresh_provider(const char *fqn) {
+    if (!fqn || !fqn[0]) {
+        resp_err("payapi_refresh_provider missing fqn");
+        return;
+    }
+    // ok=0 is NOT an error — it may mean nothing was enabled for this fqn.
+    bool ok = payapi_refresh_provider(fqn);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "ok=%d fqn=%s", ok ? 1 : 0, fqn);
+    resp_ok(buf);
+}
+
 // ---------- dispatcher -----------------------------------------------------
 
 static void dispatch_line(const char *line) {
@@ -455,9 +467,14 @@ static void dispatch_line(const char *line) {
         return;
     }
 
-    // --- PAYAPI REFRESH_CATALOG ---------------------------------------------
+    // --- PAYAPI REFRESH_CATALOG / REFRESH_PROVIDER <fqn> --------------------
     if ((rest = match_token(after_test, "PAYAPI"))) {
         if (match_token(rest, "REFRESH_CATALOG")) { handle_payapi_refresh_catalog(); return; }
+        const char *args;
+        if ((args = match_token(rest, "REFRESH_PROVIDER"))) {
+            handle_payapi_refresh_provider(args);
+            return;
+        }
         resp_err("payapi bad_subverb");
         return;
     }
