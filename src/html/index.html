@@ -85,6 +85,7 @@
   <button class="tab" data-tab="settings">SETTINGS</button>
   <button class="tab" data-tab="services">SERVICES</button>
   <button class="tab" data-tab="socials">SOCIALS</button>
+  <button class="tab" data-tab="spending">SPENDING</button>
 </div>
 
 <div class="panel active" id="panel-chat">
@@ -238,6 +239,36 @@
       <button class="btn" id="x-style-save">Save style</button>
       <span id="x-style-saved" style="margin-left:10px;font-size:11px;color:var(--green);display:none">saved</span>
     </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-spending">
+  <div class="card">
+    <h3>SPENDING LIMITS</h3>
+    <p class="hint">Controls how much Daemon can spend per x402 call and per day.</p>
+    <div class="row">
+      <label>Auto-approve below
+        <input type="number" id="spend-auto" step="0.01" min="0" /> $
+      </label>
+    </div>
+    <div class="row">
+      <label>Hold-confirm below
+        <input type="number" id="spend-confirm" step="0.01" min="0" /> $
+      </label>
+    </div>
+    <p class="hint">Anything above hold-confirm is refused automatically.</p>
+    <div class="row">
+      <label>Daily cap
+        <input type="number" id="spend-daily" step="0.01" min="0" /> $
+      </label>
+    </div>
+    <div class="today" style="margin:12px 0 10px;padding:10px;background:#040810;border:1px solid var(--border);border-radius:8px">
+      <div style="font-size:13px;margin-bottom:6px">Today: <span id="spend-today-usd" style="color:var(--accent2)">$0.00</span> / <span id="spend-cap-usd" style="color:var(--dim)">$0.00</span></div>
+      <progress id="spend-progress" max="100" value="0" style="width:100%;height:6px;border-radius:4px;accent-color:var(--accent)"></progress>
+      <small style="color:var(--dim);font-size:10px">Resets at UTC midnight</small>
+    </div>
+    <button class="btn" id="spend-save">Save</button>
+    <p id="spend-status" style="font-size:12px;color:var(--green);min-height:16px;margin:8px 0 0"></p>
   </div>
 </div>
 
@@ -785,5 +816,67 @@ document.querySelectorAll('.tab').forEach(t => {
 });
 
 refreshXState();
+
+// ────────── spending ──────────
+let spendPollTimer = null;
+
+async function loadSpending() {
+  try {
+    const j = await (await fetch('/api/spending')).json();
+    $('#spend-auto').value    = ((j.auto_max_cents    || 0) / 100).toFixed(2);
+    $('#spend-confirm').value = ((j.confirm_max_cents || 0) / 100).toFixed(2);
+    $('#spend-daily').value   = ((j.daily_cap_cents   || 0) / 100).toFixed(2);
+    const todayCents = j.today_cents || 0;
+    const capCents   = j.daily_cap_cents || 0;
+    $('#spend-today-usd').textContent = '$' + (todayCents / 100).toFixed(2);
+    $('#spend-cap-usd').textContent   = '$' + (capCents   / 100).toFixed(2);
+    const pct = capCents > 0 ? Math.min(100, Math.round(todayCents / capCents * 100)) : 0;
+    $('#spend-progress').value = pct;
+  } catch(e) { /* offline */ }
+}
+
+async function saveSpending() {
+  const auto    = Math.round(parseFloat($('#spend-auto').value    || 0) * 100);
+  const confirm = Math.round(parseFloat($('#spend-confirm').value || 0) * 100);
+  const daily   = Math.round(parseFloat($('#spend-daily').value   || 0) * 100);
+  try {
+    const r = await fetch('/api/spending', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({auto_max_cents: auto, confirm_max_cents: confirm, daily_cap_cents: daily}),
+    });
+    const st = $('#spend-status');
+    if (r.ok) {
+      st.style.color = 'var(--green)';
+      st.textContent = 'saved';
+    } else {
+      st.style.color = 'var(--red)';
+      st.textContent = 'save failed (' + r.status + ')';
+    }
+    setTimeout(() => { st.textContent = ''; }, 2000);
+    loadSpending();
+  } catch(e) {
+    $('#spend-status').textContent = 'error: ' + e;
+  }
+}
+
+$('#spend-save').onclick = saveSpending;
+
+// Hook spending poll into tab activation/deactivation.
+// The existing tab switcher iterates $$('.tab') — we piggyback the same
+// event by augmenting the onclick after the switcher's forEach has run.
+document.querySelectorAll('.tab').forEach(t => {
+  if (t.dataset.tab === 'spending') {
+    t.addEventListener('click', () => {
+      loadSpending();
+      spendPollTimer = setInterval(loadSpending, 5000);
+    });
+  } else {
+    t.addEventListener('click', () => {
+      clearInterval(spendPollTimer);
+      spendPollTimer = null;
+    });
+  }
+});
 </script>
 </body></html>
