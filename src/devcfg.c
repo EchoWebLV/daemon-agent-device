@@ -193,9 +193,11 @@ static uint32_t s_spnd_conf_c   = 500;   // $5.00
 static uint32_t s_spnd_daily_c  = 1000;  // $10.00
 
 // Packed blob persisted under KEY_SPND_TODAY.
+// micros first: eliminates internal padding on Xtensa (12-byte natural layout
+// instead of {int32, 4-byte pad, uint64}).
 typedef struct {
-    int32_t  utc_day;   // time(NULL)/86400 for the day this counter covers
     uint64_t micros;    // cumulative spend in micros (1e-6 USD) for that day
+    int32_t  utc_day;   // time(NULL)/86400 for the day this counter covers
 } spend_today_t;
 static spend_today_t s_today = {0, 0};
 
@@ -355,6 +357,23 @@ esp_err_t devcfg_init(void) {
                 sizeof(s_x_redirect_uri));
     }
 
+    // x402 payment controls — must be loaded BEFORE nvs_close(h).
+    load_str (h, KEY_PAY_ENABLED,  s_pay_enabled,  sizeof(s_pay_enabled));
+    load_u32 (h, KEY_SPND_AUTO_C,  &s_spnd_auto_c,  10);
+    load_u32 (h, KEY_SPND_CONF_C,  &s_spnd_conf_c,  500);
+    load_u32 (h, KEY_SPND_DAILY_C, &s_spnd_daily_c, 1000);
+    {
+        // Load the today blob. If missing or wrong size, leave defaults (0,0).
+        if (h != 0) {
+            size_t blen = sizeof(s_today);
+            if (nvs_get_blob(h, KEY_SPND_TODAY, &s_today, &blen) != ESP_OK ||
+                blen != sizeof(s_today)) {
+                s_today.utc_day = 0;
+                s_today.micros  = 0;
+            }
+        }
+    }
+
     if (h != 0) nvs_close(h);
 
     // One-shot migration: the deprecated wizard saved its BUILTIN
@@ -387,23 +406,6 @@ esp_err_t devcfg_init(void) {
                     nvs_close(hw);
                 }
                 break;
-            }
-        }
-    }
-
-    // x402 payment controls
-    load_str (h, KEY_PAY_ENABLED,  s_pay_enabled,  sizeof(s_pay_enabled));
-    load_u32 (h, KEY_SPND_AUTO_C,  &s_spnd_auto_c,  10);
-    load_u32 (h, KEY_SPND_CONF_C,  &s_spnd_conf_c,  500);
-    load_u32 (h, KEY_SPND_DAILY_C, &s_spnd_daily_c, 1000);
-    {
-        // Load the today blob. If missing or wrong size, leave defaults (0,0).
-        if (h != 0) {
-            size_t blen = sizeof(s_today);
-            if (nvs_get_blob(h, KEY_SPND_TODAY, &s_today, &blen) != ESP_OK ||
-                blen != sizeof(s_today)) {
-                s_today.utc_day = 0;
-                s_today.micros  = 0;
             }
         }
     }
@@ -666,5 +668,6 @@ void devcfg_add_spend_today_micros(uint64_t delta) {
 }
 
 int32_t devcfg_spend_today_utc_day(void) {
+    maybe_rollover_today();
     return s_today.utc_day;
 }
