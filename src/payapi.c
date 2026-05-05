@@ -884,16 +884,83 @@ void payapi_init(void) {
 // Stubs (Tasks 6-17)
 // ---------------------------------------------------------------------------
 
-bool payapi_resolve(const char *tool_name, payapi_tool_info_t *out)
-{
-    ESP_LOGI(TAG, "payapi_resolve: %s", tool_name ? tool_name : "(null)");
-    return false;
-}
+// ---------------------------------------------------------------------------
+// payapi_attach_tools — append registered tools to a cJSON tools array
+// ---------------------------------------------------------------------------
+// Called from ai.c::attach_tools() to expose pay.sh tools to the LLM.
+// out_array must be a cJSON array object. Skips gracefully if NULL.
 
 void payapi_attach_tools(struct cJSON *out_array)
 {
-    ESP_LOGI(TAG, "payapi_attach_tools");
-    (void)out_array;
+    if (!out_array) return;
+    if (!s_tools_mutex) return;
+
+    if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) != pdTRUE) return;
+
+    for (size_t i = 0; i < s_tool_count; i++) {
+        payapi_tool_t *t = &s_tools[i];
+
+        cJSON *tool = cJSON_CreateObject();
+        if (!tool) continue;
+
+        cJSON_AddStringToObject(tool, "type", "function");
+        cJSON *fn = cJSON_AddObjectToObject(tool, "function");
+        if (!fn) { cJSON_Delete(tool); continue; }
+
+        cJSON_AddStringToObject(fn, "name", t->name);
+        cJSON_AddStringToObject(fn, "description",
+                                t->description ? t->description : "");
+
+        // Parse the serialized params schema. Fall back to empty object on
+        // parse failure so the tool is still visible to the LLM.
+        cJSON *params = NULL;
+        if (t->params_schema_json && t->params_schema_json[0]) {
+            params = cJSON_Parse(t->params_schema_json);
+        }
+        if (!params) {
+            params = cJSON_CreateObject();
+        }
+        cJSON_AddItemToObject(fn, "parameters", params);
+
+        cJSON_AddItemToArray(out_array, tool);
+    }
+
+    xSemaphoreGive(s_tools_mutex);
+}
+
+// ---------------------------------------------------------------------------
+// payapi_resolve — map a tool name back to its registry entry
+// ---------------------------------------------------------------------------
+// Lifetime contract: out is populated with const pointers directly into the
+// s_tools[] registry. The caller must use these pointers synchronously within
+// execute_tool's stack frame. No concurrent catalog refresh runs while
+// execute_tool holds the tool result — payapi_refresh_provider drops-and-
+// re-registers under s_tools_mutex, so the resolved pointer remains valid for
+// the duration of the synchronous HTTP call that follows.
+
+bool payapi_resolve(const char *tool_name, payapi_tool_info_t *out)
+{
+    if (!tool_name || !out) return false;
+    if (!s_tools_mutex) return false;
+
+    bool found = false;
+
+    if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
+        for (size_t i = 0; i < s_tool_count; i++) {
+            if (strcmp(s_tools[i].name, tool_name) == 0) {
+                out->service_url         = s_tools[i].service_url;
+                out->method              = s_tools[i].method;
+                out->path                = s_tools[i].path;
+                out->fqn                 = s_tools[i].fqn;
+                out->price_usd_max_cents = s_tools[i].price_usd_max_cents;
+                found = true;
+                break;
+            }
+        }
+        xSemaphoreGive(s_tools_mutex);
+    }
+
+    return found;
 }
 
 x402_guard_decision_t payapi_guard(uint64_t actual_micros,
@@ -907,12 +974,51 @@ x402_guard_decision_t payapi_guard(uint64_t actual_micros,
     return X402_GUARD_AUTO;
 }
 
+// ---------------------------------------------------------------------------
+// payapi_status_json — per-provider load status for /api/services
+// ---------------------------------------------------------------------------
+// Returns a cJSON object: {providers:[{fqn,loaded,tool_count,error?,tried_at}],
+// catalog_synced_at:<unix>}. Acquires s_tools_mutex then s_catalog_mutex
+// separately — never both at once.
+
 struct cJSON *payapi_status_json(void)
 {
-    ESP_LOGI(TAG, "payapi_status_json");
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "providers", cJSON_CreateArray());
-    // TODO(Task 6): replace literal 0 with s_catalog.synced_at (needs mutex read).
-    cJSON_AddNumberToObject(root, "catalog_synced_at", 0);
+    if (!root) return NULL;
+
+    cJSON *providers = cJSON_CreateArray();
+    if (!providers) { cJSON_Delete(root); return NULL; }
+    cJSON_AddItemToObject(root, "providers", providers);
+
+    // --- s_tools_mutex: read s_status[] ---
+    if (s_tools_mutex && xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
+        for (size_t i = 0; i < s_status_cnt; i++) {
+            payapi_provider_status_t *st = &s_status[i];
+            if (!st->fqn) continue;
+
+            cJSON *entry = cJSON_CreateObject();
+            if (!entry) continue;
+
+            cJSON_AddStringToObject(entry, "fqn",        st->fqn);
+            cJSON_AddBoolToObject(  entry, "loaded",     st->loaded);
+            cJSON_AddNumberToObject(entry, "tool_count", st->tool_count);
+            if (st->last_error[0] != '\0') {
+                cJSON_AddStringToObject(entry, "error", st->last_error);
+            }
+            cJSON_AddNumberToObject(entry, "tried_at", (double)st->tried_at);
+
+            cJSON_AddItemToArray(providers, entry);
+        }
+        xSemaphoreGive(s_tools_mutex);
+    }
+
+    // --- s_catalog_mutex: read synced_at only ---
+    int64_t synced_at = 0;
+    if (s_catalog_mutex && xSemaphoreTake(s_catalog_mutex, portMAX_DELAY) == pdTRUE) {
+        synced_at = s_catalog.synced_at;
+        xSemaphoreGive(s_catalog_mutex);
+    }
+
+    cJSON_AddNumberToObject(root, "catalog_synced_at", (double)synced_at);
     return root;
 }

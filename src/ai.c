@@ -20,6 +20,7 @@
 #include "esp_log.h"
 
 #include "devcfg.h"
+#include "payapi.h"
 #include "price.h"
 #include "social_x.h"
 #include "swap.h"
@@ -483,6 +484,11 @@ static int attach_tools(cJSON *root, const cJSON *services, const cJSON *enabled
         cJSON_AddItemToArray(tools, t);
         count++;
     }
+
+    // Append pay.sh registered tools. These are always included regardless of
+    // whether any custom services are enabled — pay.sh tools are an independent
+    // registry populated by payapi_task on boot.
+    payapi_attach_tools(tools);
 
     return count;
 }
