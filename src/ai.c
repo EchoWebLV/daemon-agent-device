@@ -85,7 +85,15 @@ static const char *PERSONA =
     "Never use markdown in any response — no asterisks for bold or italics, "
     "no dashes or numbers as bullets, no hash headings, no backticks, no code "
     "fences, no tables. Write like you are speaking out loud. No emojis. "
-    "Occasionally add light sarcasm.";
+    "Occasionally add light sarcasm."
+    "\n\n"
+    "You also have a set of paid services available as tools. Each tool's "
+    "description ends with a price hint like \"~$0.001 per call\". Use them "
+    "naturally when the user's request needs information or actions you "
+    "can't fulfill on your own. Don't ask permission for cheap calls — the "
+    "device handles spending caps automatically. If a paid call returns a "
+    "`status` field (declined / refused / error), the user already saw the "
+    "reason on the screen; just acknowledge it briefly.";
 
 // ---------------------------------------------------------------------------
 // Rolling history. Fixed-size arena; oldest turn is dropped when full.
@@ -577,6 +585,148 @@ static void param_to_string(const cJSON *v, char *out, size_t cap) {
     }
 }
 
+// Build the URL (and optional body) for a pay.sh tool call.
+//
+// Path template: substitute {name} occurrences from `args`. String values
+// are substituted as-is; numbers use %g; missing keys become empty string.
+// A `remaining` dup of `args` accumulates all keys NOT consumed by path
+// substitution.
+//
+// For body methods (POST/PUT/PATCH): URL = base_url + resolved_path; body is
+// cJSON_PrintUnformatted(remaining) if remaining is non-empty (caller owns the
+// allocation via *body_out_buf).
+//
+// For GET/DELETE: URL = base_url + resolved_path + ?key=value... from
+// remaining (percent-encoded via the existing url_encode_append helper).
+// TODO: path-template vars are NOT percent-encoded for now (MVP); add encoding
+// if providers use special chars in path params.
+//
+// Always cJSON_Delete(remaining) before returning.
+static void build_url_with_params(const char *base_url, const char *path,
+                                  const char *method,   cJSON *args,
+                                  char *url, size_t url_cap,
+                                  char **body_out_buf, const char **body_out) {
+    *body_out_buf = NULL;
+    *body_out     = NULL;
+
+    // Start with base_url; resolved path is appended below.
+    size_t base_len = base_url ? strlen(base_url) : 0;
+    if (base_len >= url_cap) { url[0] = '\0'; return; }
+    memcpy(url, base_url, base_len);
+    url[base_len] = '\0';
+    size_t url_used = base_len;
+
+    // Duplicate args so we can delete substituted keys from the remainder.
+    cJSON *remaining = args ? cJSON_Duplicate(args, /*recurse=*/true)
+                            : cJSON_CreateObject();
+
+    // Walk the path template, substituting {name} tokens.
+    if (path) {
+        const char *p = path;
+        while (*p) {
+            if (*p == '{') {
+                const char *end = strchr(p + 1, '}');
+                if (!end) {
+                    // Malformed template — copy literally.
+                    if (url_used + 1 < url_cap) url[url_used++] = *p++;
+                    continue;
+                }
+                size_t name_len = (size_t)(end - p - 1);
+                char name[64] = {0};
+                if (name_len >= sizeof(name)) name_len = sizeof(name) - 1;
+                memcpy(name, p + 1, name_len);
+                name[name_len] = '\0';
+
+                // Substitute from args.
+                char valbuf[160] = {0};
+                const cJSON *v = args ? cJSON_GetObjectItem(args, name) : NULL;
+                if (v) {
+                    param_to_string(v, valbuf, sizeof(valbuf));
+                    cJSON_DeleteItemFromObject(remaining, name);
+                }
+                // Append substituted value (or empty string if missing).
+                size_t vlen = strlen(valbuf);
+                if (url_used + vlen + 1 < url_cap) {
+                    memcpy(url + url_used, valbuf, vlen);
+                    url_used += vlen;
+                }
+                p = end + 1;
+            } else {
+                if (url_used + 1 < url_cap) url[url_used++] = *p;
+                p++;
+            }
+        }
+    }
+    url[url_used] = '\0';
+
+    bool has_body = !(strcasecmp(method, "GET")    == 0 ||
+                      strcasecmp(method, "DELETE")  == 0);
+
+    if (cJSON_GetArraySize(remaining) == 0) {
+        // No leftover args — body stays NULL, URL stays clean.
+    } else if (has_body) {
+        char *s = cJSON_PrintUnformatted(remaining);
+        *body_out_buf = s;
+        *body_out     = s;
+    } else {
+        // Append query string using the existing url_encode_append helper.
+        bool first = (strchr(url, '?') == NULL);
+        const cJSON *kv = NULL;
+        cJSON_ArrayForEach(kv, remaining) {
+            size_t len = strlen(url);
+            if (len + 3 >= url_cap) break;
+            url[len++] = first ? '?' : '&';
+            url[len]   = '\0';
+            first = false;
+            url_encode_append(url, url_cap, kv->string);
+            len = strlen(url);
+            if (len + 2 >= url_cap) break;
+            url[len++] = '=';
+            url[len]   = '\0';
+            char valbuf[160];
+            param_to_string(kv, valbuf, sizeof(valbuf));
+            url_encode_append(url, url_cap, valbuf);
+        }
+    }
+
+    cJSON_Delete(remaining);
+}
+
+// Build a structured failure JSON string for the LLM's tool result when a
+// pay.sh call is declined, refused, or errors. The verdict string is spoken
+// directly by the skip-LLM-2 fast path, so keep it short and natural.
+// Returns a malloc'd string the caller must free() (or pass to cJSON_free —
+// both work since cJSON uses the same allocator).
+static char *tool_result_failure_json(const x402_result_t *r, const char *fqn) {
+    cJSON *root = cJSON_CreateObject();
+    const char *status, *reason;
+    char        verdict[160];
+    if (strcmp(r->error, "user_declined") == 0) {
+        status = "declined";
+        reason = "hold_to_confirm_denied";
+        snprintf(verdict, sizeof verdict, "You declined the call to %s.", fqn);
+    } else if (strcmp(r->error, "policy_refused") == 0) {
+        status = "refused";
+        reason = "daily_cap_exceeded_or_over_max";
+        snprintf(verdict, sizeof verdict, "That'd put you over your spending limits.");
+    } else {
+        status = "error";
+        reason = (r->error[0] != '\0') ? r->error : "network";
+        snprintf(verdict, sizeof verdict, "Couldn't reach %s.", fqn);
+    }
+    cJSON_AddStringToObject(root, "status", status);
+    cJSON_AddStringToObject(root, "reason", reason);
+    cJSON_AddNumberToObject(root, "price_usd", r->cost_usd);
+    cJSON_AddNumberToObject(root, "today_spent_usd",
+                            (double)devcfg_spend_today_micros() / 1e6);
+    cJSON_AddNumberToObject(root, "daily_cap_usd",
+                            (double)devcfg_spend_daily_cap_cents() / 100.0);
+    cJSON_AddStringToObject(root, "verdict", verdict);
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return s;
+}
+
 // Execute a single tool call and write the response into `out`. On any
 // failure, write a short JSON {"error":...} so the model gets something
 // to reason about next round.
@@ -643,6 +793,60 @@ static void execute_tool(const cJSON *services, const cJSON *enabled,
                      err[0] ? err : "unknown");
         }
         return;
+    }
+
+    // pay.sh dispatch — check BEFORE the legacy custom-services path.
+    {
+        payapi_tool_info_t info;
+        if (payapi_resolve(tool_name, &info)) {
+            char        url[1024];
+            const char *body_to_send  = NULL;
+            char       *body_buf_owned = NULL;
+
+            cJSON *pargs = args_json && args_json[0] ? cJSON_Parse(args_json)
+                                                     : cJSON_CreateObject();
+            if (!pargs) pargs = cJSON_CreateObject();
+
+            build_url_with_params(info.service_url, info.path, info.method,
+                                  pargs, url, sizeof url,
+                                  &body_buf_owned, &body_to_send);
+            cJSON_Delete(pargs);
+
+            ESP_LOGI(TAG, "payapi tool %s -> %s %s", tool_name, info.method, url);
+
+            char *rsp = malloc(TOOL_RESPONSE_CAP);
+            if (!rsp) {
+                free(body_buf_owned);
+                snprintf(out, cap, "{\"error\":\"oom\"}");
+                return;
+            }
+
+            x402_result_t r = {0};
+            x402_call_with_guard(info.method, url, body_to_send, NULL,
+                                 rsp, TOOL_RESPONSE_CAP,
+                                 payapi_guard, NULL, &r);
+            free(body_buf_owned);
+
+            if (r.status >= 200 && r.status < 300) {
+                devcfg_add_spend_today_micros(r.cost_micros);
+                strlcpy(out, rsp, cap);
+                free(rsp);
+                return;
+            }
+
+            // Failure path: build structured JSON so skip-LLM-2 fast path
+            // can speak the verdict field directly without a second LLM round.
+            char *fail = tool_result_failure_json(&r, info.fqn);
+            if (fail) {
+                strlcpy(out, fail, cap);
+                free(fail);
+            } else {
+                snprintf(out, cap, "{\"error\":\"payapi_fail\",\"status\":%d}",
+                         r.status);
+            }
+            free(rsp);
+            return;
+        }
     }
 
     // Existing x402 service dispatch.
