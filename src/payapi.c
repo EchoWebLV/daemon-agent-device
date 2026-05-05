@@ -318,6 +318,9 @@ bool payapi_refresh_catalog(void) {
 // ---------------------------------------------------------------------------
 
 // Free all strdup'd strings in one tool entry (does NOT free the entry itself).
+// All fields are freed with plain free() even if allocated via heap_caps_malloc
+// (PSRAM) — ESP-IDF's unified heap dispatcher routes the call correctly. Do NOT
+// replace with heap_caps_free; it is unnecessary and would break internal-RAM strings.
 static void tool_free_strings(payapi_tool_t *t) {
     if (!t) return;
     free(t->fqn);
@@ -364,6 +367,7 @@ static bool tools_append_locked(const payapi_tool_t *t) {
 // Upsert a provider status entry. fqn is strdup'd on insert.
 static void status_upsert_locked(const char *fqn, bool loaded,
                                  int tool_count, const char *error) {
+    if (!fqn) return;
     // Find existing
     for (size_t i = 0; i < s_status_cnt; i++) {
         if (s_status[i].fqn && strcmp(s_status[i].fqn, fqn) == 0) {
@@ -518,6 +522,9 @@ static char *slim_op_to_params_json(const cJSON *operation,
                         }
                     }
 
+                    // NOTE: only one $ref hop is resolved above; any $refs
+                    // inside the resolved schema are cloned verbatim — the LLM
+                    // will see underspecified properties for nested references.
                     // Merge schema properties into props
                     cJSON *body_props = cJSON_GetObjectItem(schema, "properties");
                     if (cJSON_IsObject(body_props)) {
@@ -720,15 +727,23 @@ bool payapi_refresh_provider(const char *fqn) {
     static const int   NMETHOD   = 5;
 
     // 6+7. Under s_tools_mutex: drop old, append new.
-    if (!s_tools_mutex) s_tools_mutex = xSemaphoreCreateMutex();
+    if (!s_tools_mutex) {
+        ESP_LOGE(TAG, "tools_mutex not initialized — call payapi_init first");
+        cJSON_Delete(enabled_cfg);
+        cJSON_Delete(root);
+        free(local_fqn); free(local_title); free(local_service_url);
+        return false;
+    }
 
-    int added = 0;
+    int  added = 0;
+    bool oom   = false;
     if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
         tools_drop_provider_locked(fqn);
 
         if (cJSON_IsObject(paths)) {
             cJSON *path_item;
             cJSON_ArrayForEach(path_item, paths) {
+                if (oom) break;
                 const char *path_str = path_item->string;
                 if (!path_str) continue;
 
@@ -776,14 +791,21 @@ bool payapi_refresh_provider(const char *fqn) {
                     if (tools_append_locked(&t)) {
                         added++;
                     } else {
+                        ESP_LOGE(TAG, "%s: tool dropped (registry full / OOM)", local_fqn);
                         tool_free_strings(&t);
+                        oom = true;
+                        break;
                     }
                 }
             }
         }
 
-        // 8. Update status.
-        status_upsert_locked(fqn, true, added, NULL);
+        // 8. Update status — report OOM loudly so /api/services shows red.
+        if (oom) {
+            status_upsert_locked(local_fqn, false, added, "registry_oom");
+        } else {
+            status_upsert_locked(local_fqn, added > 0, added, NULL);
+        }
         xSemaphoreGive(s_tools_mutex);
     }
 
@@ -803,7 +825,11 @@ bool payapi_refresh_provider(const char *fqn) {
 
 static void payapi_task(void *arg) {
     (void)arg;
-    if (!s_tools_mutex) s_tools_mutex = xSemaphoreCreateMutex();
+    if (!s_tools_mutex) {
+        ESP_LOGE(TAG, "tools_mutex not initialized — call payapi_init first");
+        vTaskDelete(NULL);
+        return;
+    }
     payapi_refresh_catalog();
 
     cJSON *enabled = cJSON_Parse(devcfg_pay_enabled_services());
