@@ -38,6 +38,7 @@
 // the only caller that needs to see all of these together, so we intentionally
 // fan-in the dependencies here rather than in a public header.
 #include "ai.h"
+#include "payapi.h"
 #include "swap.h"
 #include "ui.h"
 #include "wallet.h"
@@ -383,6 +384,14 @@ static void handle_x402_call(const char *url) {
     resp_ok(buf);
 }
 
+static void handle_payapi_refresh_catalog(void) {
+    bool ok = payapi_refresh_catalog();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "ok=%d", ok ? 1 : 0);
+    if (ok) resp_ok(buf);
+    else    resp_err(buf);
+}
+
 // ---------- dispatcher -----------------------------------------------------
 
 static void dispatch_line(const char *line) {
@@ -443,6 +452,13 @@ static void dispatch_line(const char *line) {
         const char *args;
         if ((args = match_token(rest, "CALL"))) { handle_x402_call(args); return; }
         resp_err("x402 bad_subverb");
+        return;
+    }
+
+    // --- PAYAPI REFRESH_CATALOG ---------------------------------------------
+    if ((rest = match_token(after_test, "PAYAPI"))) {
+        if (match_token(rest, "REFRESH_CATALOG")) { handle_payapi_refresh_catalog(); return; }
+        resp_err("payapi bad_subverb");
         return;
     }
 
