@@ -570,7 +570,7 @@ static esp_http_client_method_t method_from_str(const char *m, bool *has_body) {
     return HTTP_METHOD_POST;
 }
 
-// Internal one-stop entry that both x402_call and x402_call_stream share.
+// Internal one-stop entry that both x402_call_with_guard and x402_call_stream share.
 // In buffered mode, body_buf is non-NULL; in streaming mode, on_chunk is
 // non-NULL. Phase 1 always buffers (so we can capture a small 402 body
 // for the description fallback path); phase 2's delivery follows whichever
@@ -585,6 +585,8 @@ static void x402_call_internal(const char *method,
                                size_t      body_cap,
                                x402_chunk_cb_t on_chunk,    // NULL in buffered mode
                                void           *cb_user,
+                               x402_guard_cb_t guard,       // NULL = no guard
+                               void           *guard_user,
                                x402_result_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -728,6 +730,62 @@ static void x402_call_internal(const char *method,
             goto done;
         }
 
+        // Parse amount and human-readable description from the decoded JSON
+        // so we can populate out->cost_micros/cost_usd and run the guard
+        // BEFORE any signing happens.
+        {
+            cJSON *pr_j = cJSON_Parse(desc);
+            if (pr_j) {
+                cJSON *opt_j = pick_solana_accept(pr_j);
+                if (opt_j) {
+                    const cJSON *amt_j     = cJSON_GetObjectItem(opt_j, "amount");
+                    const cJSON *amt_max_j = cJSON_GetObjectItem(opt_j, "maxAmountRequired");
+                    const char  *amt_s     = NULL;
+                    if (cJSON_IsString(amt_j)     && amt_j->valuestring)     amt_s = amt_j->valuestring;
+                    else if (cJSON_IsString(amt_max_j) && amt_max_j->valuestring) amt_s = amt_max_j->valuestring;
+                    if (amt_s) {
+                        out->cost_micros = (uint64_t)strtoull(amt_s, NULL, 10);
+                        out->cost_usd    = (double)out->cost_micros / 1e6;
+                    }
+                }
+                cJSON_Delete(pr_j);
+            }
+        }
+
+        // Guard hook: fires after cost is known, before signing.
+        if (guard) {
+            // Extract the top-level "description" string if present (human-readable).
+            const char *guard_desc = "";
+            char desc_str[128] = {0};
+            cJSON *pr_j2 = cJSON_Parse(desc);
+            if (pr_j2) {
+                const cJSON *d = cJSON_GetObjectItem(pr_j2, "description");
+                if (cJSON_IsString(d) && d->valuestring) {
+                    strlcpy(desc_str, d->valuestring, sizeof(desc_str));
+                    guard_desc = desc_str;
+                }
+                cJSON_Delete(pr_j2);
+            }
+
+            x402_guard_decision_t decision = guard(out->cost_micros, guard_desc, guard_user);
+            if (decision == X402_GUARD_CONFIRM_DENIED) {
+                ESP_LOGI(TAG, "guard: user_declined (%.5f USDC)", out->cost_usd);
+                out->status = 402;
+                snprintf(out->error, sizeof(out->error), "user_declined");
+                free(desc); free(b64);
+                xSemaphoreGive(s_handle_mutex);
+                goto done;
+            } else if (decision == X402_GUARD_REFUSE) {
+                ESP_LOGI(TAG, "guard: policy_refused (%.5f USDC)", out->cost_usd);
+                out->status = 402;
+                snprintf(out->error, sizeof(out->error), "policy_refused");
+                free(desc); free(b64);
+                xSemaphoreGive(s_handle_mutex);
+                goto done;
+            }
+            // X402_GUARD_AUTO or X402_GUARD_CONFIRM_OK: fall through to sign+retry.
+        }
+
         uint64_t paid_atomic = 0;
         bool built = build_payment_header(desc, url, b64, X402_B64_CAP, &paid_atomic);
         free(desc);
@@ -805,6 +863,15 @@ done:
     free(pr); free(xpr); free(wa);
 }
 
+void x402_call_with_guard(const char *method, const char *url,
+                          const char *json_body, const char *auth_bearer,
+                          char *body_buf, size_t body_cap,
+                          x402_guard_cb_t guard, void *guard_user,
+                          x402_result_t *out) {
+    x402_call_internal(method, url, json_body, auth_bearer,
+                       body_buf, body_cap, NULL, NULL, guard, guard_user, out);
+}
+
 void x402_call(const char *method,
                const char *url,
                const char *json_body,
@@ -812,8 +879,8 @@ void x402_call(const char *method,
                char       *body_buf,
                size_t      body_cap,
                x402_result_t *out) {
-    x402_call_internal(method, url, json_body, auth_bearer,
-                       body_buf, body_cap, NULL, NULL, out);
+    x402_call_with_guard(method, url, json_body, auth_bearer,
+                         body_buf, body_cap, NULL, NULL, out);
 }
 
 void x402_call_stream(const char *method,
@@ -824,7 +891,7 @@ void x402_call_stream(const char *method,
                       void          *cb_user,
                       x402_result_t *out) {
     x402_call_internal(method, url, json_body, auth_bearer,
-                       NULL, 0, on_chunk, cb_user, out);
+                       NULL, 0, on_chunk, cb_user, NULL, NULL, out);
 }
 
 void x402_post(const char *url, const char *json_body,

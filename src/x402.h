@@ -12,17 +12,42 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct {
-    int    status;       // final HTTP status (after payment if one was required)
-    double cost_usd;     // USDC charged this call (0 on free / failure)
-    char   error[96];    // "" on success, short human-readable msg otherwise
-    size_t body_len;     // bytes of response body actually captured
+    int      status;       // final HTTP status (after payment if one was required)
+    double   cost_usd;     // USDC charged this call (0 on free / failure)
+    uint64_t cost_micros;  // exact integer base-units from the payment envelope (0 on free / failure)
+    char     error[96];    // "" on success, short human-readable msg otherwise
+    size_t   body_len;     // bytes of response body actually captured
 } x402_result_t;
+
+// Guard hook: called after the 402 payment amount is known but before the
+// Solana transaction is signed and submitted. Allows the caller to inspect
+// the cost and approve, deny, or refuse the payment.
+typedef enum {
+    X402_GUARD_AUTO,            // proceed with payment (default / no-op)
+    X402_GUARD_CONFIRM_OK,      // explicitly confirmed by caller — proceed
+    X402_GUARD_CONFIRM_DENIED,  // user declined — abort with "user_declined"
+    X402_GUARD_REFUSE,          // policy refused — abort with "policy_refused"
+} x402_guard_decision_t;
+
+typedef x402_guard_decision_t (*x402_guard_cb_t)(
+    uint64_t actual_micros, const char *description, void *user);
+
+// Issue an HTTP request with an optional guard hook that fires between
+// receiving the 402 and signing the payment. `guard` may be NULL (behaves
+// identically to x402_call). `guard_user` is forwarded to the callback.
+// See x402_call for parameter semantics.
+void x402_call_with_guard(const char *method, const char *url,
+                          const char *json_body, const char *auth_bearer,
+                          char *body_buf, size_t body_cap,
+                          x402_guard_cb_t guard, void *guard_user,
+                          x402_result_t *out);
 
 // Issue an HTTP request to `url` with `method` ("GET", "POST", "PUT",
 // "PATCH", "DELETE" — case-sensitive, NULL treated as "POST"). If the first
