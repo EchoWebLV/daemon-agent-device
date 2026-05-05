@@ -116,6 +116,11 @@ static char *http_get_psram(const char *url, size_t cap) {
         return NULL;
     }
 
+    if (gb.len == gb.cap - 1) {
+        ESP_LOGW(TAG, "http_get_psram: response truncated at %u bytes (URL: %s)",
+                 (unsigned)gb.len, url);
+    }
+
     return buf;
 }
 
@@ -126,6 +131,7 @@ static char *http_get_psram(const char *url, size_t cap) {
 // Convert USD double to cents with rounding, clamped to UINT32_MAX.
 static uint32_t usd_to_cents(double v) {
     if (v <= 0.0) return 0;
+    if (v < 0.005) return 1;       // sub-cent: round up to 1¢ minimum
     double c = v * 100.0 + 0.5;
     if (c >= (double)UINT32_MAX) return UINT32_MAX;
     return (uint32_t)c;
@@ -287,11 +293,15 @@ static void payapi_task(void *arg) {
 
 void payapi_init(void) {
     if (s_initialized) return;
-    s_initialized = true;
 
     if (!s_catalog_mutex) {
         s_catalog_mutex = xSemaphoreCreateMutex();
+        if (!s_catalog_mutex) {
+            ESP_LOGE(TAG, "payapi_init: mutex create failed, aborting");
+            return;     // s_initialized stays false → next call retries
+        }
     }
+    s_initialized = true;
 
     // Stack lives in PSRAM (TCB stays in internal RAM), mirroring speech_task.
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
@@ -339,6 +349,7 @@ struct cJSON *payapi_status_json(void)
     ESP_LOGI(TAG, "payapi_status_json");
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "providers", cJSON_CreateArray());
+    // TODO(Task 6): replace literal 0 with s_catalog.synced_at (needs mutex read).
     cJSON_AddNumberToObject(root, "catalog_synced_at", 0);
     return root;
 }
