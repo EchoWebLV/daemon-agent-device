@@ -890,13 +890,14 @@ void payapi_init(void) {
 // Called from ai.c::attach_tools() to expose pay.sh tools to the LLM.
 // out_array must be a cJSON array object. Skips gracefully if NULL.
 
-void payapi_attach_tools(struct cJSON *out_array)
+int payapi_attach_tools(struct cJSON *out_array)
 {
-    if (!out_array) return;
-    if (!s_tools_mutex) return;
+    if (!out_array) return 0;
+    if (!s_tools_mutex) return 0;
 
-    if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) != pdTRUE) return 0;
 
+    int n = 0;
     for (size_t i = 0; i < s_tool_count; i++) {
         payapi_tool_t *t = &s_tools[i];
 
@@ -923,35 +924,32 @@ void payapi_attach_tools(struct cJSON *out_array)
         cJSON_AddItemToObject(fn, "parameters", params);
 
         cJSON_AddItemToArray(out_array, tool);
+        n++;
     }
 
     xSemaphoreGive(s_tools_mutex);
+    return n;
 }
 
 // ---------------------------------------------------------------------------
 // payapi_resolve — map a tool name back to its registry entry
 // ---------------------------------------------------------------------------
-// Lifetime contract: out is populated with const pointers directly into the
-// s_tools[] registry. The caller must use these pointers synchronously within
-// execute_tool's stack frame. No concurrent catalog refresh runs while
-// execute_tool holds the tool result — payapi_refresh_provider drops-and-
-// re-registers under s_tools_mutex, so the resolved pointer remains valid for
-// the duration of the synchronous HTTP call that follows.
+// Values are strlcpy'd into out under the mutex; out fields are caller-owned
+// and safe to use after the call even if the registry is concurrently mutated.
 
 bool payapi_resolve(const char *tool_name, payapi_tool_info_t *out)
 {
-    if (!tool_name || !out) return false;
-    if (!s_tools_mutex) return false;
+    if (!tool_name || !out || !s_tools_mutex) return false;
 
     bool found = false;
 
     if (xSemaphoreTake(s_tools_mutex, portMAX_DELAY) == pdTRUE) {
         for (size_t i = 0; i < s_tool_count; i++) {
             if (strcmp(s_tools[i].name, tool_name) == 0) {
-                out->service_url         = s_tools[i].service_url;
-                out->method              = s_tools[i].method;
-                out->path                = s_tools[i].path;
-                out->fqn                 = s_tools[i].fqn;
+                strlcpy(out->service_url, s_tools[i].service_url ? s_tools[i].service_url : "", sizeof out->service_url);
+                strlcpy(out->method,      s_tools[i].method      ? s_tools[i].method      : "", sizeof out->method);
+                strlcpy(out->path,        s_tools[i].path        ? s_tools[i].path        : "", sizeof out->path);
+                strlcpy(out->fqn,         s_tools[i].fqn         ? s_tools[i].fqn         : "", sizeof out->fqn);
                 out->price_usd_max_cents = s_tools[i].price_usd_max_cents;
                 found = true;
                 break;

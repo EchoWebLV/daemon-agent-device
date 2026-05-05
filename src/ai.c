@@ -488,7 +488,7 @@ static int attach_tools(cJSON *root, const cJSON *services, const cJSON *enabled
     // Append pay.sh registered tools. These are always included regardless of
     // whether any custom services are enabled — pay.sh tools are an independent
     // registry populated by payapi_task on boot.
-    payapi_attach_tools(tools);
+    count += payapi_attach_tools(tools);
 
     return count;
 }

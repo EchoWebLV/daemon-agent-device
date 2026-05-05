@@ -30,21 +30,22 @@ bool payapi_refresh_catalog(void);
 bool payapi_refresh_provider(const char *fqn);
 
 // Tool resolution. Called from ai.c execute_tool() when an LLM tool name
-// matches a registered pay.sh tool.
+// matches a registered pay.sh tool. Fields are caller-owned copies; no
+// registry pointer aliases survive the call.
 typedef struct {
-    const char *service_url;
-    const char *method;             // "GET" / "POST" / etc
-    const char *path;               // template, may contain {var}
-    const char *fqn;                // for description in the modal
-    uint32_t    price_usd_max_cents;
+    char     service_url[256];
+    char     method[8];
+    char     path[256];
+    char     fqn[64];
+    uint32_t price_usd_max_cents;
 } payapi_tool_info_t;
 
 bool payapi_resolve(const char *tool_name, payapi_tool_info_t *out);
 
 // Tool registration. Called from ai.c attach_tools(); appends pay.sh-derived
-// tool definitions to the cJSON array.
+// tool definitions to the cJSON array. Returns the number of tools appended.
 struct cJSON;
-void payapi_attach_tools(struct cJSON *out_array);
+int payapi_attach_tools(struct cJSON *out_array);
 
 // Guard callback. Pass to x402_call_with_guard(). Reads spending caps
 // from devcfg, applies the auto/confirm/refuse policy, opens the
