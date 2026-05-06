@@ -33,6 +33,9 @@ typedef struct payapi_provider {
     char    *fqn;
     char    *title;
     char    *service_url;
+    char    *description;   // strdup, owned, may be "" — what the service IS
+    char    *use_case;      // strdup, owned, may be "" — what to ASK for ("Use for …")
+    char    *category;      // strdup, owned, may be ""
     uint32_t min_price_usd_cents;
     uint32_t max_price_usd_cents;
     bool     has_free_tier;
@@ -48,7 +51,14 @@ typedef struct {
 // Tool registry types
 // ---------------------------------------------------------------------------
 
-#define PAYAPI_OPENAPI_CAP   (256 * 1024)   // up to ~250 KB raw spec
+// pay.sh's published spec wrapper is the full openapi_doc + metadata, so
+// individual files can run ~700 KB (rentcast, agentmail, alibaba/ocr).
+// Cap at 1 MB; PSRAM has plenty.
+#define PAYAPI_OPENAPI_CAP   (1024 * 1024)
+// Catalog wrappers live at this storage bucket. service_url + "/openapi.json"
+// is unreliable (paid 401, Google Discovery format, etc.); pay.sh's wrappers
+// are pre-converted to OpenAPI under "openapi_doc".
+#define PAYAPI_SPEC_URL_FMT  "https://storage.googleapis.com/pay-skills/v1/providers/%s.json"
 #define PAYAPI_TOOL_NAME_LEN 64
 
 typedef struct {
@@ -217,6 +227,9 @@ static payapi_provider_t *parse_catalog(const char *json, size_t *out_count) {
         cJSON *fqn_j         = cJSON_GetObjectItem(it, "fqn");
         cJSON *title_j       = cJSON_GetObjectItem(it, "title");
         cJSON *svc_j         = cJSON_GetObjectItem(it, "service_url");
+        cJSON *desc_j        = cJSON_GetObjectItem(it, "description");
+        cJSON *uc_j          = cJSON_GetObjectItem(it, "use_case");
+        cJSON *cat_j         = cJSON_GetObjectItem(it, "category");
         cJSON *min_j         = cJSON_GetObjectItem(it, "min_price_usd");
         cJSON *max_j         = cJSON_GetObjectItem(it, "max_price_usd");
         cJSON *free_j        = cJSON_GetObjectItem(it, "has_free_tier");
@@ -232,15 +245,25 @@ static payapi_provider_t *parse_catalog(const char *json, size_t *out_count) {
         p->title       = (cJSON_IsString(title_j) && title_j->valuestring)
                              ? strdup(title_j->valuestring) : strdup("");
         p->service_url = strdup(svc_j->valuestring);
+        p->description = (cJSON_IsString(desc_j) && desc_j->valuestring)
+                             ? strdup(desc_j->valuestring) : strdup("");
+        p->use_case    = (cJSON_IsString(uc_j) && uc_j->valuestring)
+                             ? strdup(uc_j->valuestring) : strdup("");
+        p->category    = (cJSON_IsString(cat_j) && cat_j->valuestring)
+                             ? strdup(cat_j->valuestring) : strdup("");
         p->min_price_usd_cents = cJSON_IsNumber(min_j) ? usd_to_cents(min_j->valuedouble) : 0;
         p->max_price_usd_cents = cJSON_IsNumber(max_j) ? usd_to_cents(max_j->valuedouble) : 0;
         p->has_free_tier       = cJSON_IsTrue(free_j);
 
-        if (!p->fqn || !p->title || !p->service_url) {
+        if (!p->fqn || !p->title || !p->service_url ||
+            !p->description || !p->use_case || !p->category) {
             // strdup OOM — drop this row cleanly.
             free(p->fqn);
             free(p->title);
             free(p->service_url);
+            free(p->description);
+            free(p->use_case);
+            free(p->category);
             memset(p, 0, sizeof(*p));
             continue;
         }
@@ -265,6 +288,9 @@ static void free_catalog_items(payapi_provider_t *items, size_t count) {
         free(items[i].fqn);
         free(items[i].title);
         free(items[i].service_url);
+        free(items[i].description);
+        free(items[i].use_case);
+        free(items[i].category);
     }
     free(items);
 }
@@ -661,6 +687,7 @@ bool payapi_refresh_provider(const char *fqn) {
     uint32_t local_min_cents = 0;
     uint32_t local_max_cents = 0;
     bool     local_free_tier = false;
+    bool     from_catalog    = false;
 
     if (xSemaphoreTake(s_catalog_mutex, portMAX_DELAY) == pdTRUE) {
         for (size_t i = 0; i < s_catalog.count; i++) {
@@ -673,6 +700,7 @@ bool payapi_refresh_provider(const char *fqn) {
                 local_min_cents   = s_catalog.items[i].min_price_usd_cents;
                 local_max_cents   = s_catalog.items[i].max_price_usd_cents;
                 local_free_tier   = s_catalog.items[i].has_free_tier;
+                from_catalog      = true;
                 break;
             }
         }
@@ -715,9 +743,23 @@ bool payapi_refresh_provider(const char *fqn) {
         ESP_LOGI(TAG, "payapi_refresh_provider: %s using persisted service_url", fqn);
     }
 
-    // 2. Fetch openapi.json. (No mutex held here.)
+    // 2. Fetch the spec.
+    //
+    // For catalog providers we hit pay.sh's public storage bucket — they
+    // publish a wrapper {service_url, endpoints, openapi_doc, ...} where
+    // openapi_doc is a clean OpenAPI 3.x spec (Google Discovery → OpenAPI
+    // conversion already done). The provider's own /openapi.json is
+    // unreliable: some return 401 (paid x402), some return native Google
+    // Discovery format the device parser doesn't speak.
+    //
+    // For custom (user-added) providers we keep the legacy ${service_url}/
+    // openapi.json convention since they aren't in the bucket.
     char openapi_url[512];
-    snprintf(openapi_url, sizeof(openapi_url), "%s/openapi.json", local_service_url);
+    if (from_catalog) {
+        snprintf(openapi_url, sizeof(openapi_url), PAYAPI_SPEC_URL_FMT, local_fqn);
+    } else {
+        snprintf(openapi_url, sizeof(openapi_url), "%s/openapi.json", local_service_url);
+    }
 
     char *body = http_get_psram(openapi_url, PAYAPI_OPENAPI_CAP);
     if (!body) {
@@ -744,8 +786,14 @@ bool payapi_refresh_provider(const char *fqn) {
     }
 
     // 4. Extract paths + components.
-    cJSON *paths      = cJSON_GetObjectItem(root, "paths");
-    cJSON *components = cJSON_GetObjectItem(root, "components");  // may be NULL
+    //
+    // pay.sh wrappers nest the OpenAPI doc under "openapi_doc". A custom
+    // (user-added) provider serves a plain OpenAPI document at the root.
+    // Look one level deep first; fall back to root.
+    cJSON *spec_root  = cJSON_GetObjectItem(root, "openapi_doc");
+    if (!spec_root || !cJSON_IsObject(spec_root)) spec_root = root;
+    cJSON *paths      = cJSON_GetObjectItem(spec_root, "paths");
+    cJSON *components = cJSON_GetObjectItem(spec_root, "components");  // may be NULL
 
     // 5. Read enabled-services filter.
     cJSON *enabled_cfg = cJSON_Parse(devcfg_pay_enabled_services());
@@ -862,7 +910,14 @@ static void payapi_task(void *arg) {
         vTaskDelete(NULL);
         return;
     }
-    payapi_refresh_catalog();
+    // Retry boot fetch with backoff. wifi_sta_begin returns on GOT_IP, but
+    // DNS / TLS can still race for a second or two after that — a single
+    // attempt strands the device on an empty catalog until the user clicks
+    // Refresh in the web admin. 2s / 4s / 8s buys ~14s of grace.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (payapi_refresh_catalog()) break;
+        vTaskDelay(pdMS_TO_TICKS(2000 << attempt));
+    }
 
     cJSON *enabled = cJSON_Parse(devcfg_pay_enabled_services());
     if (enabled) {
@@ -879,6 +934,48 @@ static void payapi_task(void *arg) {
         cJSON_Delete(enabled);
     }
     vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog JSON snapshot for /api/catalog HTTP route. Browser-side calls
+// this rather than reaching pay.sh directly — keeps everything same-origin
+// and removes CORS / mixed-content / network-from-LAN failure modes.
+// ---------------------------------------------------------------------------
+cJSON *payapi_catalog_json(void) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    cJSON *arr = cJSON_AddArrayToObject(root, "providers");
+    if (!arr) { cJSON_Delete(root); return NULL; }
+
+    if (!s_catalog_mutex) {
+        cJSON_AddNumberToObject(root, "provider_count", 0);
+        cJSON_AddNumberToObject(root, "synced_at", 0);
+        return root;
+    }
+    if (xSemaphoreTake(s_catalog_mutex, portMAX_DELAY) != pdTRUE) {
+        cJSON_AddNumberToObject(root, "provider_count", 0);
+        cJSON_AddNumberToObject(root, "synced_at", 0);
+        return root;
+    }
+    cJSON_AddNumberToObject(root, "provider_count", (double)s_catalog.count);
+    cJSON_AddNumberToObject(root, "synced_at",      (double)s_catalog.synced_at);
+    for (size_t i = 0; i < s_catalog.count; i++) {
+        const payapi_provider_t *p = &s_catalog.items[i];
+        cJSON *o = cJSON_CreateObject();
+        if (!o) continue;
+        cJSON_AddStringToObject(o, "fqn",         p->fqn         ? p->fqn         : "");
+        cJSON_AddStringToObject(o, "title",       p->title       ? p->title       : "");
+        cJSON_AddStringToObject(o, "service_url", p->service_url ? p->service_url : "");
+        cJSON_AddStringToObject(o, "description", p->description ? p->description : "");
+        cJSON_AddStringToObject(o, "use_case",    p->use_case    ? p->use_case    : "");
+        cJSON_AddStringToObject(o, "category",    p->category    ? p->category    : "");
+        cJSON_AddNumberToObject(o, "min_price_usd", (double)p->min_price_usd_cents / 100.0);
+        cJSON_AddNumberToObject(o, "max_price_usd", (double)p->max_price_usd_cents / 100.0);
+        cJSON_AddBoolToObject  (o, "has_free_tier", p->has_free_tier);
+        cJSON_AddItemToArray(arr, o);
+    }
+    xSemaphoreGive(s_catalog_mutex);
+    return root;
 }
 
 // ---------------------------------------------------------------------------

@@ -483,6 +483,87 @@ static SemaphoreHandle_t        s_handle_mutex   = NULL;
 static esp_http_client_handle_t s_cached_handle  = NULL;
 static char                     s_cached_host[128] = {0};
 
+// ---------------------------------------------------------------------------
+// Description cache. After we receive a 402 from a route, the description
+// JSON (price + payTo + chain + extras) doesn't change between requests.
+// Caching it lets us skip the phase-1 round-trip on subsequent calls: we
+// build the PAYMENT-SIGNATURE header from the cached description and send
+// it on the FIRST POST. The server validates and streams; no 402 dance.
+//
+// If the server returns 402 anyway (e.g. price changed under us), we
+// invalidate the slot and fall through to the existing 2-phase flow,
+// which writes a fresh description back into the cache.
+//
+// Sized for the small set of paid routes the device hits (anthropic /
+// openai / grok / shannon stream variants + a handful of utility ones).
+// ---------------------------------------------------------------------------
+#define X402_DESC_CACHE_SLOTS 6
+
+typedef struct {
+    char  *url;         // strdup'd, NULL = empty slot
+    char  *desc_json;   // PSRAM-backed copy of the 402 description
+    size_t desc_len;
+} desc_cache_entry_t;
+
+static desc_cache_entry_t s_desc_cache[X402_DESC_CACHE_SLOTS] = {0};
+static unsigned           s_desc_cache_next = 0;   // round-robin eviction
+
+// Caller MUST hold s_handle_mutex.
+static const char *desc_cache_get_locked(const char *url) {
+    if (!url) return NULL;
+    for (size_t i = 0; i < X402_DESC_CACHE_SLOTS; i++) {
+        if (s_desc_cache[i].url && strcmp(s_desc_cache[i].url, url) == 0) {
+            return s_desc_cache[i].desc_json;
+        }
+    }
+    return NULL;
+}
+
+// Caller MUST hold s_handle_mutex.
+static void desc_cache_invalidate_locked(const char *url) {
+    if (!url) return;
+    for (size_t i = 0; i < X402_DESC_CACHE_SLOTS; i++) {
+        if (s_desc_cache[i].url && strcmp(s_desc_cache[i].url, url) == 0) {
+            free(s_desc_cache[i].url);
+            heap_caps_free(s_desc_cache[i].desc_json);
+            s_desc_cache[i].url = NULL;
+            s_desc_cache[i].desc_json = NULL;
+            s_desc_cache[i].desc_len = 0;
+            return;
+        }
+    }
+}
+
+// Caller MUST hold s_handle_mutex. Overwrites an existing slot for the same
+// URL, otherwise round-robins into the next slot (evicting whatever was there).
+static void desc_cache_store_locked(const char *url, const char *desc_json) {
+    if (!url || !desc_json) return;
+    desc_cache_invalidate_locked(url);
+
+    unsigned slot = s_desc_cache_next % X402_DESC_CACHE_SLOTS;
+    s_desc_cache_next++;
+
+    if (s_desc_cache[slot].url) {
+        free(s_desc_cache[slot].url);
+        heap_caps_free(s_desc_cache[slot].desc_json);
+    }
+    size_t n = strlen(desc_json);
+    char *url_copy  = strdup(url);
+    char *desc_copy = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (!url_copy || !desc_copy) {
+        free(url_copy);
+        if (desc_copy) heap_caps_free(desc_copy);
+        s_desc_cache[slot].url = NULL;
+        s_desc_cache[slot].desc_json = NULL;
+        s_desc_cache[slot].desc_len = 0;
+        return;
+    }
+    memcpy(desc_copy, desc_json, n + 1);
+    s_desc_cache[slot].url       = url_copy;
+    s_desc_cache[slot].desc_json = desc_copy;
+    s_desc_cache[slot].desc_len  = n;
+}
+
 static void ensure_mutex_init(void) {
     if (s_handle_mutex == NULL) {
         s_handle_mutex = xSemaphoreCreateMutex();
@@ -695,9 +776,87 @@ static void x402_call_internal(const char *method,
     }
     if (has_body) esp_http_client_set_post_field(h, json_body, (int)strlen(json_body));
 
+    // ---- Fast path: cached description from a prior 402 lets us build
+    // the payment header up front and send it on the FIRST request, so
+    // the server returns 200 + body straight away instead of forcing the
+    // full 402 → retry round-trip. Phase 1 below still handles the cold
+    // case (cache miss) and the cache-stale case (server returns 402
+    // anyway because the price changed under us) — we just invalidate
+    // and fall through. ~300-600 ms saved per call when warm.
+    bool      fast_paid       = false;
+    uint64_t  fast_paid_atomic = 0;
+    char     *fast_b64        = NULL;
+    {
+        const char *cached_desc = desc_cache_get_locked(url);
+        if (cached_desc) {
+            fast_b64 = (char *)heap_caps_malloc(X402_B64_CAP, MALLOC_CAP_SPIRAM);
+            if (fast_b64 && build_payment_header(cached_desc, url, fast_b64,
+                                                 X402_B64_CAP, &fast_paid_atomic)) {
+                esp_http_client_set_header(h, "PAYMENT-SIGNATURE", fast_b64);
+                fast_paid = true;
+                // Phase-1 will be the only round-trip if the server accepts
+                // this payment. Capture body straight to the caller's
+                // destination (chunk callback in streaming, body_buf in
+                // buffered mode) instead of phase-1 scratch.
+                if (streaming) {
+                    state.body_buf = NULL;
+                    state.body_cap = 0;
+                    state.on_chunk = on_chunk;
+                    state.cb_user  = cb_user;
+                } else {
+                    state.body_buf = body_buf;
+                    state.body_cap = body_cap;
+                }
+                state.body_len = 0;
+                state.pr = state.xpr = state.wa = NULL;   // skip header capture
+            } else {
+                // build failed (no wallet ATA, no blockhash, etc.) — drop the
+                // header we never set and let the cold 2-phase flow take over.
+                if (fast_b64) { heap_caps_free(fast_b64); fast_b64 = NULL; }
+            }
+        }
+    }
+
     // ---- Phase 1: initial request (capturing potential 402 headers) -----
     esp_err_t err1  = esp_http_client_perform(h);
     int       code1 = esp_http_client_get_status_code(h);
+
+    // Fast-path resolution. 200 = cached payment was accepted, we're done.
+    // 402 = cached description is stale; invalidate and fall through to
+    // the cold 2-phase below (which will overwrite the header and body
+    // capture state during its retry).
+    if (fast_paid) {
+        if (err1 == ESP_OK && code1 == 200) {
+            out->status   = code1;
+            out->body_len = state.body_len;
+            out->cost_usd = (double)fast_paid_atomic / 1e6;
+            ESP_LOGI(TAG, "paid %.5f USDC (cached desc, no 402 round-trip)",
+                     out->cost_usd);
+            heap_caps_free(fast_b64);
+            xSemaphoreGive(s_handle_mutex);
+            goto done;
+        }
+        if (err1 == ESP_OK && code1 == 402) {
+            ESP_LOGI(TAG, "cached desc rejected (price changed?); refreshing");
+            desc_cache_invalidate_locked(url);
+        }
+        heap_caps_free(fast_b64);
+        fast_b64 = NULL;
+        // Re-prime header capture for the cold-path 402 description read.
+        state.body_buf = phase1_buf;
+        state.body_cap = phase1_cap;
+        state.on_chunk = NULL;
+        state.cb_user  = NULL;
+        state.pr       = pr;
+        state.xpr      = xpr;
+        state.wa       = wa;
+        state.body_len = 0;
+        // Drop the stale PAYMENT-SIGNATURE; the cold-path will set a fresh one.
+        esp_http_client_delete_header(h, "PAYMENT-SIGNATURE");
+        // The cold path's flow assumes a fresh response. esp_http_client
+        // doesn't strictly need a re-perform here when code1 was 402,
+        // since the retry below does another perform. Continue.
+    }
 
     if (err1 != ESP_OK) {
         snprintf(out->error, sizeof(out->error), "perform: %s", esp_err_to_name(err1));
@@ -780,6 +939,11 @@ static void x402_call_internal(const char *method,
 
         uint64_t paid_atomic = 0;
         bool built = build_payment_header(desc, url, b64, X402_B64_CAP, &paid_atomic);
+        // Stash the description for next time so subsequent calls to this
+        // URL can skip the 402 round-trip via the fast path above. Stored
+        // even when build_payment_header fails — the description is still
+        // valid; the build failure is wallet-side (e.g. no ATA cached yet).
+        desc_cache_store_locked(url, desc);
         free(desc);
         if (!built) {
             strlcpy(out->error, "payment build failed", sizeof(out->error));

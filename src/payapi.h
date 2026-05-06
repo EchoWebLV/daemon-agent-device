@@ -60,6 +60,14 @@ x402_guard_decision_t payapi_guard(uint64_t actual_micros,
 // caller must cJSON_Delete.
 struct cJSON *payapi_status_json(void);
 
+// Full catalog as a malloc'd cJSON tree, shape:
+//   { "provider_count": N, "synced_at": <unix>,
+//     "providers": [ {fqn, title, service_url, category,
+//                     min_price_usd, max_price_usd, has_free_tier}, ... ] }
+// Caller must cJSON_Delete. Returns an empty providers array if the
+// catalog hasn't been fetched yet.
+struct cJSON *payapi_catalog_json(void);
+
 #ifdef __cplusplus
 }
 #endif

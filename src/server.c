@@ -529,6 +529,21 @@ static esp_err_t handle_services_refresh_catalog(httpd_req_t *req) {
     return send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
+// GET /api/catalog — proxy view of pay.sh's catalog as cached on the device.
+// Browser-side calls this rather than fetching pay.sh directly so the
+// Services tab stays same-origin (no CORS / mixed-content / LAN reachability
+// concerns). Returns { provider_count, synced_at, providers: [...] }.
+static esp_err_t handle_catalog_get(httpd_req_t *req) {
+    cJSON *root = payapi_catalog_json();
+    if (!root) return send_json(req, 500, "{\"error\":\"out of memory\"}");
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) return send_json(req, 500, "{\"error\":\"out of memory\"}");
+    esp_err_t r = send_json(req, 200, body);
+    cJSON_free(body);
+    return r;
+}
+
 // POST /api/services/refresh_provider  body: { fqn: string }
 // Re-fetches the openapi spec for a single provider.
 // Reply { "ok": true/false }. Missing/invalid fqn -> 400.
@@ -591,6 +606,7 @@ esp_err_t server_start(void) {
         { .uri = "/api/services",                       .method = HTTP_POST, .handler = handle_services_post             },
         { .uri = "/api/services/refresh_catalog",       .method = HTTP_POST, .handler = handle_services_refresh_catalog  },
         { .uri = "/api/services/refresh_provider",      .method = HTTP_POST, .handler = handle_services_refresh_provider },
+        { .uri = "/api/catalog",                        .method = HTTP_GET,  .handler = handle_catalog_get               },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &uris[i]),
