@@ -30,6 +30,7 @@
 
 #include "ed25519.h"
 #include "swap_screen.h"
+#include "tls_lock.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -104,9 +105,11 @@ static bool https_get(const char *url, char *out, size_t out_cap) {
     };
     esp_http_client_handle_t h = esp_http_client_init(&cfg);
     if (!h) return false;
+    if (!tls_lock_take(20000)) { esp_http_client_cleanup(h); return false; }
     esp_err_t err  = esp_http_client_perform(h);
     int       code = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
+    tls_lock_give();
     if (err != ESP_OK)  { ESP_LOGW(TAG, "GET %s: %s", url, esp_err_to_name(err)); return false; }
     if (code != 200)    { ESP_LOGW(TAG, "GET %s: HTTP %d", url, code);             return false; }
     if (rb.overflowed)  { ESP_LOGW(TAG, "GET %s: body > %u bytes", url, (unsigned)out_cap); return false; }
@@ -134,9 +137,11 @@ static bool https_post_json(const char *url, const char *body,
     if (!h) return false;
     esp_http_client_set_header(h, "Content-Type", "application/json");
     esp_http_client_set_post_field(h, body, (int)strlen(body));
+    if (!tls_lock_take(20000)) { esp_http_client_cleanup(h); return false; }
     esp_err_t err  = esp_http_client_perform(h);
     int       code = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
+    tls_lock_give();
     if (err != ESP_OK)  { ESP_LOGW(TAG, "POST %s: %s", url, esp_err_to_name(err)); return false; }
     if (code != 200)    { ESP_LOGW(TAG, "POST %s: HTTP %d", url, code);             return false; }
     if (rb.overflowed)  { ESP_LOGW(TAG, "POST %s: body > %u bytes", url, (unsigned)out_cap); return false; }

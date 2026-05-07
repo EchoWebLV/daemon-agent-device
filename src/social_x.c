@@ -5,6 +5,7 @@
 #include "x_post_screen.h"
 #include "devcfg.h"
 #include "secrets.h"
+#include "tls_lock.h"
 #include "freertos/semphr.h"
 
 #include <stdlib.h>
@@ -144,9 +145,16 @@ static bool http_post_with_auth(const char *url, const char *body,
     }
     if (body)
         esp_http_client_set_post_field(h, body, strlen(body));
+    // Serialise on global TLS lock — see tls_lock.h
+    if (!tls_lock_take(20000)) {
+        esp_http_client_cleanup(h);
+        free(c.body);
+        return false;
+    }
     esp_err_t rc = esp_http_client_perform(h);
     int st = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
+    tls_lock_give();
     if (rc != ESP_OK) {
         free(c.body);
         return false;
@@ -176,9 +184,15 @@ static bool http_get_with_auth(const char *url, const char *bearer,
         snprintf(hdr, sizeof(hdr), "Bearer %s", bearer);
         esp_http_client_set_header(h, "Authorization", hdr);
     }
+    if (!tls_lock_take(20000)) {
+        esp_http_client_cleanup(h);
+        free(c.body);
+        return false;
+    }
     esp_err_t rc = esp_http_client_perform(h);
     int st = esp_http_client_get_status_code(h);
     esp_http_client_cleanup(h);
+    tls_lock_give();
     if (rc != ESP_OK) { free(c.body); return false; }
     if (out_status) *out_status = st;
     if (out_body)   *out_body   = c.body;

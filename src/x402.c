@@ -31,6 +31,7 @@
 #include "base58.h"
 #include "secrets.h"
 #include "solana_tx.h"
+#include "tls_lock.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -805,6 +806,10 @@ done:
     free(pr); free(xpr); free(wa);
 }
 
+// Public entry points all serialise on the global TLS lock — see tls_lock.h
+// for why. The lock window covers the entire 402 retry dance plus the body
+// download so there's only ever one mbedtls AES context allocated across
+// all of wallet/price/stt/voice/ai/scheduler.
 void x402_call(const char *method,
                const char *url,
                const char *json_body,
@@ -812,8 +817,16 @@ void x402_call(const char *method,
                char       *body_buf,
                size_t      body_cap,
                x402_result_t *out) {
+    if (!tls_lock_take(30000)) {
+        if (out) {
+            memset(out, 0, sizeof(*out));
+            strlcpy(out->error, "tls_lock_timeout", sizeof(out->error));
+        }
+        return;
+    }
     x402_call_internal(method, url, json_body, auth_bearer,
                        body_buf, body_cap, NULL, NULL, out);
+    tls_lock_give();
 }
 
 void x402_call_stream(const char *method,
@@ -823,8 +836,16 @@ void x402_call_stream(const char *method,
                       x402_chunk_cb_t on_chunk,
                       void          *cb_user,
                       x402_result_t *out) {
+    if (!tls_lock_take(30000)) {
+        if (out) {
+            memset(out, 0, sizeof(*out));
+            strlcpy(out->error, "tls_lock_timeout", sizeof(out->error));
+        }
+        return;
+    }
     x402_call_internal(method, url, json_body, auth_bearer,
                        NULL, 0, on_chunk, cb_user, out);
+    tls_lock_give();
 }
 
 void x402_post(const char *url, const char *json_body,

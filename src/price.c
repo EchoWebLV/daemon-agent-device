@@ -21,6 +21,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "tls_lock.h"
 #include "wifi_sta.h"
 
 static const char *TAG = "price";
@@ -59,6 +60,14 @@ static esp_err_t on_http_event(esp_http_client_event_t *evt) {
 void price_refresh(void) {
     if (!wifi_sta_is_connected()) return;
 
+    // Serialise on the global TLS lock — see tls_lock.h. 5 s timeout is
+    // generous; if the lock is held by a longer call (PTT in flight,
+    // wallet refresh) we just skip and try again on the next 30-s tick.
+    if (!tls_lock_take(5000)) {
+        ESP_LOGW(TAG, "tls_lock busy, skipping refresh");
+        return;
+    }
+
     rsp_buf_t rsp = { .len = 0 };
     esp_http_client_config_t cfg = {
         .url               = "https://api.coingecko.com/api/v3/"
@@ -70,11 +79,12 @@ void price_refresh(void) {
         .timeout_ms        = 10000,
     };
     esp_http_client_handle_t http = esp_http_client_init(&cfg);
-    if (!http) { ESP_LOGW(TAG, "client init failed"); return; }
+    if (!http) { ESP_LOGW(TAG, "client init failed"); tls_lock_give(); return; }
 
     esp_err_t err  = esp_http_client_perform(http);
     int       code = esp_http_client_get_status_code(http);
     esp_http_client_cleanup(http);
+    tls_lock_give();
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "perform: %s", esp_err_to_name(err));

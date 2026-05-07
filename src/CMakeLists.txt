@@ -28,6 +28,7 @@ idf_component_register(
         "swap.c"
         "swap_screen.c"
         "testharness.c"
+        "tls_lock.c"
         "touch.c"
         "ui.c"
         "voice.c"

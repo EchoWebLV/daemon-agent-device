@@ -30,6 +30,7 @@
 #include "base58.h"
 #include "ed25519.h"
 #include "secrets.h"
+#include "tls_lock.h"
 #include "wifi_sta.h"
 
 static const char *TAG = "wallet";
@@ -431,12 +432,21 @@ static void snapshot_balances(void) {
 
 void wallet_refresh(void) {
     if (!s_ok) return;
+    // Serialise both Helius RPC calls (SOL balance + token list) on the
+    // global TLS lock so they never overlap with PTT's STT/AI/TTS or with
+    // the scheduler. 5 s timeout is generous — worst case a long PTT round
+    // trip is in flight and we just skip this refresh and try next minute.
+    if (!tls_lock_take(5000)) {
+        ESP_LOGW(TAG, "tls_lock busy, skipping refresh");
+        return;
+    }
     char *buf = alloc_rpc_buf();
-    if (!buf) { ESP_LOGW(TAG, "rpc buf oom"); return; }
+    if (!buf) { ESP_LOGW(TAG, "rpc buf oom"); tls_lock_give(); return; }
     refresh_sol_balance(buf);
     refresh_tokens(buf);
     free(buf);
     s_last_refresh_us = esp_timer_get_time();
+    tls_lock_give();
 
     detect_incoming();
     snapshot_balances();

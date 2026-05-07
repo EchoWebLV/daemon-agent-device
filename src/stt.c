@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 #include "stt.h"
 #include "secrets.h"
+#include "tls_lock.h"
 #include "wifi_sta.h"
 
 #include <string.h>
@@ -176,6 +177,15 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
 
     ESP_LOGI(TAG, "POST %s (%.2f s of audio, %u-byte body)",
              STT_URL, (float)frames / (float)STT_SAMPLE_HZ, (unsigned)total);
+    // Serialise on the global TLS lock — STT must not race AI/TTS or
+    // wallet/price for the AES context. 30 s is generous; STT itself
+    // can take 3-5 s for long audio.
+    if (!tls_lock_take(30000)) {
+        ESP_LOGW(TAG, "tls_lock timeout");
+        esp_http_client_cleanup(h);
+        heap_caps_free(body);
+        return false;
+    }
     esp_err_t err    = esp_http_client_perform(h);
     int       status = esp_http_client_get_status_code(h);
 
@@ -197,6 +207,7 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
     }
 
     esp_http_client_cleanup(h);
+    tls_lock_give();
     heap_caps_free(body);
 
     if (err != ESP_OK) {

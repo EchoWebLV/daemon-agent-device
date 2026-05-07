@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 #include "voice.h"
 #include "secrets.h"
+#include "tls_lock.h"
 #include "wifi_sta.h"
 #include "devcfg.h"
 
@@ -269,10 +270,19 @@ static bool tts_perform(const char *text) {
     esp_http_client_set_header(h, "Accept",       "audio/pcm");
     esp_http_client_set_post_field(h, body, (int)strlen(body));
 
+    // Serialise TTS on the global TLS lock — see tls_lock.h. TTS streaming
+    // can take several seconds (long replies) so the timeout is generous.
+    if (!tls_lock_take(30000)) {
+        ESP_LOGW(TAG, "tls_lock timeout");
+        esp_http_client_cleanup(h);
+        free(body);
+        return false;
+    }
     esp_err_t err = esp_http_client_perform(h);
     int status = esp_http_client_get_status_code(h);
     ctx.http_status = status;
     esp_http_client_cleanup(h);
+    tls_lock_give();
     free(body);
 
     if (err != ESP_OK) {

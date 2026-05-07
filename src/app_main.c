@@ -26,6 +26,7 @@
 #include "devcfg.h"
 #include "display.h"
 #include "price.h"
+#include "tls_lock.h"
 #include "server.h"
 #include "testharness.h"
 #include "touch.h"
@@ -119,6 +120,12 @@ void app_main(void) {
 
     // Device settings (backlight PWM comes online here at the stored duty).
     ESP_ERROR_CHECK(devcfg_init());
+
+    // Global TLS mutex — every outgoing HTTPS call (wallet, price, stt, ai,
+    // voice/TTS, social_x, swap, x402) takes this before opening a connection
+    // and releases after closing. Serialises mbedtls AES context allocation
+    // so concurrent TLS handshakes can't race on internal RAM. See tls_lock.h.
+    tls_lock_init();
 
     // TEMP: wipe any stored custom personality so the built-in PERSONA wins.
     // A stale prompt (possibly from a previous build) was overriding ai.c's
