@@ -95,15 +95,18 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_SR_WN_WN9_HIESP=y
 CONFIG_SR_VADN_VADNET1_MEDIUM=y
 
-# ---- mbedTLS hardware AES OFF ---------------------------------------------
-# AFE's working buffers consume enough DMA-capable internal RAM that the
-# hardware AES accelerator's small DMA descriptor allocation now fails:
-# `esp-aes: Failed to allocate memory` followed by `esp-tls-mbedtls:
-# write error :-0x0001` on every TLS handshake (STT POST, x402 chat,
-# ElevenLabs TTS). Software AES on the S3 at 240 MHz is comfortably fast
-# enough for the ~127 KB STT POST and the streaming chat body, and uses
-# plain heap that PSRAM-backed mbedTLS can satisfy.
+# ---- mbedTLS hardware AES + GCM OFF ----------------------------------------
+# Hardware AES on ESP32-S3 allocates DMA-capable internal-RAM buffers per
+# encrypt block. Combined with esp-sr's AFE working buffers (which also
+# need internal RAM), the AES DMA alloc routinely fails:
+#   esp-aes: Failed to allocate memory
+#   esp-tls-mbedtls: write error :-0x0001
+# on every TLS handshake (STT POST, x402 chat, ElevenLabs TTS). Software
+# AES at 240 MHz is fast enough for our payloads and uses plain heap that
+# PSRAM-backed mbedTLS satisfies. HARDWARE_GCM depends on the same DMA
+# path, so disable it too.
 CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_GCM=n
 
 # ---- LVGL extras -----------------------------------------------------------
 # QR code lib: wallet screen renders the device pubkey as a QR so a phone
