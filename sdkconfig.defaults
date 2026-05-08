@@ -44,24 +44,28 @@ CONFIG_FREERTOS_UNICORE=n
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_COLORS=y
 
-# ---- LWIP (HTTPS to ElevenLabs / Solana RPC expects reasonable buffers) ----
-CONFIG_LWIP_MAX_ACTIVE_TCP=16
+# ---- LWIP — generous socket headroom ---------------------------------------
+# Under combined load (httpd polling from the web UI + outbound HTTPS for
+# AI POST + 1-2 Helius RPC sockets for blockhash/ATA + ElevenLabs TTS +
+# wallet/price refresh) the default 10-socket pool wedges within 3-4
+# /say calls. Each socket is a few hundred bytes of internal RAM, and
+# we have ~200 KB free internal heap, so sizing generously is cheap.
+CONFIG_LWIP_MAX_SOCKETS=24
+CONFIG_LWIP_MAX_ACTIVE_TCP=24
 CONFIG_LWIP_MAX_LISTENING_TCP=8
 
-# Total socket pool. Default (10) gets exhausted under combined load
-# (httpd's listen + 2 accepted, mDNS x2, then any outbound HTTPS for
-# AI / RPC / voice / wallet refresh races them). With 'esp-tls: Failed
-# to create socket' visible on hardware, bump to 16. Each socket is a
-# few hundred bytes of internal RAM — fine.
-CONFIG_LWIP_MAX_SOCKETS=16
+# Drop TCP TIME_WAIT from 60 s to 1.5 s. A closed outbound HTTPS socket
+# normally squats a slot for the full MSL (60 s default). 1.5 s is safe
+# on a private LAN with sub-200 ms round-trips.
+CONFIG_LWIP_TCP_MSL=1500
 
-# Drop TCP TIME_WAIT from 60 s to 3 s. A closed outbound HTTPS socket
-# normally squats a slot for the full MSL (60 s default), so a quick
-# burst of AI + voice + RPC calls saturates the pool and the next
-# socket() returns -1 (visible as 'Failed to create socket'). 3 s is
-# safe on a private LAN with short round-trips and saves us from the
-# wedged-pool failure mode entirely.
-CONFIG_LWIP_TCP_MSL=3000
+# Keep-alive on the listening httpd socket so dead client connections
+# (browser tab closed, phone went to sleep mid-poll) get reaped quickly
+# instead of squatting accept slots until the kernel notices.
+CONFIG_LWIP_TCP_KEEPIDLE_DEFAULT=60
+CONFIG_LWIP_TCP_KEEPINTVL_DEFAULT=15
+CONFIG_LWIP_TCP_KEEPCNT_DEFAULT=3
+CONFIG_LWIP_SO_LINGER=y
 
 # ---- mbedTLS (bigger record buffer so Gemini / ElevenLabs chunks fit) ------
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
