@@ -384,6 +384,13 @@ esp_err_t server_start(void) {
     cfg.server_port     = 80;
     cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
+    // Cap httpd's slice of the LWIP socket pool. Default is
+    // (CONFIG_LWIP_MAX_SOCKETS - 3), which on a 24-socket pool would let
+    // httpd squat 21 — starving outbound HTTPS (AI / RPC / TTS) when the
+    // web UI is polling fast and dead browser tabs leave sockets in
+    // TIME_WAIT. 7 is plenty for a phone + laptop with 2-3 concurrent
+    // polls each, and leaves the rest of the pool for outbound work.
+    cfg.max_open_sockets = 7;
     // The /say path runs the full AI pipeline on the httpd task — that's
     // up to four TLS handshakes (LLM, two Solana RPC calls, LLM retry)
     // plus cJSON/mbedtls scratch. Default 4 KB blows the canary; 16 KB
