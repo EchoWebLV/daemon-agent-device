@@ -67,16 +67,24 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
 # ---- ESP-SR (wake word + VAD via AFE) --------------------------------------
-# WakeNet9 with the English "Hi Lexin" placeholder. The custom "Hey Daemon"
-# model is in flight at Espressif's WakeNet generator service (1-2 week
-# turnaround). Once the trained model arrives, drop the .bin into
-# components/model/ and swap this for `CONFIG_SR_WN_WN9_HEYDAEMON=y` (or
-# whatever symbol the generator returns).
-CONFIG_SR_WN_WN9_HILEXIN=y
+# WakeNet9 placeholder. wn9_hiesp ("Hi ESP") is trained on English speakers
+# and detects reliably for the demo without waiting on a custom model. Swap
+# to `CONFIG_SR_WN_WN9_HEYDAEMON=y` (or whatever symbol the WakeNet generator
+# returns) once the custom "Hey Daemon" model arrives. Both the Espressif
+# customization process and third-party services (e.g. custom-espsr.com)
+# produce compatible WN9 models.
+CONFIG_SR_WN_WN9_HIESP=y
 CONFIG_SR_VADN_VADNET1_MEDIUM=y
-# AFE working memory in PSRAM. Internal RAM is too tight after Wi-Fi/LVGL
-# /mbedTLS already claimed their share — AFE alone wants ~600 KB.
-CONFIG_USE_AFE_PSRAM=y
+
+# ---- mbedTLS hardware AES OFF ---------------------------------------------
+# AFE's working buffers consume enough DMA-capable internal RAM that the
+# hardware AES accelerator's small DMA descriptor allocation now fails:
+# `esp-aes: Failed to allocate memory` followed by `esp-tls-mbedtls:
+# write error :-0x0001` on every TLS handshake (STT POST, x402 chat,
+# ElevenLabs TTS). Software AES on the S3 at 240 MHz is comfortably fast
+# enough for the ~127 KB STT POST and the streaming chat body, and uses
+# plain heap that PSRAM-backed mbedTLS can satisfy.
+CONFIG_MBEDTLS_HARDWARE_AES=n
 
 # ---- LVGL extras -----------------------------------------------------------
 # QR code lib: wallet screen renders the device pubkey as a QR so a phone

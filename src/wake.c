@@ -170,6 +170,16 @@ static void feed_task(void *arg) {
     ESP_LOGI(TAG, "feed task up (chunksize=%d frames, ~%dms)",
              chunksize, (int)((chunksize * 1000) / WAKE_SAMPLE_HZ));
 
+    // Rolling RMS so we can see at a glance whether the mic is receiving
+    // anything during wake-word testing. ~1 Hz log cadence (1 second of
+    // chunks per print) keeps the output readable while still catching
+    // a dead mic / dead AFE-feed within a second of boot.
+    int      rms_log_chunks = 0;
+    int64_t  rms_sum_sq     = 0;
+    size_t   rms_samples    = 0;
+    int16_t  rms_peak       = 0;
+    const int RMS_LOG_EVERY = WAKE_SAMPLE_HZ / chunksize;
+
     while (s_running) {
         esp_err_t err = esp_codec_dev_read(s_codec, stereo, stereo_bytes);
         if (err != ESP_OK) {
@@ -183,10 +193,27 @@ static void feed_task(void *arg) {
         // avoid int16 overflow (matches mic.c's previous behavior).
         for (int i = 0; i < chunksize; i++) {
             int32_t mix = ((int32_t)stereo[i * 2] + (int32_t)stereo[i * 2 + 1]) / 2;
-            mono[i] = (int16_t)mix;
+            int16_t s   = (int16_t)mix;
+            mono[i] = s;
+            int16_t a = s < 0 ? (int16_t)-s : s;
+            if (a > rms_peak) rms_peak = a;
+            rms_sum_sq += (int64_t)s * (int64_t)s;
+            rms_samples++;
         }
 
         s_afe->feed(s_afe_data, mono);
+
+        if (++rms_log_chunks >= RMS_LOG_EVERY) {
+            int rms = rms_samples
+                ? (int)__builtin_sqrt((double)rms_sum_sq / (double)rms_samples)
+                : 0;
+            ESP_LOGI(TAG, "feed: rms=%d peak=%d (1s window)",
+                     rms, (int)rms_peak);
+            rms_log_chunks = 0;
+            rms_sum_sq     = 0;
+            rms_samples    = 0;
+            rms_peak       = 0;
+        }
 
         // Append to capture buffer iff a capture is active. Held under
         // s_mux so detect_task's endpoint swap can't race the memcpy.
@@ -230,13 +257,21 @@ static void detect_task(void *arg) {
             ESP_LOGI(TAG, "wake word detected (model_idx=%d, word_idx=%d)",
                      res->wakenet_model_index, res->wake_word_index);
             if (try_enter_mode(CAP_WAKE_VAD)) {
-                if (s_on_wake) s_on_wake();
+                ESP_LOGI(TAG, "entered CAP_WAKE_VAD (s_buf=%p)", s_buf);
+                if (s_on_wake) {
+                    s_on_wake();
+                    ESP_LOGI(TAG, "on_wake callback returned");
+                } else {
+                    ESP_LOGW(TAG, "no on_wake callback registered");
+                }
             } else {
-                ESP_LOGI(TAG, "wake fired but capture already in flight");
+                ESP_LOGI(TAG, "wake fired but capture already in flight (mode=%d, s_buf=%p)",
+                         (int)s_mode, s_buf);
             }
         }
 
         // ---- VAD endpoint (only in WAKE_VAD mode) ---------------------
+        static int s_vad_log_throttle = 0;
         if (s_mode == CAP_WAKE_VAD) {
             if (res->vad_state == VAD_SILENCE) {
                 s_silence_ms += WAKE_FETCH_CHUNK_MS;
@@ -246,6 +281,16 @@ static void detect_task(void *arg) {
 
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
             uint32_t cap_ms = now_ms - s_capture_start_ms;
+
+            // Diagnostic: log ~3 Hz while in CAP_WAKE_VAD so we can see
+            // whether VAD ever reports silence and how the endpoint
+            // accumulator is moving.
+            if (++s_vad_log_throttle >= 10) {
+                ESP_LOGI(TAG, "WAKE_VAD cap=%lums silence=%lums vad=%d frames=%u",
+                         (unsigned long)cap_ms, (unsigned long)s_silence_ms,
+                         (int)res->vad_state, (unsigned)s_buf_frames);
+                s_vad_log_throttle = 0;
+            }
 
             bool by_silence = s_silence_ms >= WAKE_VAD_SILENCE_MS;
             bool by_max     = cap_ms >= WAKE_MAX_CAPTURE_MS;
@@ -360,6 +405,16 @@ esp_err_t wake_init(wake_detect_cb_t on_wake, wake_speech_cb_t on_speech) {
     if (!s_afe_data) {
         ESP_LOGE(TAG, "AFE create_from_config failed");
         return ESP_FAIL;
+    }
+
+    // Loosen the wake threshold from the model default (~0.63 for hiesp)
+    // to 0.5. Default thresholds are tuned by Espressif for low false-positive
+    // rates in their reference acoustic conditions; on the BOX-3 with
+    // dual-mic-summed mono and a small built-in speaker right next to the
+    // mic, we'd rather accept a slightly higher false-trigger rate to make
+    // the demo reliable from across a desk.
+    if (s_afe->set_wakenet_threshold) {
+        s_afe->set_wakenet_threshold(s_afe_data, 1, 0.5f);
     }
 
     s_on_wake   = on_wake;

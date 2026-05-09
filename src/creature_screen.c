@@ -590,20 +590,13 @@ static void speech_task(void *arg) {
         } \
     } while (0)
 
-    // Filler word, ~50% of the time, fired ~1 s AFTER the button releases
-    // (i.e. ~1 s into speech_task). Immediate fillers felt over-eager —
-    // the 1 s pause reads as natural human hedging, lets the chirp tone
-    // finish, and still covers the dead-air window before the LLM reply
-    // arrives. Coin flip happens BEFORE the spawn so we don't burn a task
-    // on the silent half. The delay task sleeps then enqueues via
-    // voice_speak (async); STT continues unblocked on this task.
-    if ((esp_random() & 1u) == 0u) {
-        BaseType_t spawned = xTaskCreate(filler_delay_task, "filler_delay",
-                                         2048, NULL, 4, NULL);
-        if (spawned != pdPASS) {
-            ESP_LOGW(TAG, "filler delay task spawn failed");
-        }
-    }
+    // Filler word disabled: spawning a second ElevenLabs TLS handshake
+    // ~1 s after the STT POST starts was racing the OpenAI handshake on
+    // mbedTLS's PSRAM buffer pool. STT was returning ESP_FAIL (status=0)
+    // about half the time when the filler coin flip won, which surfaced
+    // as the bot saying "I didn't catch that" on perfectly captured
+    // audio. Re-enable once the filler is rate-limited against the in-
+    // flight STT, or moved behind a queue that drains after STT returns.
 
     char transcript[512] = {0};
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
@@ -768,6 +761,7 @@ void creature_screen_ptt_stop(void) {
 // flight inside wake.c by the time we're called — no mic_record_start
 // equivalent here.
 void creature_screen_on_wake(void) {
+    ESP_LOGI(TAG, "creature_screen_on_wake invoked");
     s_ptt_was_busy = s_speech_in_flight || voice_is_speaking();
     if (s_ptt_was_busy) {
         voice_clear();
@@ -777,14 +771,15 @@ void creature_screen_on_wake(void) {
     s_ptt_gen++;
     s_ptt_press_ms = esp_log_timestamp();
     ui_set_subtitle("Listening...");
+    ESP_LOGI(TAG, "wake: subtitle set; awaiting VAD endpoint");
 }
 
-// Wake-VAD endpoint from wake.c. The captured PCM has already been
-// detached from wake.c's rolling buffer; we own it and hand it through
-// the same pipeline PTT uses.
 void creature_screen_ingest_wake_speech(int16_t *pcm, size_t frames) {
+    ESP_LOGI(TAG, "creature_screen_ingest_wake_speech: %u frames (%.2f s)",
+             (unsigned)frames, (float)frames / 16000.0f);
     ingest_speech(pcm, frames);
 }
+
 
 lv_obj_t *creature_screen(void) { return s_scr; }
 
