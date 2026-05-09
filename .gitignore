@@ -26,3 +26,9 @@ __pycache__/
 
 # Claude Code local state (settings.local.json, worktrees, etc).
 .claude/
+
+# Codex local state.
+.codex/
+
+# Local microWakeWord training scratch.
+training/

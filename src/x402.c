@@ -698,6 +698,46 @@ static void x402_call_internal(const char *method,
     esp_err_t err1  = esp_http_client_perform(h);
     int       code1 = esp_http_client_get_status_code(h);
 
+    // Fast-path desc-cache optimization is on feat/tasks but not main yet
+    // (depends on desc_cache_invalidate_locked); skipped here. The
+    // stale-connection retry below is the actual TLS-recovery fix.
+
+    // Stale-connection retry. The cached TLS handle from a prior call
+    // can be FIN'd by the server during long idle periods (most often
+    // hit by scheduled tasks fired several minutes apart). The first
+    // write then fails with ESP_ERR_HTTP_WRITE_DATA / CONNECTION_CLOSED.
+    // Drop the dead handle, get a fresh one, and try the request once
+    // more before surfacing the error to the caller.
+    if (err1 == ESP_ERR_HTTP_WRITE_DATA || err1 == ESP_ERR_HTTP_CONNECT ||
+        err1 == ESP_ERR_HTTP_CONNECTION_CLOSED || err1 == ESP_ERR_HTTP_FETCH_HEADER) {
+        ESP_LOGW(TAG, "perform: %s — retrying once with a fresh handle",
+                 esp_err_to_name(err1));
+        cleanup_cached_handle_locked();
+        h = acquire_handle_locked(url, &cfg);
+        if (h) {
+            reset_handle_for_call(h, http_method, &state);
+            if (has_body) esp_http_client_set_header(h, "Content-Type", "application/json");
+            if (auth_bearer && auth_bearer[0]) {
+                char hdr[160];
+                snprintf(hdr, sizeof(hdr), "Bearer %s", auth_bearer);
+                esp_http_client_set_header(h, "Authorization", hdr);
+            }
+            if (has_body) esp_http_client_set_post_field(h, json_body, (int)strlen(json_body));
+            // Re-prime header capture for the cold-path 402 description read.
+            state.body_buf = phase1_buf;
+            state.body_cap = phase1_cap;
+            state.on_chunk = NULL;
+            state.cb_user  = NULL;
+            state.pr       = pr;
+            state.xpr      = xpr;
+            state.wa       = wa;
+            state.body_len = 0;
+            vTaskDelay(pdMS_TO_TICKS(150));
+            err1  = esp_http_client_perform(h);
+            code1 = esp_http_client_get_status_code(h);
+        }
+    }
+
     if (err1 != ESP_OK) {
         snprintf(out->error, sizeof(out->error), "perform: %s", esp_err_to_name(err1));
         // Perform error — socket may be half-closed. Drop the handle so
