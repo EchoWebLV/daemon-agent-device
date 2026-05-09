@@ -16,6 +16,8 @@
 // ---------------------------------------------------------------------------
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "lvgl.h"
 
@@ -78,6 +80,16 @@ void creature_screen_cycle(int delta);
 // Safe to call from any task context.
 void creature_screen_ptt_start(void);
 void creature_screen_ptt_stop(void);
+
+// Wake-word entry points. Called from wake.c (the AFE detect task).
+// `on_wake` mirrors the interrupt half of ptt_start: clears in-flight
+// TTS and bumps the generation counter so a running speech_task aborts.
+// `ingest_wake_speech` takes ownership of pcm (heap_caps_malloc'd in
+// PSRAM) and drives it through the same STT/AI/voice pipeline as PTT.
+// Safe to call from any task; both functions internally hop to LVGL
+// where needed.
+void creature_screen_on_wake(void);
+void creature_screen_ingest_wake_speech(int16_t *pcm, size_t frames);
 
 // True while speech_task is processing a voice query (STT → LLM → TTS).
 // ui.c reads this in its tick handler so the post-speak subtitle wipe

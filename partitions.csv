@@ -6,10 +6,18 @@
 #   0x9000   nvs      — wifi creds, device config, preferences
 #   0xF000   phy_init — RF calibration blob
 #   0x10000  factory  — application (5 MB, plenty of headroom)
-#   0x510000 storage  — LittleFS (~11 MB: wallet keys, TTS cache, logs)
+#   0x510000 model    — ESP-SR WakeNet + VAD models (SPIFFS, 2 MB)
+#   0x710000 storage  — LittleFS (~9 MB: wallet keys, TTS cache, logs)
+#
+# The `model` partition is loaded by esp_srmodel_init("model") at boot
+# (see src/wake.c). 2 MB fits a single English WakeNet9 + VADNet plus
+# SPIFFS overhead with comfortable headroom for a custom wake word swap.
+# Storage shrunk from 11 MB to ~9 MB to make room — still ample for
+# wallet NVS overflow, TTS cache, and logs.
 #
 # Name,     Type, SubType,  Offset,   Size,       Flags
 nvs,        data, nvs,      0x9000,   0x6000,
 phy_init,   data, phy,      0xf000,   0x1000,
 factory,    app,  factory,  0x10000,  0x500000,
-storage,    data, littlefs, 0x510000, 0xAF0000,
+model,      data, spiffs,   0x510000, 0x200000,
+storage,    data, littlefs, 0x710000, 0x8F0000,

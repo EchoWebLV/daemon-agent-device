@@ -66,6 +66,18 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
+# ---- ESP-SR (wake word + VAD via AFE) --------------------------------------
+# WakeNet9 with the English "Hi Lexin" placeholder. The custom "Hey Daemon"
+# model is in flight at Espressif's WakeNet generator service (1-2 week
+# turnaround). Once the trained model arrives, drop the .bin into
+# components/model/ and swap this for `CONFIG_SR_WN_WN9_HEYDAEMON=y` (or
+# whatever symbol the generator returns).
+CONFIG_SR_WN_WN9_HILEXIN=y
+CONFIG_SR_VADN_VADNET1_MEDIUM=y
+# AFE working memory in PSRAM. Internal RAM is too tight after Wi-Fi/LVGL
+# /mbedTLS already claimed their share — AFE alone wants ~600 KB.
+CONFIG_USE_AFE_PSRAM=y
+
 # ---- LVGL extras -----------------------------------------------------------
 # QR code lib: wallet screen renders the device pubkey as a QR so a phone
 # wallet can scan it without typing 44 base58 chars.

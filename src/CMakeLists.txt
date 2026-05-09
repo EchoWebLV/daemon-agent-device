@@ -31,6 +31,7 @@ idf_component_register(
         "touch.c"
         "ui.c"
         "voice.c"
+        "wake.c"
         "wallet.c"
         "wallet_screen.c"
         "wifi_screen.c"
@@ -91,4 +92,9 @@ idf_component_register(
         # mDNS — advertise `daemon.local` once Wi-Fi associates so the MCP
         # server (and curl from any laptop) can reach the device by name.
         mdns
+        # ESP-SR — wake word + AFE + VAD. wake.c owns the codec and runs
+        # the always-on detect/feed pipeline. Pulled in via
+        # src/idf_component.yml; listed here because we call its public
+        # API (esp_srmodel_init, esp_afe_handle_from_config, etc.).
+        esp-sr
 )

@@ -698,27 +698,14 @@ void creature_screen_ptt_start(void) {
     }
 }
 
-void creature_screen_ptt_stop(void) {
-    if (!mic_is_recording()) return;
-    int16_t *pcm    = NULL;
-    size_t   frames = 0;
-    esp_err_t err = mic_record_stop(&pcm, &frames);
-
-    // Stop-only gesture: a short tap during a busy state means "shut up,
-    // I don't have anything new to ask." Drop the audio without spawning
-    // STT/AI. The 1 s threshold separates "tap to interrupt" from a real
-    // PTT recording. Outside the busy case, the existing <100 ms junk
-    // check below still handles accidental brushes.
-    uint32_t hold_ms = esp_log_timestamp() - s_ptt_press_ms;
-    if (s_ptt_was_busy && hold_ms < 1000) {
-        ESP_LOGI(TAG, "ptt: interrupt-only tap (%lums) — dropping audio",
-                 (unsigned long)hold_ms);
-        if (pcm) mic_buffer_free(pcm);
-        ui_set_subtitle("");
-        return;
-    }
-
-    if (err != ESP_OK || !pcm || frames < 1600) {   // <100 ms = junk
+// Common back end for both PTT-stop and wake-VAD-endpoint. Takes
+// ownership of pcm — every return path frees the buffer or hands it
+// to speech_task (which frees it at the end of the STT/AI/voice run).
+// Frames below the 100 ms threshold are treated as junk (covers
+// accidental finger brushes on PTT and false wakes that immediately
+// fall silent).
+static void ingest_speech(int16_t *pcm, size_t frames) {
+    if (!pcm || frames < 1600) {
         if (pcm) mic_buffer_free(pcm);
         ui_set_subtitle("");
         return;
@@ -744,6 +731,59 @@ void creature_screen_ptt_stop(void) {
         s_speech_in_flight = false;
         ui_set_subtitle("");
     }
+}
+
+void creature_screen_ptt_stop(void) {
+    if (!mic_is_recording()) return;
+    int16_t *pcm    = NULL;
+    size_t   frames = 0;
+    esp_err_t err = mic_record_stop(&pcm, &frames);
+
+    // Stop-only gesture: a short tap during a busy state means "shut up,
+    // I don't have anything new to ask." Drop the audio without spawning
+    // STT/AI. The 1 s threshold separates "tap to interrupt" from a real
+    // PTT recording. Outside the busy case, ingest_speech's <100 ms junk
+    // check still handles accidental brushes.
+    uint32_t hold_ms = esp_log_timestamp() - s_ptt_press_ms;
+    if (s_ptt_was_busy && hold_ms < 1000) {
+        ESP_LOGI(TAG, "ptt: interrupt-only tap (%lums) — dropping audio",
+                 (unsigned long)hold_ms);
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+
+    if (err != ESP_OK) {
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+    ingest_speech(pcm, frames);
+}
+
+// Wake event from wake.c (AFE detect task). Mirrors the interrupt half
+// of ptt_start: any in-flight reply gets cancelled so saying the wake
+// word during a reply drops the bot back into listening mode within
+// one chunk's worth of latency. The actual recording is already in
+// flight inside wake.c by the time we're called — no mic_record_start
+// equivalent here.
+void creature_screen_on_wake(void) {
+    s_ptt_was_busy = s_speech_in_flight || voice_is_speaking();
+    if (s_ptt_was_busy) {
+        voice_clear();
+        ESP_LOGI(TAG, "wake: interrupting in-flight (next gen=%lu)",
+                 (unsigned long)(s_ptt_gen + 1));
+    }
+    s_ptt_gen++;
+    s_ptt_press_ms = esp_log_timestamp();
+    ui_set_subtitle("Listening...");
+}
+
+// Wake-VAD endpoint from wake.c. The captured PCM has already been
+// detached from wake.c's rolling buffer; we own it and hand it through
+// the same pipeline PTT uses.
+void creature_screen_ingest_wake_speech(int16_t *pcm, size_t frames) {
+    ingest_speech(pcm, frames);
 }
 
 lv_obj_t *creature_screen(void) { return s_scr; }

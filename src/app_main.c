@@ -32,6 +32,7 @@
 #include "ui.h"
 #include "voice.h"
 #include "mic.h"
+#include "wake.h"
 #include "wallet.h"
 #include "wifi_sta.h"
 
@@ -187,11 +188,24 @@ void app_main(void) {
         ESP_LOGW(TAG, "voice_begin failed; continuing muted");
     }
 
-    // Mic capture for push-to-talk. Must run AFTER voice_begin since both
-    // codecs share the BSP-managed I2S port. Failure is non-fatal — the
-    // PTT button just becomes a no-op when nothing can record.
+    // Mic capture for push-to-talk. Now a thin shim over wake.c — see below.
+    // Kept here so any defensive callers that still call mic_init() get a
+    // success return; the actual codec lifecycle moves into wake_init.
     if (mic_init() != ESP_OK) {
         ESP_LOGW(TAG, "mic_init failed; push-to-talk disabled");
+    }
+
+    // Wake-word engine (ESP-SR / WakeNet9). Owns the ES7210 codec
+    // continuously, runs the AFE pipeline, and serves both the always-on
+    // "Hey Daemon" detection AND the existing PTT capture path. Must
+    // run AFTER voice_begin since both codecs share the BSP-managed I2S
+    // port. Failure here disables both wake detection and PTT capture;
+    // the rest of the device stays usable. The placeholder wake word
+    // ("Hi Lexin") will swap to the custom "Hey Daemon" model once
+    // Espressif's WakeNet generator returns the trained .bin.
+    if (wake_init(creature_screen_on_wake,
+                  creature_screen_ingest_wake_speech) != ESP_OK) {
+        ESP_LOGW(TAG, "wake_init failed; wake-word + PTT capture disabled");
     }
 
     // Front-face hardware button → PTT. Must run AFTER touch_init so the
