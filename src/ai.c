@@ -21,6 +21,8 @@
 
 #include "devcfg.h"
 #include "price.h"
+#include "skill_store.h"
+#include "skill_tools.h"
 #include "social_x.h"
 #include "swap.h"
 #include "voice.h"
@@ -273,6 +275,38 @@ static void build_system_prompt(char *out, size_t cap,
 
     append_tool_listing(out, cap, services, enabled);
 
+    // Markdown skills — for each enabled markdown-kind service, append its
+    // raw markdown body so the model can follow the documented flow using
+    // the generic skill tools (http_request / x402_pay / secret_get/set /
+    // solana_get_pubkey). Bodies live in LittleFS at /storage/skills/<id>.md.
+    {
+        char ids[16][SKILL_ID_MAX];
+        int n_skills = skill_store_list_enabled(ids, 16);
+        if (n_skills > 0) {
+            size_t u = strlen(out);
+            if (u + 256 < cap) {
+                int hn = snprintf(out + u, cap - u,
+                    "\nGENERIC SKILL TOOLS AVAILABLE: http_request(method,url,headers,body), "
+                    "x402_pay(payment_required,memo?), secret_get(skill,name), "
+                    "secret_set(skill,name,value), solana_get_pubkey(). "
+                    "Each enabled skill below documents how to chain them.\n");
+                if (hn > 0 && (size_t)hn < cap - u) u += (size_t)hn;
+            }
+            for (int i = 0; i < n_skills; ++i) {
+                if (u + 64 >= cap) break;
+                int hn = snprintf(out + u, cap - u, "\n## Skill: %s\n\n", ids[i]);
+                if (hn < 0 || (size_t)hn >= cap - u) break;
+                u += (size_t)hn;
+                int rb = skill_store_read_body_stripped(ids[i], out + u, cap - u);
+                if (rb > 0) u += (size_t)rb;
+                if (u + 8 < cap) {
+                    int dn = snprintf(out + u, cap - u, "\n\n---\n");
+                    if (dn > 0 && (size_t)dn < cap - u) u += (size_t)dn;
+                }
+            }
+        }
+    }
+
     // Tool-call preamble protocol: the firmware speaks the tool's verdict
     // string directly after the tool returns, skipping a second LLM round
     // entirely. To keep the reply natural, the model writes a short
@@ -415,6 +449,144 @@ static int attach_tools(cJSON *root, const cJSON *services, const cJSON *enabled
                 }
             }
             cJSON_AddItemToArray(tools, tool);
+            count++;
+        }
+    }
+
+    // Generic skill tools — only registered when at least one markdown-kind
+    // skill is enabled. The skills' markdown bodies document how to chain
+    // these into multi-step flows (e.g. SP3ND: registerAgent -> cart ->
+    // order -> payAgentOrder -> x402_pay -> getPartnerOrders).
+    if (skill_store_any_enabled_markdown()) {
+        if (!tools) tools = cJSON_AddArrayToObject(root, "tools");
+
+        // http_request
+        {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(t, "function");
+            cJSON_AddStringToObject(fn, "name", "http_request");
+            cJSON_AddStringToObject(fn, "description",
+                "Issue an HTTPS request and return the response. ${VAR} "
+                "references in url/headers/body are auto-substituted with "
+                "stored skill credentials. 402 responses are returned raw "
+                "for you to feed into x402_pay.");
+            cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+            cJSON_AddStringToObject(p, "type", "object");
+            cJSON *props = cJSON_AddObjectToObject(p, "properties");
+            cJSON *pm = cJSON_AddObjectToObject(props, "method");
+            cJSON_AddStringToObject(pm, "type", "string");
+            cJSON_AddStringToObject(pm, "description",
+                "GET, POST, PUT, DELETE, or PATCH.");
+            cJSON *pu = cJSON_AddObjectToObject(props, "url");
+            cJSON_AddStringToObject(pu, "type", "string");
+            cJSON_AddStringToObject(pu, "description",
+                "Full https:// URL. May contain ${VAR} references.");
+            cJSON *ph = cJSON_AddObjectToObject(props, "headers");
+            cJSON_AddStringToObject(ph, "type", "object");
+            cJSON_AddStringToObject(ph, "description",
+                "Optional header object. Values may contain ${VAR}.");
+            cJSON *pb = cJSON_AddObjectToObject(props, "body");
+            cJSON_AddStringToObject(pb, "description",
+                "Optional request body, either a string or a JSON object.");
+            cJSON *req = cJSON_AddArrayToObject(p, "required");
+            cJSON_AddItemToArray(req, cJSON_CreateString("method"));
+            cJSON_AddItemToArray(req, cJSON_CreateString("url"));
+            cJSON_AddItemToArray(tools, t);
+            count++;
+        }
+
+        // x402_pay
+        {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(t, "function");
+            cJSON_AddStringToObject(fn, "name", "x402_pay");
+            cJSON_AddStringToObject(fn, "description",
+                "Settle an x402 402 Payment Required response by signing a "
+                "USDC transfer with the device wallet and posting to the "
+                "facilitator's verify+settle endpoints. Pass the parsed 402 "
+                "body (or its accepts[0]) as payment_required. Use this "
+                "after http_request returns status 402.");
+            cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+            cJSON_AddStringToObject(p, "type", "object");
+            cJSON *props = cJSON_AddObjectToObject(p, "properties");
+            cJSON *pp = cJSON_AddObjectToObject(props, "payment_required");
+            cJSON_AddStringToObject(pp, "type", "object");
+            cJSON_AddStringToObject(pp, "description",
+                "The accepts[0] object from the 402 response.");
+            cJSON *pm = cJSON_AddObjectToObject(props, "memo");
+            cJSON_AddStringToObject(pm, "type", "string");
+            cJSON_AddStringToObject(pm, "description",
+                "Optional memo override. Default uses extra.order_number.");
+            cJSON *req = cJSON_AddArrayToObject(p, "required");
+            cJSON_AddItemToArray(req, cJSON_CreateString("payment_required"));
+            cJSON_AddItemToArray(tools, t);
+            count++;
+        }
+
+        // secret_get
+        {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(t, "function");
+            cJSON_AddStringToObject(fn, "name", "secret_get");
+            cJSON_AddStringToObject(fn, "description",
+                "Read a stored credential value for the named skill.");
+            cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+            cJSON_AddStringToObject(p, "type", "object");
+            cJSON *props = cJSON_AddObjectToObject(p, "properties");
+            cJSON *ps = cJSON_AddObjectToObject(props, "skill");
+            cJSON_AddStringToObject(ps, "type", "string");
+            cJSON *pn = cJSON_AddObjectToObject(props, "name");
+            cJSON_AddStringToObject(pn, "type", "string");
+            cJSON *req = cJSON_AddArrayToObject(p, "required");
+            cJSON_AddItemToArray(req, cJSON_CreateString("skill"));
+            cJSON_AddItemToArray(req, cJSON_CreateString("name"));
+            cJSON_AddItemToArray(tools, t);
+            count++;
+        }
+
+        // secret_set
+        {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(t, "function");
+            cJSON_AddStringToObject(fn, "name", "secret_set");
+            cJSON_AddStringToObject(fn, "description",
+                "Persist a credential value for the named skill. Use this "
+                "to capture API keys returned by registration endpoints.");
+            cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+            cJSON_AddStringToObject(p, "type", "object");
+            cJSON *props = cJSON_AddObjectToObject(p, "properties");
+            cJSON *ps = cJSON_AddObjectToObject(props, "skill");
+            cJSON_AddStringToObject(ps, "type", "string");
+            cJSON *pn = cJSON_AddObjectToObject(props, "name");
+            cJSON_AddStringToObject(pn, "type", "string");
+            cJSON *pv = cJSON_AddObjectToObject(props, "value");
+            cJSON_AddStringToObject(pv, "type", "string");
+            cJSON *req = cJSON_AddArrayToObject(p, "required");
+            cJSON_AddItemToArray(req, cJSON_CreateString("skill"));
+            cJSON_AddItemToArray(req, cJSON_CreateString("name"));
+            cJSON_AddItemToArray(req, cJSON_CreateString("value"));
+            cJSON_AddItemToArray(tools, t);
+            count++;
+        }
+
+        // solana_get_pubkey
+        {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "type", "function");
+            cJSON *fn = cJSON_AddObjectToObject(t, "function");
+            cJSON_AddStringToObject(fn, "name", "solana_get_pubkey");
+            cJSON_AddStringToObject(fn, "description",
+                "Return the device wallet's Solana public key (base58). "
+                "Use during agent registration when a skill needs the "
+                "wallet pubkey as an input.");
+            cJSON *p = cJSON_AddObjectToObject(fn, "parameters");
+            cJSON_AddStringToObject(p, "type", "object");
+            cJSON_AddObjectToObject(p, "properties");
+            cJSON_AddItemToArray(tools, t);
             count++;
         }
     }
@@ -577,6 +749,13 @@ static void param_to_string(const cJSON *v, char *out, size_t cap) {
 static void execute_tool(const cJSON *services, const cJSON *enabled,
                          const char *tool_name, const char *args_json,
                          char *out, size_t cap) {
+    // Generic skill tools (only registered when at least one markdown
+    // skill is enabled, so any call here implies a markdown skill is live).
+    if (skill_tools_is_skill_tool(tool_name)) {
+        skill_tools_dispatch(tool_name, args_json, out, cap);
+        return;
+    }
+
     // Synthetic built-ins first.
     if (strcmp(tool_name, "swap_tokens") == 0) {
         cJSON *args = args_json ? cJSON_Parse(args_json) : NULL;

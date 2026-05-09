@@ -23,6 +23,8 @@ idf_component_register(
         "server.c"
         "social_x.c"
         "settings_screen.c"
+        "skill_store.c"
+        "skill_tools.c"
         "solana_tx.c"
         "stt.c"
         "swap.c"
@@ -98,4 +100,9 @@ idf_component_register(
         # src/idf_component.yml; listed here because we call its public
         # API (esp_srmodel_init, esp_afe_handle_from_config, etc.).
         esp-sr
+        # LittleFS for skill markdown storage (joltwallet/littlefs).
+        # Mounted by skill_store.c at /storage; backs the `storage`
+        # partition declared in partitions.csv. Used by the skill loader
+        # to persist user-uploaded skill bodies that don't fit in NVS.
+        littlefs
 )

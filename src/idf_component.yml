@@ -43,3 +43,8 @@ dependencies:
   # while the custom "Hey Daemon" model is in flight at Espressif's
   # WakeNet generator service. See src/wake.c for the integration.
   espressif/esp-sr:                "^2.1.3"
+  # LittleFS for the `storage` partition (see partitions.csv). Used by
+  # skill_store.c to persist user-uploaded skill markdown bodies under
+  # /storage/skills/<id>.md. NVS keeps the lightweight metadata; LittleFS
+  # holds the bodies (typically 5-30 KB each, too big for NVS blobs).
+  joltwallet/littlefs:             "^1.14.0"

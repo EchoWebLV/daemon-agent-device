@@ -168,6 +168,18 @@ static bool fetch_usdc_ata(const char *owner_b58, char *out, size_t cap) {
     return ok;
 }
 
+// Public wrappers for skill_tools.c. Keep the static helpers above as-is so
+// the existing chat-payment path is undisturbed; these just thin-shim the
+// same logic so a tool handler can drive its own (memo + external feePayer)
+// payment without re-implementing the RPC transport.
+bool x402_fetch_recent_blockhash(uint8_t out[32]) {
+    return fetch_recent_blockhash(out);
+}
+
+bool x402_fetch_usdc_ata(const char *owner_b58, char *out, size_t cap) {
+    return fetch_usdc_ata(owner_b58, out, cap);
+}
+
 // ---------------------------------------------------------------------------
 // mbedtls wrappers — base64 that returns a NUL-terminated C string.
 // ---------------------------------------------------------------------------

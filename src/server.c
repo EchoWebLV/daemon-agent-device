@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "devcfg.h"
+#include "skill_store.h"
 #include "social_x.h"
 #include "ui.h"
 #include "esp_check.h"
@@ -376,14 +377,194 @@ static esp_err_t handle_x_disconnect(httpd_req_t *req) {
     return send_json(req, 200, "{\"ok\":true}");
 }
 
+// --- Skills handlers ---------------------------------------------------------
+//
+// A skill is a markdown document with YAML-lite frontmatter that the AI
+// reads from the system prompt. Bodies are persisted to LittleFS at
+// /storage/skills/<id>.md and surfaced as markdown-kind entries in the
+// existing custom-services list. See skill_store.h for the storage API.
+
+#define SKILL_UPLOAD_MAX (64 * 1024)
+
+// Drain remaining body bytes when we've decided to fail early so the client
+// gets a clean response instead of a stalled connection.
+static void drain_body(httpd_req_t *req) {
+    char scratch[256];
+    int remaining = (int)req->content_len;
+    while (remaining > 0) {
+        int r = httpd_req_recv(req, scratch,
+                               remaining < (int)sizeof(scratch)
+                                   ? remaining : (int)sizeof(scratch));
+        if (r <= 0) break;
+        remaining -= r;
+    }
+}
+
+// POST /skills — raw markdown body. Parses frontmatter, validates, writes
+// body to LittleFS, upserts a markdown-kind entry into svc_custom.
+//
+// Returns 200 + JSON metadata on success.
+// 400 on missing fields / bad name; 413 on oversize; 507 on storage full.
+static esp_err_t handle_skill_upload(httpd_req_t *req) {
+    if (req->content_len == 0) {
+        return send_json(req, 400, "{\"error\":\"empty_body\"}");
+    }
+    if (req->content_len > SKILL_UPLOAD_MAX) {
+        drain_body(req);
+        return send_json(req, 413,
+            "{\"error\":\"too_large\",\"max_bytes\":65536}");
+    }
+
+    char *body = malloc(req->content_len + 1);
+    if (!body) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int n = read_body(req, body, req->content_len + 1);
+    if (n <= 0) { free(body); return send_json(req, 400, "{\"error\":\"recv\"}"); }
+
+    skill_meta_t meta;
+    size_t body_offset = 0;
+    int rc = skill_store_parse_frontmatter(body, (size_t)n, &meta, &body_offset);
+    if (rc != 0) {
+        free(body);
+        const char *err =
+            rc == -1 ? "no_frontmatter" :
+            rc == -2 ? "missing_required_field" :
+            rc == -3 ? "field_too_long" :
+                       "malformed_frontmatter";
+        char msg[96];
+        snprintf(msg, sizeof(msg), "{\"error\":\"%s\"}", err);
+        return send_json(req, 400, msg);
+    }
+
+    // Validate id charset (parser is permissive; reject here for a clear error).
+    bool id_ok = meta.id[0] != '\0';
+    for (size_t i = 0; meta.id[i]; ++i) {
+        char c = meta.id[i];
+        if (!(c == '-' || c == '_' ||
+              (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9'))) { id_ok = false; break; }
+    }
+    if (!id_ok) {
+        free(body);
+        return send_json(req, 400,
+            "{\"error\":\"bad_name\",\"hint\":\"^[a-z0-9_-]+$\"}");
+    }
+
+    // Persist body (whole markdown, frontmatter included).
+    esp_err_t we = skill_store_write_body(meta.id, body, (size_t)n);
+    free(body);
+    if (we == ESP_ERR_NO_MEM) {
+        return send_json(req, 507, "{\"error\":\"storage_full\"}");
+    } else if (we != ESP_OK) {
+        return send_json(req, 500, "{\"error\":\"write_failed\"}");
+    }
+
+    // Upsert into svc_custom.
+    if (skill_store_register(&meta) != ESP_OK) {
+        // Roll back the body write so we don't leak orphans.
+        skill_store_delete(meta.id);
+        return send_json(req, 413, "{\"error\":\"registry_full\"}");
+    }
+
+    // Build response.
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "id",          meta.id);
+    cJSON_AddStringToObject(root, "name",        meta.name);
+    cJSON_AddStringToObject(root, "description", meta.description);
+    cJSON_AddStringToObject(root, "version",     meta.version);
+    cJSON *creds = cJSON_AddArrayToObject(root, "credentials");
+    for (int i = 0; i < meta.credentials_count; ++i) {
+        cJSON_AddItemToArray(creds, cJSON_CreateString(meta.credentials[i]));
+    }
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) return send_json(req, 500, "{\"error\":\"oom\"}");
+    esp_err_t rc2 = send_json(req, 200, out);
+    cJSON_free(out);
+    return rc2;
+}
+
+// Extract the skill id from a URI like "/skills/<id>" or
+// "/skills/<id>/credentials". Returns true on success and writes the id
+// (NUL-terminated) into `out`. Sets `*has_credentials` to true when the
+// path's tail is "/credentials".
+static bool parse_skills_uri(const char *uri, char *out, size_t cap,
+                             bool *has_credentials) {
+    *has_credentials = false;
+    if (!uri || strncmp(uri, "/skills/", 8) != 0) return false;
+
+    // Drop any query string.
+    char path[128];
+    strlcpy(path, uri, sizeof(path));
+    char *q = strchr(path, '?');
+    if (q) *q = '\0';
+
+    const char *rest = path + 8;
+    if (!*rest) return false;
+
+    const char *slash = strchr(rest, '/');
+    size_t id_len = slash ? (size_t)(slash - rest) : strlen(rest);
+    if (id_len == 0 || id_len >= cap) return false;
+    memcpy(out, rest, id_len);
+    out[id_len] = '\0';
+
+    if (slash) {
+        if (strcmp(slash, "/credentials") != 0) return false;
+        *has_credentials = true;
+    }
+    return true;
+}
+
+// DELETE /skills/<id>
+static esp_err_t handle_skill_delete(httpd_req_t *req) {
+    char id[SKILL_ID_MAX];
+    bool has_creds = false;
+    if (!parse_skills_uri(req->uri, id, sizeof(id), &has_creds) || has_creds) {
+        return send_json(req, 404, "{\"error\":\"not_found\"}");
+    }
+    skill_store_delete(id);
+    skill_store_unregister(id);
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
+// POST /skills/<id>/credentials  body: {"KEY":"value", ...}
+static esp_err_t handle_skill_post_wildcard(httpd_req_t *req) {
+    char id[SKILL_ID_MAX];
+    bool has_creds = false;
+    if (!parse_skills_uri(req->uri, id, sizeof(id), &has_creds) || !has_creds) {
+        return send_json(req, 404, "{\"error\":\"not_found\"}");
+    }
+    if (req->content_len == 0 || req->content_len > 4096) {
+        drain_body(req);
+        return send_json(req, 400, "{\"error\":\"bad_body\"}");
+    }
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) return send_json(req, 500, "{\"error\":\"oom\"}");
+    int n = read_body(req, buf, req->content_len + 1);
+    if (n < 0) { free(buf); return send_json(req, 400, "{\"error\":\"recv\"}"); }
+
+    esp_err_t rc = skill_store_set_creds_json(id, buf);
+    free(buf);
+    if (rc != ESP_OK) return send_json(req, 400, "{\"error\":\"bad_credentials\"}");
+
+    char keys[256];
+    skill_store_set_creds_keys(id, keys, sizeof(keys));
+    char body[320];
+    snprintf(body, sizeof(body), "{\"ok\":true,\"set\":%s}", keys);
+    return send_json(req, 200, body);
+}
+
 // --- Public API --------------------------------------------------------------
 esp_err_t server_start(void) {
     if (s_httpd) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port     = 80;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
     cfg.lru_purge_enable = true;
+    // Wildcard URI matching for `/skills/*` (so DELETE /skills/<id> and
+    // POST /skills/<id>/credentials route to a single handler each that
+    // parses the rest). Existing exact-match URIs stay unaffected.
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
     // Cap httpd's slice of the LWIP socket pool. Default is
     // (CONFIG_LWIP_MAX_SOCKETS - 3), which on a 24-socket pool would let
     // httpd squat 21 — starving outbound HTTPS (AI / RPC / TTS) when the
@@ -414,6 +595,9 @@ esp_err_t server_start(void) {
         { .uri = "/social/x/begin",      .method = HTTP_POST, .handler = handle_x_begin      },
         { .uri = "/social/x/finish",     .method = HTTP_POST, .handler = handle_x_finish     },
         { .uri = "/social/x/disconnect", .method = HTTP_POST, .handler = handle_x_disconnect },
+        { .uri = "/skills",          .method = HTTP_POST,   .handler = handle_skill_upload         },
+        { .uri = "/skills/*",        .method = HTTP_POST,   .handler = handle_skill_post_wildcard  },
+        { .uri = "/skills/*",        .method = HTTP_DELETE, .handler = handle_skill_delete         },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_httpd, &uris[i]),

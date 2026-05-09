@@ -65,6 +65,20 @@ void x402_call_stream(const char *method,
                       void          *cb_user,
                       x402_result_t *out);
 
+// Solana RPC helpers exposed for skill tools that need to build their own
+// payments (e.g. x402_pay, which has to inject a memo + external feePayer
+// from a non-standard 402 response). Implementations share x402.c's RPC
+// transport so they pick up tls_lock + Helius routing automatically.
+
+// Fetch the current Solana blockhash. Writes raw 32 bytes into `out`.
+// Returns true on success.
+#include <stdint.h>
+bool x402_fetch_recent_blockhash(uint8_t out[32]);
+
+// Resolve any owner's USDC associated token account. Writes the base58
+// pubkey (NUL-terminated) into `out`. Returns true on success.
+bool x402_fetch_usdc_ata(const char *owner_b58, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

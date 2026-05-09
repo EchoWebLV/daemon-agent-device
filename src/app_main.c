@@ -24,6 +24,7 @@
 #include "buttons.h"
 #include "creature_screen.h"
 #include "devcfg.h"
+#include "skill_store.h"
 #include "display.h"
 #include "price.h"
 #include "tls_lock.h"
@@ -120,6 +121,12 @@ void app_main(void) {
 
     // Device settings (backlight PWM comes online here at the stored duty).
     ESP_ERROR_CHECK(devcfg_init());
+
+    // LittleFS storage for skill markdown + per-skill credentials. Non-fatal
+    // on failure — the device still works without the skill loader.
+    if (skill_store_init() != ESP_OK) {
+        ESP_LOGW(TAG, "skill_store_init failed; skill loader disabled");
+    }
 
     // Global TLS mutex — every outgoing HTTPS call (wallet, price, stt, ai,
     // voice/TTS, social_x, swap, x402) takes this before opening a connection
