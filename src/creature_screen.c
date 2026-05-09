@@ -590,20 +590,13 @@ static void speech_task(void *arg) {
         } \
     } while (0)
 
-    // Filler word, ~50% of the time, fired ~1 s AFTER the button releases
-    // (i.e. ~1 s into speech_task). Immediate fillers felt over-eager —
-    // the 1 s pause reads as natural human hedging, lets the chirp tone
-    // finish, and still covers the dead-air window before the LLM reply
-    // arrives. Coin flip happens BEFORE the spawn so we don't burn a task
-    // on the silent half. The delay task sleeps then enqueues via
-    // voice_speak (async); STT continues unblocked on this task.
-    if ((esp_random() & 1u) == 0u) {
-        BaseType_t spawned = xTaskCreate(filler_delay_task, "filler_delay",
-                                         2048, NULL, 4, NULL);
-        if (spawned != pdPASS) {
-            ESP_LOGW(TAG, "filler delay task spawn failed");
-        }
-    }
+    // Filler word disabled: spawning a second ElevenLabs TLS handshake
+    // ~1 s after the STT POST starts was racing the OpenAI handshake on
+    // mbedTLS's PSRAM buffer pool. STT was returning ESP_FAIL (status=0)
+    // about half the time when the filler coin flip won, which surfaced
+    // as the bot saying "I didn't catch that" on perfectly captured
+    // audio. Re-enable once the filler is rate-limited against the in-
+    // flight STT, or moved behind a queue that drains after STT returns.
 
     char transcript[512] = {0};
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
@@ -698,27 +691,14 @@ void creature_screen_ptt_start(void) {
     }
 }
 
-void creature_screen_ptt_stop(void) {
-    if (!mic_is_recording()) return;
-    int16_t *pcm    = NULL;
-    size_t   frames = 0;
-    esp_err_t err = mic_record_stop(&pcm, &frames);
-
-    // Stop-only gesture: a short tap during a busy state means "shut up,
-    // I don't have anything new to ask." Drop the audio without spawning
-    // STT/AI. The 1 s threshold separates "tap to interrupt" from a real
-    // PTT recording. Outside the busy case, the existing <100 ms junk
-    // check below still handles accidental brushes.
-    uint32_t hold_ms = esp_log_timestamp() - s_ptt_press_ms;
-    if (s_ptt_was_busy && hold_ms < 1000) {
-        ESP_LOGI(TAG, "ptt: interrupt-only tap (%lums) — dropping audio",
-                 (unsigned long)hold_ms);
-        if (pcm) mic_buffer_free(pcm);
-        ui_set_subtitle("");
-        return;
-    }
-
-    if (err != ESP_OK || !pcm || frames < 1600) {   // <100 ms = junk
+// Common back end for both PTT-stop and wake-VAD-endpoint. Takes
+// ownership of pcm — every return path frees the buffer or hands it
+// to speech_task (which frees it at the end of the STT/AI/voice run).
+// Frames below the 100 ms threshold are treated as junk (covers
+// accidental finger brushes on PTT and false wakes that immediately
+// fall silent).
+static void ingest_speech(int16_t *pcm, size_t frames) {
+    if (!pcm || frames < 1600) {
         if (pcm) mic_buffer_free(pcm);
         ui_set_subtitle("");
         return;
@@ -745,6 +725,61 @@ void creature_screen_ptt_stop(void) {
         ui_set_subtitle("");
     }
 }
+
+void creature_screen_ptt_stop(void) {
+    if (!mic_is_recording()) return;
+    int16_t *pcm    = NULL;
+    size_t   frames = 0;
+    esp_err_t err = mic_record_stop(&pcm, &frames);
+
+    // Stop-only gesture: a short tap during a busy state means "shut up,
+    // I don't have anything new to ask." Drop the audio without spawning
+    // STT/AI. The 1 s threshold separates "tap to interrupt" from a real
+    // PTT recording. Outside the busy case, ingest_speech's <100 ms junk
+    // check still handles accidental brushes.
+    uint32_t hold_ms = esp_log_timestamp() - s_ptt_press_ms;
+    if (s_ptt_was_busy && hold_ms < 1000) {
+        ESP_LOGI(TAG, "ptt: interrupt-only tap (%lums) — dropping audio",
+                 (unsigned long)hold_ms);
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+
+    if (err != ESP_OK) {
+        if (pcm) mic_buffer_free(pcm);
+        ui_set_subtitle("");
+        return;
+    }
+    ingest_speech(pcm, frames);
+}
+
+// Wake event from wake.c (AFE detect task). Mirrors the interrupt half
+// of ptt_start: any in-flight reply gets cancelled so saying the wake
+// word during a reply drops the bot back into listening mode within
+// one chunk's worth of latency. The actual recording is already in
+// flight inside wake.c by the time we're called — no mic_record_start
+// equivalent here.
+void creature_screen_on_wake(void) {
+    ESP_LOGI(TAG, "creature_screen_on_wake invoked");
+    s_ptt_was_busy = s_speech_in_flight || voice_is_speaking();
+    if (s_ptt_was_busy) {
+        voice_clear();
+        ESP_LOGI(TAG, "wake: interrupting in-flight (next gen=%lu)",
+                 (unsigned long)(s_ptt_gen + 1));
+    }
+    s_ptt_gen++;
+    s_ptt_press_ms = esp_log_timestamp();
+    ui_set_subtitle("Listening...");
+    ESP_LOGI(TAG, "wake: subtitle set; awaiting VAD endpoint");
+}
+
+void creature_screen_ingest_wake_speech(int16_t *pcm, size_t frames) {
+    ESP_LOGI(TAG, "creature_screen_ingest_wake_speech: %u frames (%.2f s)",
+             (unsigned)frames, (float)frames / 16000.0f);
+    ingest_speech(pcm, frames);
+}
+
 
 lv_obj_t *creature_screen(void) { return s_scr; }
 

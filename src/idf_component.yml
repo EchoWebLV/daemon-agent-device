@@ -35,3 +35,11 @@ dependencies:
   # Lets the MCP server (and curl from any laptop) reach the device by name
   # instead of looking up the IP every time it changes.
   espressif/mdns:                  "^1.5.0"
+  # ESP-SR — Espressif speech recognition (WakeNet wake word + VAD + AFE).
+  # AFE owns a continuous audio pipeline; WakeNet detects the wake word and
+  # surfaces the event via the fetch interface. Model files ship in the
+  # `model` SPIFFS partition (see partitions.csv). Selected wake word is
+  # configured in sdkconfig.defaults — currently a placeholder (Hi Lexin)
+  # while the custom "Hey Daemon" model is in flight at Espressif's
+  # WakeNet generator service. See src/wake.c for the integration.
+  espressif/esp-sr:                "^2.1.3"

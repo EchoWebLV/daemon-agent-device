@@ -2,17 +2,17 @@
 //  mic.h — ES7210 microphone capture for the ESP32-S3-BOX-3.
 //
 //  Push-to-talk path:
-//      mic_init() once at boot (after voice_begin so the shared data_if
-//      and I2S RX channel exist)
+//      wake_init() once at boot (owns the codec; mic_init is a no-op)
 //      → user long-presses creature → mic_record_start()
 //      → user releases → mic_record_stop(&pcm, &frames) returns the
 //        recorded 16 kHz 16-bit mono PCM
 //      → caller hands the buffer to stt.c, which uploads + transcribes,
 //        and then frees with mic_buffer_free()
 //
-//  The capture buffer is hard-capped (see MIC_MAX_RECORD_SECS in mic.c)
-//  so a stuck long-press can't OOM the device. Allocation lives in PSRAM
-//  since 10 s @ 16 kHz mono = ~320 KB which won't fit in internal RAM.
+//  Implementation lives in wake.c — this header is the legacy facade
+//  used by creature_screen.c's PTT handlers. The wake-word engine and
+//  PTT share the same continuously-open codec and the same PSRAM
+//  capture buffer; wake.c's mode interlock prevents double-capture.
 // ---------------------------------------------------------------------------
 #pragma once
 

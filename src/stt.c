@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -175,11 +178,30 @@ bool stt_transcribe(const int16_t *pcm, size_t frames,
              STT_URL, (float)frames / (float)STT_SAMPLE_HZ, (unsigned)total);
     esp_err_t err    = esp_http_client_perform(h);
     int       status = esp_http_client_get_status_code(h);
+
+    // One retry on transport failure. Concurrent TLS handshakes (e.g.
+    // an ElevenLabs filler kicking off mid-STT) were racing on the
+    // mbedTLS dynamic buffer pool and producing ESP_FAIL on the second
+    // perform. A 200 ms backoff and one retry covers the race without
+    // adding noticeable latency on the happy path.
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "perform err: %s (status=%d) — retrying once",
+                 esp_err_to_name(err), status);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        // Reset the response buffer so we don't append a partial body
+        // from the failed attempt onto the retry's response.
+        resp.body_len = 0;
+        if (resp.body) resp.body[0] = 0;
+        err    = esp_http_client_perform(h);
+        status = esp_http_client_get_status_code(h);
+    }
+
     esp_http_client_cleanup(h);
     heap_caps_free(body);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "perform err: %s (status=%d)", esp_err_to_name(err), status);
+        ESP_LOGW(TAG, "perform err after retry: %s (status=%d)",
+                 esp_err_to_name(err), status);
         return false;
     }
     if (status < 200 || status >= 300) {
