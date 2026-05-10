@@ -97,16 +97,26 @@ static const char *PERSONA =
 // 5 turns × 512 chars = 2.5 KB cap on history payload.
 #define MAX_TURNS          5
 #define TURN_TEXT_CAP      512    // trimmed hard — long turns are summarised
-#define SYS_PROMPT_CAP     4096   // persona + wallet context + tool listing
+// Sized to fit the persona + wallet context + tool listing PLUS at least
+// one full markdown skill body (e.g. SP3ND is ~30 KB). All allocations are
+// satisfied from PSRAM since they're well above the 16 KB DRAM threshold
+// configured in sdkconfig.defaults.
+#define SYS_PROMPT_CAP     65536
 // Tool-calling blows up both sides of the wire — each tool in the request
 // is ~300 bytes of schema JSON, and assistant+tool reply rounds accumulate
 // as we loop. 16 KB covers a dozen enabled services plus a couple of rounds
 // of tool-call context; 8 KB response capture covers the biggest tool JSON
 // we expect to surface back into the next turn.
-#define CHAT_BODY_CAP      16384  // JSON we POST
+// JSON we POST. Sized to wrap a 64 KB system prompt (with worst-case 1.5x
+// JSON-escape inflation) plus tool schemas + message history.
+#define CHAT_BODY_CAP      131072
 #define CHAT_RSP_CAP       8192   // response body we capture
 #define TOOL_RESPONSE_CAP  2048   // per-tool response we feed back
-#define MAX_TOOL_ROUNDS    3      // safety limit on back-and-forth
+// Safety limit on back-and-forth tool calls. SP3ND-style flows need
+// solana_get_pubkey + http_request(register) + secret_set(key) +
+// secret_set(secret) at minimum, plus a verbal-confirm round. Multi-step
+// purchases (cart, order, pay, poll) need more headroom.
+#define MAX_TOOL_ROUNDS    10
 
 typedef struct {
     char role[12];   // "user" or "assistant"

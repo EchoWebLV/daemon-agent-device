@@ -16,6 +16,8 @@
 #include "devcfg.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "skill_store";
 
@@ -24,6 +26,57 @@ static const char *TAG = "skill_store";
 #define PARTITION_LABEL "storage"
 
 static bool s_mounted = false;
+
+// In-memory cache so build_system_prompt + ${VAR} substitution can serve
+// reads without touching flash. Critical because both can run from speech_task
+// (PSRAM-backed stack), and any LittleFS read from a PSRAM stack hits
+// `esp_task_stack_is_sane_cache_disabled` and panics. The cache is the
+// source of truth for reads; writes go through both the cache and LittleFS.
+//
+// Each entry holds the FRONTMATTER-STRIPPED body (what the prompt injects)
+// and the raw creds JSON string. Both pointers are PSRAM mallocs and may
+// be NULL if the corresponding file doesn't exist yet.
+#define SKILL_CACHE_MAX 16
+typedef struct {
+    char    id[SKILL_ID_MAX];
+    char   *body_stripped;
+    size_t  body_stripped_len;
+    char   *creds_json;            // raw JSON: "{\"K\":\"v\",...}" or NULL
+} body_cache_entry_t;
+static body_cache_entry_t s_cache[SKILL_CACHE_MAX];
+static SemaphoreHandle_t  s_cache_mtx = NULL;
+
+static int cache_find(const char *id) {
+    for (int i = 0; i < SKILL_CACHE_MAX; ++i) {
+        if (s_cache[i].id[0] && strcmp(s_cache[i].id, id) == 0) return i;
+    }
+    return -1;
+}
+
+static int cache_alloc_slot(const char *id) {
+    int slot = cache_find(id);
+    if (slot >= 0) return slot;
+    for (int i = 0; i < SKILL_CACHE_MAX; ++i) {
+        if (s_cache[i].id[0] == '\0') {
+            strlcpy(s_cache[i].id, id, SKILL_ID_MAX);
+            s_cache[i].body_stripped = NULL;
+            s_cache[i].body_stripped_len = 0;
+            s_cache[i].creds_json = NULL;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void cache_lock(void)   { if (s_cache_mtx) xSemaphoreTake(s_cache_mtx, portMAX_DELAY); }
+static void cache_unlock(void) { if (s_cache_mtx) xSemaphoreGive(s_cache_mtx); }
+
+static void cache_clear_entry_locked(int idx) {
+    if (s_cache[idx].body_stripped) { free(s_cache[idx].body_stripped); s_cache[idx].body_stripped = NULL; }
+    if (s_cache[idx].creds_json)    { free(s_cache[idx].creds_json);    s_cache[idx].creds_json = NULL; }
+    s_cache[idx].body_stripped_len = 0;
+    s_cache[idx].id[0] = '\0';
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -73,6 +126,51 @@ static void path_creds(char *out, size_t cap, const char *id) {
 // ---------------------------------------------------------------------------
 // Mount
 // ---------------------------------------------------------------------------
+// Forward decl: scan_into_cache uses skill_store_read_body_stripped after
+// init flips s_mounted, but we cache while the function is also used by
+// callers that bypass the cache. Internal helper just for boot scan.
+static int read_body_stripped_uncached(const char *id, char *out, size_t out_cap);
+static int read_creds_uncached(const char *id, char *out, size_t out_cap);
+
+static void cache_set_body_locked(const char *id, const char *body_stripped, size_t len);
+static void cache_set_creds_locked(const char *id, const char *json);
+
+static void scan_into_cache(void) {
+    DIR *d = opendir(SKILLS_DIR);
+    if (!d) return;
+    struct dirent *de;
+    cache_lock();
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        const char *dot = strrchr(de->d_name, '.');
+        if (!dot) continue;
+        // Only seed body cache here; creds JSON is small and loaded on demand.
+        if (strcmp(dot, ".md") != 0) continue;
+        char id[SKILL_ID_MAX];
+        size_t id_len = (size_t)(dot - de->d_name);
+        if (id_len == 0 || id_len >= SKILL_ID_MAX) continue;
+        memcpy(id, de->d_name, id_len);
+        id[id_len] = '\0';
+
+        // Read stripped body into a stretchy buffer. Bodies are <= 64 KB.
+        char *buf = malloc(SKILL_BODY_MAX + 1);
+        if (!buf) continue;
+        int n = read_body_stripped_uncached(id, buf, SKILL_BODY_MAX + 1);
+        if (n > 0) cache_set_body_locked(id, buf, (size_t)n);
+        free(buf);
+
+        // Pre-load creds for the same id if present.
+        char *cbuf = malloc(SKILL_CREDS_FILE_MAX + 1);
+        if (cbuf) {
+            int cn = read_creds_uncached(id, cbuf, SKILL_CREDS_FILE_MAX + 1);
+            if (cn >= 0) cache_set_creds_locked(id, cbuf);
+            free(cbuf);
+        }
+    }
+    cache_unlock();
+    closedir(d);
+}
+
 esp_err_t skill_store_init(void) {
     if (s_mounted) return ESP_OK;
 
@@ -94,13 +192,67 @@ esp_err_t skill_store_init(void) {
         ESP_LOGW(TAG, "mkdir %s failed: %s", SKILLS_DIR, strerror(errno));
     }
 
+    if (!s_cache_mtx) s_cache_mtx = xSemaphoreCreateMutex();
+    s_mounted = true;
+
+    // Pre-warm the in-memory cache from LittleFS. Done here on the main task
+    // (internal RAM stack, safe for flash I/O) so that subsequent reads from
+    // PSRAM-stack tasks (speech_task etc.) never have to touch flash.
+    scan_into_cache();
+
     size_t total = 0, used = 0;
     if (esp_littlefs_info(PARTITION_LABEL, &total, &used) == ESP_OK) {
-        ESP_LOGI(TAG, "littlefs mounted at %s (used=%u/%u)",
+        ESP_LOGI(TAG, "littlefs mounted at %s (used=%u/%u, cache populated)",
                  MOUNT_BASE, (unsigned)used, (unsigned)total);
     }
-    s_mounted = true;
     return ESP_OK;
+}
+
+static void cache_set_body_locked(const char *id, const char *body_stripped, size_t len) {
+    int slot = cache_alloc_slot(id);
+    if (slot < 0) return;
+    if (s_cache[slot].body_stripped) free(s_cache[slot].body_stripped);
+    s_cache[slot].body_stripped = malloc(len + 1);
+    if (s_cache[slot].body_stripped) {
+        memcpy(s_cache[slot].body_stripped, body_stripped, len);
+        s_cache[slot].body_stripped[len] = '\0';
+        s_cache[slot].body_stripped_len = len;
+    } else {
+        s_cache[slot].body_stripped_len = 0;
+    }
+}
+
+static void cache_set_creds_locked(const char *id, const char *json) {
+    int slot = cache_alloc_slot(id);
+    if (slot < 0) return;
+    if (s_cache[slot].creds_json) { free(s_cache[slot].creds_json); s_cache[slot].creds_json = NULL; }
+    if (json && json[0]) {
+        size_t n = strlen(json);
+        s_cache[slot].creds_json = malloc(n + 1);
+        if (s_cache[slot].creds_json) memcpy(s_cache[slot].creds_json, json, n + 1);
+    }
+}
+
+// Strip frontmatter from a NUL-terminated markdown buffer in place.
+// Returns new length (excluding NUL).
+static size_t strip_frontmatter_inplace(char *buf) {
+    if (!buf) return 0;
+    if (!(buf[0] == '-' && buf[1] == '-' && buf[2] == '-')) return strlen(buf);
+    char *p = buf + 4;
+    while (*p) {
+        if (p[0] == '\n' && p[1] == '-' && p[2] == '-' && p[3] == '-') {
+            char *q = p + 4;
+            while (*q == ' ' || *q == '\t' || *q == '\r') ++q;
+            if (*q == '\n' || *q == '\0') {
+                if (*q == '\n') ++q;
+                size_t kept = strlen(q);
+                memmove(buf, q, kept + 1);
+                return kept;
+            }
+        }
+        ++p;
+    }
+    return strlen(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +452,21 @@ esp_err_t skill_store_write_body(const char *id,
                  path, (unsigned)w, (unsigned)body_len);
         return ESP_FAIL;
     }
+
+    // Refresh cache: copy body into a scratch buffer, strip frontmatter,
+    // store. Without this the prompt-injection path would still hit flash
+    // for this skill on the next /say.
+    char *scratch = malloc(body_len + 1);
+    if (scratch) {
+        memcpy(scratch, body, body_len);
+        scratch[body_len] = '\0';
+        size_t stripped = strip_frontmatter_inplace(scratch);
+        cache_lock();
+        cache_set_body_locked(id, scratch, stripped);
+        cache_unlock();
+        free(scratch);
+    }
+
     ESP_LOGI(TAG, "wrote skill body %s (%u bytes)", id, (unsigned)body_len);
     return ESP_OK;
 }
@@ -312,7 +479,9 @@ bool skill_store_body_exists(const char *id) {
     return stat(path, &st) == 0;
 }
 
-int skill_store_read_body(const char *id, char *out, size_t out_cap) {
+// Internal: bypasses cache. Used only by the boot scan from
+// skill_store_init (main task, internal RAM stack — safe for flash I/O).
+static int read_body_uncached(const char *id, char *out, size_t out_cap) {
     if (!s_mounted || !valid_id(id) || !out || out_cap == 0) return -1;
     char path[64];
     path_body(path, sizeof(path), id);
@@ -324,28 +493,35 @@ int skill_store_read_body(const char *id, char *out, size_t out_cap) {
     return (int)r;
 }
 
-int skill_store_read_body_stripped(const char *id, char *out, size_t out_cap) {
-    int n = skill_store_read_body(id, out, out_cap);
+static int read_body_stripped_uncached(const char *id, char *out, size_t out_cap) {
+    int n = read_body_uncached(id, out, out_cap);
     if (n <= 0) return n;
-    // Find closing "---\n" (or "---\r\n") of frontmatter.
-    if (!(out[0] == '-' && out[1] == '-' && out[2] == '-')) return n;
-    char *p = out + 4;  // past first "---\n" / "---\r"
-    while (*p) {
-        // Look for "\n---" possibly followed by whitespace + newline.
-        if (p[0] == '\n' && p[1] == '-' && p[2] == '-' && p[3] == '-') {
-            char *q = p + 4;
-            while (*q == ' ' || *q == '\t' || *q == '\r') ++q;
-            if (*q == '\n' || *q == '\0') {
-                if (*q == '\n') ++q;
-                size_t kept = strlen(q);
-                memmove(out, q, kept + 1);
-                return (int)kept;
-            }
-        }
-        ++p;
+    return (int)strip_frontmatter_inplace(out);
+}
+
+int skill_store_read_body(const char *id, char *out, size_t out_cap) {
+    // Public read used by the web UI's "view raw" path. Safe from httpd task.
+    return read_body_uncached(id, out, out_cap);
+}
+
+int skill_store_read_body_stripped(const char *id, char *out, size_t out_cap) {
+    if (!valid_id(id) || !out || out_cap == 0) return -1;
+    cache_lock();
+    int slot = cache_find(id);
+    if (slot >= 0 && s_cache[slot].body_stripped) {
+        size_t n = s_cache[slot].body_stripped_len;
+        if (n >= out_cap) n = out_cap - 1;
+        memcpy(out, s_cache[slot].body_stripped, n);
+        out[n] = '\0';
+        cache_unlock();
+        return (int)n;
     }
-    // No closing delimiter found; return body as-is.
-    return n;
+    cache_unlock();
+    // Fallback: not in cache. Only safe to hit flash from internal-RAM tasks
+    // (httpd, main). Speech_task path will get an empty body instead of
+    // crashing — markdown will be missing for one prompt and recover on the
+    // next request once the cache fills.
+    return read_body_stripped_uncached(id, out, out_cap);
 }
 
 esp_err_t skill_store_delete(const char *id) {
@@ -359,6 +535,10 @@ esp_err_t skill_store_delete(const char *id) {
     if (unlink(path) != 0 && errno != ENOENT) {
         ESP_LOGW(TAG, "unlink %s failed: %s", path, strerror(errno));
     }
+    cache_lock();
+    int slot = cache_find(id);
+    if (slot >= 0) cache_clear_entry_locked(slot);
+    cache_unlock();
     return ESP_OK;
 }
 
@@ -384,8 +564,20 @@ size_t skill_store_used_bytes(void) {
 // ---------------------------------------------------------------------------
 
 // Read whole creds file into newly-malloced buffer (NUL-terminated). Returns
-// NULL if missing. Caller frees.
+// NULL if missing. Caller frees. CACHE-AWARE: serves from in-memory cache
+// when populated so PSRAM-stack tasks (speech_task) never touch flash.
 static char *creds_read(const char *id) {
+    cache_lock();
+    int slot = cache_find(id);
+    if (slot >= 0 && s_cache[slot].creds_json) {
+        size_t n = strlen(s_cache[slot].creds_json);
+        char *copy = malloc(n + 1);
+        if (copy) memcpy(copy, s_cache[slot].creds_json, n + 1);
+        cache_unlock();
+        return copy;
+    }
+    cache_unlock();
+    // Fallback to LittleFS — only safe from internal-RAM stacks (httpd/main).
     char path[64];
     path_creds(path, sizeof(path), id);
     FILE *f = fopen(path, "rb");
@@ -402,11 +594,27 @@ static char *creds_read(const char *id) {
     return buf;
 }
 
+// Internal: bypasses the cache. Used by skill_store_init's boot scan only.
+static int read_creds_uncached(const char *id, char *out, size_t out_cap) {
+    if (!s_mounted || !valid_id(id) || !out || out_cap == 0) return -1;
+    char path[64];
+    path_creds(path, sizeof(path), id);
+    FILE *f = fopen(path, "rb");
+    if (!f) { out[0] = '\0'; return 0; }   // missing creds is fine
+    size_t r = fread(out, 1, out_cap - 1, f);
+    fclose(f);
+    out[r] = '\0';
+    return (int)r;
+}
+
 static esp_err_t creds_write_string(const char *id, const char *json_str) {
     char path[64];
     path_creds(path, sizeof(path), id);
     if (json_str == NULL || json_str[0] == '\0') {
         if (unlink(path) != 0 && errno != ENOENT) return ESP_FAIL;
+        cache_lock();
+        cache_set_creds_locked(id, NULL);
+        cache_unlock();
         return ESP_OK;
     }
     FILE *f = fopen(path, "wb");
@@ -414,7 +622,11 @@ static esp_err_t creds_write_string(const char *id, const char *json_str) {
     size_t n = strlen(json_str);
     size_t w = fwrite(json_str, 1, n, f);
     fclose(f);
-    return w == n ? ESP_OK : ESP_FAIL;
+    if (w != n) return ESP_FAIL;
+    cache_lock();
+    cache_set_creds_locked(id, json_str);
+    cache_unlock();
+    return ESP_OK;
 }
 
 int skill_store_get_cred(const char *skill_id, const char *key,
