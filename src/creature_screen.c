@@ -600,12 +600,24 @@ static void speech_task(void *arg) {
 
     char transcript[512] = {0};
     bool got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
+
+    // Whisper occasionally returns an empty string for borderline audio
+    // (short utterances, noisy backgrounds). The transport layer in stt.c
+    // already retries on perform errors; this is a higher-level retry on
+    // empty results. One extra POST is ~$0.0001 and ~1.5 s — far better
+    // UX than telling the user "didn't catch that" when the audio was fine.
+    if ((!got_text || !transcript[0]) && !PTT_STALE()) {
+        ESP_LOGW(TAG, "STT empty/failed; one retry");
+        vTaskDelay(pdMS_TO_TICKS(150));
+        transcript[0] = '\0';
+        got_text = stt_transcribe(pcm, frames, transcript, sizeof(transcript));
+    }
     mic_buffer_free(pcm);
 
     PTT_BAIL_IF_STALE();
 
     if (!got_text || !transcript[0]) {
-        ESP_LOGW(TAG, "STT returned no text — telling the user");
+        ESP_LOGW(TAG, "STT returned no text after retry — telling the user");
         ui_set_subtitle("I didn't catch that.");
         s_speech_in_flight = false;
         vTaskDeleteWithCaps(NULL);

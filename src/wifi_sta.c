@@ -72,8 +72,48 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
 }
 
 // --- One-shot driver init ---------------------------------------------------
+// Watchdog: every 15 s, sanity-check the AP info. The IDF wifi driver can
+// land in a half-broken state where it still reports an IP but the radio
+// is stuck spamming `m f null` warnings 10x/sec, starving wake/STT/AI of
+// CPU. WIFI_EVENT_STA_DISCONNECTED never fires for this so the existing
+// reconnect path doesn't help. We force a manual disconnect/connect cycle
+// when the AP info call errors twice in a row, which makes the driver
+// fire the disconnect event and recover via the normal path.
+static void wifi_watchdog_task(void *arg) {
+    (void)arg;
+    int consecutive_bad = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(15000));
+        if (!s_connected) { consecutive_bad = 0; continue; }
+        wifi_ap_record_t ap = {0};
+        esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+        if (err != ESP_OK) {
+            consecutive_bad++;
+            ESP_LOGW(TAG, "ap_info err=%s, bad=%d/2",
+                     esp_err_to_name(err), consecutive_bad);
+            if (consecutive_bad >= 2) {
+                ESP_LOGW(TAG, "forcing wifi reconnect");
+                esp_wifi_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                esp_wifi_connect();
+                consecutive_bad = 0;
+            }
+        } else {
+            consecutive_bad = 0;
+            s_rssi = ap.rssi;   // keep RSSI fresh for the settings screen
+        }
+    }
+}
+
 esp_err_t wifi_sta_init(void) {
     if (s_driver_ready) return ESP_OK;
+
+    // Quiet the IDF wifi driver. At default WARN level it spams "m f null"
+    // ~10x/sec when the radio is in a degraded-but-still-IP'd state, which
+    // chews enough CPU to starve the wake-word task. The watchdog above
+    // detects + recovers from the same condition, so we don't lose any
+    // signal we'd actually use.
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
 
     ESP_RETURN_ON_ERROR(esp_netif_init(),              TAG, "netif init");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(),TAG, "event loop");
@@ -100,7 +140,17 @@ esp_err_t wifi_sta_init(void) {
                         TAG, "wifi ram storage");
 
     s_driver_ready = true;
-    ESP_LOGI(TAG, "STA driver ready");
+
+    // 4 KB internal-RAM stack: the watchdog only calls esp_wifi_sta_get_ap_info
+    // and esp_wifi_disconnect/connect, no flash I/O, no TLS. Pinned to core 0
+    // alongside the wifi driver to avoid bouncing.
+    static StaticTask_t s_watchdog_tcb;
+    static StackType_t  s_watchdog_stack[4096 / sizeof(StackType_t)];
+    xTaskCreateStaticPinnedToCore(wifi_watchdog_task, "wifi_wd",
+                                  sizeof(s_watchdog_stack) / sizeof(StackType_t),
+                                  NULL, 3,
+                                  s_watchdog_stack, &s_watchdog_tcb, 0);
+    ESP_LOGI(TAG, "STA driver ready (watchdog up)");
     return ESP_OK;
 }
 
