@@ -127,6 +127,10 @@ void wallet_rpc_url(char *out, size_t cap) {
     }
 }
 
+// Forward decl: spawned at the tail of wallet_begin so the periodic
+// refresh task is up before the first chat ever runs.
+static bool wallet_task_begin(void);
+
 bool wallet_begin(void) {
     const char *raw = SOLANA_KEY;
     if (!raw || !raw[0] || strncmp(raw, "PASTE-", 6) == 0) {
@@ -174,6 +178,10 @@ bool wallet_begin(void) {
     s_ok = true;
     ESP_LOGI(TAG, "address %s (key %d bytes, can_sign=%d)",
              s_pubkey, (int)s_secret_len, (int)wallet_can_sign());
+    // Spawn the periodic refresh task eagerly. Failure here means balances
+    // never load and downstream x402 chats fail with "wallet has no USDC
+    // ATA cached" — the user-visible "I couldn't complete the USDC payment".
+    wallet_task_begin();
     return true;
 }
 
@@ -457,25 +465,56 @@ void wallet_refresh(void) {
 
 // ---------------------------------------------------------------------------
 // Background task
+//
+// Self-pacing: blocks on the trigger semaphore with a 60 s timeout so it
+// refreshes every 60 s on its own AND wakes immediately on an external
+// kick from wallet_request_refresh. Previous design used lazy spawn +
+// app_main pinging the trigger; if any single signal was lost (binary
+// semaphore full, task not yet spawned, etc.) the wallet would silently
+// stop refreshing — the user saw "SOL --" / "wallet has no USDC ATA
+// cached" forever and chats failed with "I couldn't complete the USDC
+// payment". This pattern is immune to lost signals.
 // ---------------------------------------------------------------------------
+#define WALLET_REFRESH_PERIOD_MS  60000
+
 static void wallet_task(void *arg) {
     (void)arg;
     for (;;) {
-        if (xSemaphoreTake(s_trigger, portMAX_DELAY) == pdTRUE) {
-            wallet_refresh();
-        }
+        // pdTRUE = external kick. pdFALSE = 60 s timeout = periodic.
+        xSemaphoreTake(s_trigger, pdMS_TO_TICKS(WALLET_REFRESH_PERIOD_MS));
+        wallet_refresh();
     }
 }
 
-static void ensure_task(void) {
-    if (s_task) return;
+// Spawn the background task once at boot. Eager (not lazy) so a missed
+// initial trigger can never strand the device with no balance/ATA cached.
+static bool wallet_task_begin(void) {
+    if (s_task) return true;
     s_trigger = xSemaphoreCreateBinary();
-    // 8 KB — two TLS handshakes + cJSON parse of up to 16 KB body.
-    xTaskCreatePinnedToCore(wallet_task, "wallet", 8192, NULL, 5, &s_task, 1);
+    if (!s_trigger) {
+        ESP_LOGE(TAG, "trigger semaphore create failed");
+        return false;
+    }
+    // Stack lives in PSRAM. Internal RAM is ~exhausted by the time
+    // wallet_begin runs (wifi + LVGL + audio codecs + AFE + WakeNet eat
+    // most of the 264 KB DRAM available at boot), so xTaskCreatePinnedToCore
+    // with an 8 KB internal stack returns NULL — the very bug this
+    // function logs about. PSRAM stacks are safe here because wallet_refresh
+    // doesn't do flash I/O (only TLS + cJSON), so the
+    // esp_task_stack_is_sane_cache_disabled assert that bites speech_task
+    // doesn't apply.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+        wallet_task, "wallet", 8192, NULL, 5, &s_task, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "wallet_task spawn failed; balances will stay stale, x402 chat will fail");
+        return false;
+    }
+    ESP_LOGI(TAG, "wallet_task up (refresh every %d ms)", WALLET_REFRESH_PERIOD_MS);
+    return true;
 }
 
 void wallet_request_refresh(void) {
-    ensure_task();
     if (s_trigger) xSemaphoreGive(s_trigger);
 }
 

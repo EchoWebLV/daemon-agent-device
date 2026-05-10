@@ -14,6 +14,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 
@@ -108,31 +109,51 @@ void price_refresh(void) {
 }
 
 // --- Background plumbing -----------------------------------------------------
+//
+// Self-pacing task: blocks on the trigger semaphore with a 30 s timeout, so
+// it refreshes every 30 s on its own AND wakes immediately on an external
+// kick from price_request_refresh. Previous design relied on lazy spawn +
+// app_main pinging the trigger every 30 s; if a single signal got lost
+// (binary semaphore had already-set token, or the task hadn't been
+// created yet because boot raced spawn vs. trigger), the price would stay
+// stuck at "SOL --" forever. This pattern is immune to that.
+#define PRICE_REFRESH_PERIOD_MS  30000
+
 static void price_task(void *arg) {
     (void)arg;
     for (;;) {
-        if (xSemaphoreTake(s_trigger, portMAX_DELAY) == pdTRUE) {
-            price_refresh();
-        }
+        // pdTRUE = trigger fired (kick from price_request_refresh).
+        // pdFALSE = 30 s timeout = periodic refresh.
+        xSemaphoreTake(s_trigger, pdMS_TO_TICKS(PRICE_REFRESH_PERIOD_MS));
+        price_refresh();
     }
-}
-
-static void ensure_task(void) {
-    if (s_task) return;
-    s_trigger = xSemaphoreCreateBinary();
-    // 6 KB covers TLS handshake + cJSON parse for the 40-byte response.
-    // Smaller stacks risk tripping the canary under mbedtls handshake.
-    xTaskCreatePinnedToCore(price_task, "price", 6144, NULL, 5, &s_task, 1);
 }
 
 // --- Public API --------------------------------------------------------------
 bool price_begin(void) {
     s_price_usd = 0.0;
+    if (s_task) return true;   // idempotent
+    s_trigger = xSemaphoreCreateBinary();
+    if (!s_trigger) {
+        ESP_LOGE(TAG, "trigger semaphore create failed");
+        return false;
+    }
+    // 6 KB covers TLS handshake + cJSON parse for the 40-byte response.
+    // Stack from PSRAM because internal RAM is exhausted by the time
+    // app_main calls price_begin. price_refresh only does TLS + cJSON,
+    // no flash I/O, so PSRAM-stack is safe.
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+        price_task, "price", 6144, NULL, 5, &s_task, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "price_task spawn failed (heap?); SOL price will stay '--'");
+        return false;
+    }
+    ESP_LOGI(TAG, "price_task up (refresh every %d ms)", PRICE_REFRESH_PERIOD_MS);
     return true;
 }
 
 void price_request_refresh(void) {
-    ensure_task();
     if (s_trigger) xSemaphoreGive(s_trigger);
 }
 
