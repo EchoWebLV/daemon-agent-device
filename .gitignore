@@ -32,3 +32,6 @@ __pycache__/
 
 # Local microWakeWord training scratch.
 training/
+
+# Internal brainstorming notes.
+brainstorming/

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Daemon — Drop Skill / x402 mockup</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="page">
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+
+        <header class="hd">
+          <h1>DAEMON</h1>
+          <div class="status">v1.4 · 0.42 USDC · ready</div>
+        </header>
+
+        <nav class="tabs">
+          <button class="tab">CHAT</button>
+          <button class="tab">SETTINGS</button>
+          <button class="tab on">SERVICES</button>
+          <button class="tab">SOCIALS</button>
+        </nav>
+
+        <section class="card">
+          <h3>X402 SERVICES</h3>
+          <p class="hint">Enable services the model can call as tools. Each call is paid in USDC from Daemon's wallet via the x402 protocol.</p>
+
+          <div class="addrow">
+            <input class="search" placeholder="search services…" disabled />
+            <button class="btn">+ add</button>
+            <button class="btn">+ skill</button>
+          </div>
+
+          <div class="dz-wrap">
+            <div class="dropzone">
+              <span class="dz-label">
+                <span class="dz-arrow">↓</span>
+                Drop skill .md or x402 endpoint
+              </span>
+              <span class="spinner spinner-md">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                parsing skill…
+              </span>
+              <span class="spinner spinner-x402">
+                <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                parsing endpoint…
+              </span>
+            </div>
+
+            <div class="file file-md">
+              <span class="file-tag tag-md">MD</span>
+              <span class="file-name">spend-tracker.md</span>
+            </div>
+            <div class="file file-x402">
+              <span class="file-tag tag-x402">x402</span>
+              <span class="file-name">weather-api.txt</span>
+            </div>
+          </div>
+
+          <div class="svclist">
+            <div class="svcrow svcrow-md">
+              <button class="toggle toggle-md"></button>
+              <div class="svcinfo">
+                <h4 class="svcname">spend-tracker <span class="badge">skill</span></h4>
+                <p class="svcdesc">Voice-controlled USDC spending limits, capped per day.</p>
+                <div class="meta">
+                  <span>skill</span>
+                  <span>2 credentials</span>
+                  <span class="ver">v0.3</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="svcrow svcrow-x402">
+              <button class="toggle toggle-x402"></button>
+              <div class="svcinfo">
+                <h4 class="svcname">Weather API <span class="badge">custom</span></h4>
+                <p class="svcdesc">Realtime weather lookup for any lat/lon, paid per call.</p>
+                <div class="meta">
+                  <span class="cat">Data</span>
+                  <span>1 tool</span>
+                  <span class="ver">$0.003</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </main>
+</body>
+</html>

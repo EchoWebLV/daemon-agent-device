@@ -1,0 +1,567 @@
+/* ────────── page background ────────── */
+:root {
+  --bg: #fff;
+  --border: #e5e5e5;
+  --accent: #000;
+  --text: #000;
+  --dim: #666;
+  --green: #16a34a;
+  --md: #6366f1;
+  --x402: #16a34a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: radial-gradient(circle at 50% 30%, #f5f5f7 0%, #e8e8ec 60%, #dcdce0 100%);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--text);
+}
+
+.page {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 16px;
+}
+
+/* ────────── phone frame ────────── */
+.phone {
+  position: relative;
+  width: 390px;
+  height: 800px;
+  background: linear-gradient(180deg, #1c1c1e 0%, #0f0f10 100%);
+  border-radius: 52px;
+  padding: 12px;
+  box-shadow:
+    0 0 0 2px #2a2a2c,
+    0 30px 80px rgba(0, 0, 0, 0.30),
+    0 80px 160px rgba(0, 0, 0, 0.18);
+}
+
+.notch {
+  position: absolute;
+  top: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 110px;
+  height: 28px;
+  background: #000;
+  border-radius: 18px;
+  z-index: 20;
+}
+
+.screen {
+  position: relative;
+  background: var(--bg);
+  border-radius: 40px;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  padding: 56px 16px 24px;
+}
+
+/* ────────── header ────────── */
+.hd { text-align: center; margin-bottom: 12px; }
+
+.hd h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 3px;
+  color: var(--accent);
+}
+
+.status {
+  opacity: 0.6;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+/* ────────── tabs ────────── */
+.tabs {
+  display: flex;
+  gap: 4px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 4px;
+  margin-bottom: 16px;
+}
+
+.tab {
+  flex: 1;
+  padding: 8px 4px;
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  border-radius: 8px;
+  cursor: default;
+}
+
+.tab.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ────────── card ────────── */
+.card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--dim);
+  margin: 0 0 10px;
+  line-height: 1.45;
+}
+
+.addrow {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.search {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  background: #fff;
+  color: var(--text);
+}
+
+.btn {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  cursor: default;
+}
+
+/* ────────── drop zone ────────── */
+.dz-wrap {
+  position: relative;
+  margin: 0 0 14px;
+}
+
+.dropzone {
+  position: relative;
+  border: 2px dashed rgba(0, 0, 0, 0.18);
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 12px;
+  height: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: var(--dim);
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  transition: none;
+  animation: dz-pulse 14s infinite;
+}
+
+.dz-label,
+.spinner {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.dz-arrow {
+  display: inline-block;
+  font-size: 14px;
+  animation: dz-arrow-bob 14s infinite;
+}
+
+.dz-label { animation: dz-label-anim 14s infinite; }
+.spinner-md { animation: spinner-md-anim 14s infinite; opacity: 0; }
+.spinner-x402 { animation: spinner-x402-anim 14s infinite; opacity: 0; }
+
+.spinner .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+  animation: dot-bounce 0.9s infinite;
+}
+.spinner .dot:nth-child(2) { animation-delay: 0.15s; }
+.spinner .dot:nth-child(3) { animation-delay: 0.30s; }
+
+@keyframes dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+/* ────────── phantom files ────────── */
+.file {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  margin-top: -19px;
+  margin-left: -85px;
+  width: 170px;
+  height: 38px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.10),
+    0 12px 32px rgba(0, 0, 0, 0.06);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+  z-index: 10;
+  opacity: 0;
+}
+
+.file-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  color: #fff;
+}
+
+.tag-md { background: var(--md); }
+.tag-x402 { background: var(--x402); }
+
+.file-name {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+}
+
+.file-md { animation: file-md-anim 14s infinite; }
+.file-x402 { animation: file-x402-anim 14s infinite; }
+
+/* ────────── service rows ────────── */
+.svclist {
+  display: flex;
+  flex-direction: column;
+}
+
+.svcrow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  opacity: 0;
+  max-height: 0;
+  overflow: hidden;
+  transform: translateY(8px);
+}
+
+.svcrow-md   { animation: row-md-anim 14s infinite; }
+.svcrow-x402 { animation: row-x402-anim 14s infinite; }
+
+.toggle {
+  flex-shrink: 0;
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--border);
+  border: none;
+  cursor: default;
+  position: relative;
+  padding: 0;
+  margin-top: 2px;
+  animation-duration: 14s;
+  animation-iteration-count: infinite;
+}
+
+.toggle::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  animation-duration: 14s;
+  animation-iteration-count: infinite;
+}
+
+.toggle-md         { animation-name: toggle-bg-md; }
+.toggle-md::before { animation-name: toggle-knob-md; }
+.toggle-x402         { animation-name: toggle-bg-x402; }
+.toggle-x402::before { animation-name: toggle-knob-x402; }
+
+.svcinfo { flex: 1; min-width: 0; }
+
+.svcname {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.badge {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: 0.3px;
+}
+
+.svcdesc {
+  font-size: 11px;
+  color: var(--dim);
+  margin: 2px 0 6px;
+  line-height: 1.45;
+}
+
+.meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 10px;
+  color: var(--dim);
+  align-items: center;
+}
+
+.meta .cat {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.15);
+  color: #0284c7;
+  font-weight: 500;
+}
+
+.meta .ver {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+/* ────────── animations ──────────
+   Master loop: 14 seconds, infinite.
+   Phase 1 (skill drop):  0.0 – 6.5s   ( 0% – 46% )
+   Phase 2 (x402 drop):   7.0 – 13.0s  (50% – 93% )
+   Reset:                13.0 – 14.0s  (93% – 100%)
+*/
+
+/* skill file fly-in.
+   translateY range tuned so file enters from just above the addrow buttons
+   (clipped by the screen's overflow:hidden as it ramps up from offscreen),
+   not from the very top of the screen — keeps the card header readable
+   during flight. */
+@keyframes file-md-anim {
+  0%, 2%   { transform: translateY(-110px) scale(0.85) rotate(-4deg); opacity: 0; }
+  5%       { transform: translateY(-110px) scale(0.92) rotate(-3deg); opacity: 0.6; }
+  9%       { transform: translateY(-60px)  scale(0.97) rotate(-2deg); opacity: 0.95; }
+  14%      { transform: translateY(0)      scale(1)    rotate(0deg);  opacity: 1; }
+  15.5%    { transform: translateY(-6px)   scale(1.04) rotate(1deg);  opacity: 1; }
+  17%      { transform: translateY(0)      scale(1)    rotate(0deg);  opacity: 1; }
+  20%      { transform: translateY(0)      scale(0.95) rotate(0deg);  opacity: 0; }
+  100%     { transform: translateY(-110px) scale(0.85) rotate(-4deg); opacity: 0; }
+}
+
+/* x402 file fly-in (offset by ~50%) */
+@keyframes file-x402-anim {
+  0%, 50%   { transform: translateY(-110px) scale(0.85) rotate(4deg);  opacity: 0; }
+  53%       { transform: translateY(-110px) scale(0.92) rotate(3deg);  opacity: 0.6; }
+  57%       { transform: translateY(-60px)  scale(0.97) rotate(2deg);  opacity: 0.95; }
+  62%       { transform: translateY(0)      scale(1)    rotate(0deg);  opacity: 1; }
+  63.5%     { transform: translateY(-6px)   scale(1.04) rotate(-1deg); opacity: 1; }
+  65%       { transform: translateY(0)      scale(1)    rotate(0deg);  opacity: 1; }
+  68%       { transform: translateY(0)      scale(0.95) rotate(0deg);  opacity: 0; }
+  100%      { transform: translateY(-110px) scale(0.85) rotate(4deg);  opacity: 0; }
+}
+
+/* drop zone pulses when each file arrives */
+@keyframes dz-pulse {
+  0%, 9% {
+    border-color: rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.02);
+  }
+  11%, 22% {
+    border-color: var(--md);
+    background: rgba(99, 102, 241, 0.08);
+  }
+  26%, 57% {
+    border-color: rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.02);
+  }
+  59%, 70% {
+    border-color: var(--x402);
+    background: rgba(22, 163, 74, 0.08);
+  }
+  74%, 100% {
+    border-color: rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.02);
+  }
+}
+
+/* small bob on the down-arrow */
+@keyframes dz-arrow-bob {
+  0%, 9%   { transform: translateY(0); }
+  4%       { transform: translateY(2px); }
+  9.01%, 100% { transform: translateY(0); }
+}
+
+/* dropzone label hides while spinner shows */
+@keyframes dz-label-anim {
+  0%, 16% { opacity: 1; }
+  18%, 23% { opacity: 0; }
+  26%, 64% { opacity: 1; }
+  66%, 71% { opacity: 0; }
+  74%, 100% { opacity: 1; }
+}
+
+@keyframes spinner-md-anim {
+  0%, 16% { opacity: 0; }
+  18%, 23% { opacity: 1; }
+  26%, 100% { opacity: 0; }
+}
+
+@keyframes spinner-x402-anim {
+  0%, 64% { opacity: 0; }
+  66%, 71% { opacity: 1; }
+  74%, 100% { opacity: 0; }
+}
+
+/* skill row appears, persists, fades on reset */
+@keyframes row-md-anim {
+  0%, 23% {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(8px);
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-color: transparent;
+  }
+  26% {
+    opacity: 1;
+    max-height: 90px;
+    transform: translateY(0);
+    padding-top: 10px;
+    padding-bottom: 10px;
+    border-top-color: var(--border);
+  }
+  90% {
+    opacity: 1;
+    max-height: 90px;
+    transform: translateY(0);
+    padding-top: 10px;
+    padding-bottom: 10px;
+    border-top-color: var(--border);
+  }
+  95%, 100% {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(0);
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-color: transparent;
+  }
+}
+
+/* x402 row appears later, same fade-out */
+@keyframes row-x402-anim {
+  0%, 71% {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(8px);
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-color: transparent;
+  }
+  74% {
+    opacity: 1;
+    max-height: 90px;
+    transform: translateY(0);
+    padding-top: 10px;
+    padding-bottom: 10px;
+    border-top-color: var(--border);
+  }
+  90% {
+    opacity: 1;
+    max-height: 90px;
+    transform: translateY(0);
+    padding-top: 10px;
+    padding-bottom: 10px;
+    border-top-color: var(--border);
+  }
+  95%, 100% {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(0);
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-color: transparent;
+  }
+}
+
+/* skill toggle: off → on around the moment the row appears */
+@keyframes toggle-bg-md {
+  0%, 26%   { background: var(--border); }
+  29%, 92% { background: var(--accent); }
+  95%, 100% { background: var(--border); }
+}
+@keyframes toggle-knob-md {
+  0%, 26%   { transform: translateX(0); }
+  29%, 92% { transform: translateX(16px); }
+  95%, 100% { transform: translateX(0); }
+}
+
+/* x402 toggle */
+@keyframes toggle-bg-x402 {
+  0%, 74%   { background: var(--border); }
+  77%, 92% { background: var(--accent); }
+  95%, 100% { background: var(--border); }
+}
+@keyframes toggle-knob-x402 {
+  0%, 74%   { transform: translateX(0); }
+  77%, 92% { transform: translateX(16px); }
+  95%, 100% { transform: translateX(0); }
+}
+
+/* ────────── caption under phone ────────── */
+.page::after {
+  content: "drop a .md skill or an x402 endpoint. both flow through the same input.";
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 0.5px;
+  text-align: center;
+  padding: 0 16px;
+}
